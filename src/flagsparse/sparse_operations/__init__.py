@@ -500,13 +500,24 @@ def _prepare_spmv_csr_inputs(data, indices, indptr, x, shape):
 
 
 def _triton_spmv_csr_impl(
-    data, indices, indptr, x, n_rows, block_nnz=256, max_segments=64
+    data, indices, indptr, x, n_rows, block_nnz=256, max_segments=None
 ):
     device = data.device
     dtype = data.dtype
     y = torch.empty(n_rows, dtype=dtype, device=device)
     if n_rows == 0:
         return y
+    block_nnz_use = block_nnz
+    if max_segments is None:
+        row_lengths = indptr[1:] - indptr[:-1]
+        max_nnz_per_row = int(row_lengths.max().item()) if n_rows > 0 else 0
+        max_segments_use = max((max_nnz_per_row + block_nnz_use - 1) // block_nnz_use, 1)
+        while max_segments_use > 2048 and block_nnz_use < 65536:
+            block_nnz_use *= 2
+            max_segments_use = max((max_nnz_per_row + block_nnz_use - 1) // block_nnz_use, 1)
+        max_segments = max_segments_use
+    else:
+        max_segments_use = max_segments
     compute_dtype = dtype
     data_in = data
     x_in = x
@@ -514,6 +525,10 @@ def _triton_spmv_csr_impl(
         compute_dtype = torch.float32
         data_in = data.to(torch.float32)
         x_in = x.to(torch.float32)
+    elif dtype == torch.float32:
+        compute_dtype = torch.float64
+        data_in = data.to(torch.float64)
+        x_in = x.to(torch.float64)
     if not _is_complex_dtype(compute_dtype):
         y_out = torch.empty(n_rows, dtype=compute_dtype, device=device)
         grid = (n_rows,)
@@ -524,10 +539,10 @@ def _triton_spmv_csr_impl(
             x_in,
             y_out,
             n_rows=n_rows,
-            BLOCK_NNZ=block_nnz,
-            MAX_SEGMENTS=max_segments,
+            BLOCK_NNZ=block_nnz_use,
+            MAX_SEGMENTS=max_segments_use,
         )
-        if dtype == torch.float16 or dtype == torch.bfloat16:
+        if dtype != compute_dtype:
             y_out = y_out.to(dtype)
         y.copy_(y_out)
         return y
@@ -543,8 +558,8 @@ def _triton_spmv_csr_impl(
         x_ri,
         y_ri,
         n_rows=n_rows,
-        BLOCK_NNZ=block_nnz,
-        MAX_SEGMENTS=max_segments,
+        BLOCK_NNZ=block_nnz_use,
+        MAX_SEGMENTS=max_segments_use,
     )
     y_ri = y_ri.reshape(n_rows, 2)
     y.copy_(torch.view_as_complex(y_ri))
@@ -558,13 +573,14 @@ def flagsparse_spmv_csr(
     x,
     shape,
     block_nnz=256,
-    max_segments=64,
+    max_segments=None,
     out=None,
     return_time=False,
 ):
     """
     CSR SpMV: y = A @ x using Triton (cuSPARSE-aligned dtypes).
     data, indices, indptr: CSR arrays; x: dense vector; shape: (n_rows, n_cols).
+    max_segments: None = auto-compute from indptr so all NNZ per row are covered.
     """
     data, kernel_indices, kernel_indptr, x, n_rows, n_cols = _prepare_spmv_csr_inputs(
         data, indices, indptr, x, shape
@@ -599,7 +615,7 @@ def flagsparse_spmv_coo(
     x,
     shape,
     block_nnz=256,
-    max_segments=64,
+    max_segments=None,
     out=None,
     return_time=False,
 ):
@@ -715,6 +731,144 @@ def _prepare_spsv_inputs(data, indices, indptr, b, shape):
     )
 
 
+@triton.jit
+def _spsv_csr_level_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    x_ptr,
+    rows_ptr,
+    n_level_rows,
+    BLOCK_NNZ: tl.constexpr,
+    MAX_SEGMENTS: tl.constexpr,
+    LOWER: tl.constexpr,
+    UNIT_DIAG: tl.constexpr,
+    DIAG_EPS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= n_level_rows:
+        return
+    row = tl.load(rows_ptr + pid)
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
+    acc = tl.load(data_ptr + start, mask=start < end, other=0.0) * 0
+    diag = tl.load(data_ptr + start, mask=start < end, other=0.0) * 0
+    if UNIT_DIAG:
+        diag = diag + 1.0
+
+    for seg in range(MAX_SEGMENTS):
+        idx = start + seg * BLOCK_NNZ
+        offsets = idx + tl.arange(0, BLOCK_NNZ)
+        mask = offsets < end
+        a = tl.load(data_ptr + offsets, mask=mask, other=0.0)
+        col = tl.load(indices_ptr + offsets, mask=mask, other=0)
+        x_vals = tl.load(x_ptr + col, mask=mask, other=0.0)
+
+        if LOWER:
+            solved = col < row
+        else:
+            solved = col > row
+        is_diag = col == row
+
+        acc = acc + tl.sum(tl.where(mask & solved, a * x_vals, 0.0))
+        if not UNIT_DIAG:
+            diag = diag + tl.sum(tl.where(mask & is_diag, a, 0.0))
+
+    rhs = tl.load(b_ptr + row)
+    diag_safe = tl.where(tl.abs(diag) < DIAG_EPS, 1.0, diag)
+    x_row = (rhs - acc) / diag_safe
+    # Prevent NaN propagation in ill-conditioned rows.
+    x_row = tl.where(x_row == x_row, x_row, 0.0)
+    tl.store(x_ptr + row, x_row)
+
+
+def _build_spsv_levels(indptr, indices, n_rows, lower=True):
+    """Build dependency levels for triangular solve so each level can run in parallel."""
+    if n_rows == 0:
+        return []
+    indptr_h = indptr.to(torch.int64).cpu()
+    indices_h = indices.to(torch.int64).cpu()
+    levels = [0] * n_rows
+    if lower:
+        for i in range(n_rows):
+            s = int(indptr_h[i].item())
+            e = int(indptr_h[i + 1].item())
+            lvl = 0
+            for p in range(s, e):
+                c = int(indices_h[p].item())
+                if c < i:
+                    lvl = max(lvl, levels[c] + 1)
+            levels[i] = lvl
+    else:
+        for i in range(n_rows - 1, -1, -1):
+            s = int(indptr_h[i].item())
+            e = int(indptr_h[i + 1].item())
+            lvl = 0
+            for p in range(s, e):
+                c = int(indices_h[p].item())
+                if c > i:
+                    lvl = max(lvl, levels[c] + 1)
+            levels[i] = lvl
+
+    max_level = max(levels)
+    buckets = [[] for _ in range(max_level + 1)]
+    for r, lv in enumerate(levels):
+        buckets[lv].append(r)
+
+    device = indptr.device
+    return [
+        torch.tensor(rows, dtype=torch.int32, device=device)
+        for rows in buckets
+        if rows
+    ]
+
+
+def _triton_spsv_csr_vector(
+    data,
+    indices,
+    indptr,
+    b_vec,
+    n_rows,
+    lower=True,
+    unit_diagonal=False,
+    block_nnz=256,
+    diag_eps=1e-12,
+):
+    x = torch.zeros_like(b_vec)
+    if n_rows == 0:
+        return x
+    levels = _build_spsv_levels(indptr, indices, n_rows, lower=lower)
+    row_lengths = indptr[1:] - indptr[:-1]
+    max_nnz_per_row = int(row_lengths.max().item()) if n_rows > 0 else 0
+    block_nnz_use = block_nnz
+    max_segments_use = max((max_nnz_per_row + block_nnz_use - 1) // block_nnz_use, 1)
+    while max_segments_use > 2048 and block_nnz_use < 65536:
+        block_nnz_use *= 2
+        max_segments_use = max((max_nnz_per_row + block_nnz_use - 1) // block_nnz_use, 1)
+
+    for rows_lv in levels:
+        n_lv = rows_lv.numel()
+        if n_lv == 0:
+            continue
+        grid = (n_lv,)
+        _spsv_csr_level_kernel[grid](
+            data,
+            indices,
+            indptr,
+            b_vec,
+            x,
+            rows_lv,
+            n_level_rows=n_lv,
+            BLOCK_NNZ=block_nnz_use,
+            MAX_SEGMENTS=max_segments_use,
+            LOWER=lower,
+            UNIT_DIAG=unit_diagonal,
+            DIAG_EPS=diag_eps,
+        )
+    return x
+
+
 def flagsparse_spsv_csr(
     data,
     indices,
@@ -727,59 +881,60 @@ def flagsparse_spsv_csr(
     out=None,
     return_time=False,
 ):
-    """Sparse solve: solve A x = b where A is CSR (triangular or general).
-
-    Current implementation is functionality-first:
-    - Convert CSR to dense on GPU
-    - Use torch.linalg.solve (with optional triangular masking)
-    - Support all value/index dtypes aligned with cuSPARSE SpMV.
-    """
+    """Sparse triangular solve using Triton level-scheduling kernels."""
     data, indices, indptr, b, n_rows, n_cols = _prepare_spsv_inputs(
         data, indices, indptr, b, shape
     )
     if n_rows != n_cols:
         raise ValueError(f"A must be square, got shape={shape}")
-
-    dense = _csr_to_dense(data, indices, indptr, (n_rows, n_cols))
-    cast_back = dense.dtype in (torch.float16, torch.bfloat16)
-
-    if cast_back:
-        dense_ = dense.to(torch.float32)
-        b_ = b.to(torch.float32)
-    else:
-        dense_ = dense
-        b_ = b
-
-    # Apply lower/upper/transpose masks for triangular systems.
-    if lower and not transpose:
-        tri = torch.tril(dense_)
-    elif (not lower) and not transpose:
-        tri = torch.triu(dense_)
-    elif lower and transpose:
-        tri = torch.triu(dense_.mT)
-    else:
-        tri = torch.tril(dense_.mT)
-
-    if unit_diagonal:
-        # Force diagonal to 1 without changing RHS; this matches unit-diagonal assumption.
-        tri = tri.clone()
-        tri.diagonal().fill_(1.0)
-
-    if b_.ndim == 1:
-        b_mat = b_.unsqueeze(1)
-    else:
-        b_mat = b_
-
+    if transpose:
+        raise NotImplementedError("transpose=True is not implemented in Triton SpSV yet")
+    if data.dtype not in (torch.float32, torch.float64):
+        raise TypeError("Triton SpSV currently supports float32/float64")
+    kernel_indices = indices.to(torch.int32) if indices.dtype != torch.int32 else indices
+    kernel_indptr = indptr.to(torch.int64)
+    compute_dtype = data.dtype
+    data_in = data
+    b_in = b
+    if data.dtype == torch.float32:
+        # Improve numerical stability on hard matrices.
+        compute_dtype = torch.float64
+        data_in = data.to(torch.float64)
+        b_in = b.to(torch.float64)
+    diag_eps = 1e-12 if compute_dtype == torch.float64 else 1e-6
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    x_mat = torch.linalg.solve(tri, b_mat)
+    if b_in.ndim == 1:
+        x = _triton_spsv_csr_vector(
+            data_in,
+            kernel_indices,
+            kernel_indptr,
+            b_in,
+            n_rows,
+            lower=lower,
+            unit_diagonal=unit_diagonal,
+            diag_eps=diag_eps,
+        )
+    else:
+        cols = []
+        for j in range(b_in.shape[1]):
+            cols.append(
+                _triton_spsv_csr_vector(
+                    data_in,
+                    kernel_indices,
+                    kernel_indptr,
+                    b_in[:, j],
+                    n_rows,
+                    lower=lower,
+                    unit_diagonal=unit_diagonal,
+                    diag_eps=diag_eps,
+                )
+            )
+        x = torch.stack(cols, dim=1)
+    if compute_dtype != data.dtype:
+        x = x.to(data.dtype)
     torch.cuda.synchronize()
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
-
-    if cast_back:
-        x_mat = x_mat.to(dense.dtype)
-
-    x = x_mat.squeeze(1) if b.ndim == 1 else x_mat
     if out is not None:
         if out.shape != x.shape or out.dtype != x.dtype:
             raise ValueError("out shape/dtype must match result")
@@ -1349,7 +1504,7 @@ def benchmark_spmv_case(
     warmup=20,
     iters=200,
     block_nnz=256,
-    max_segments=64,
+    max_segments=None,
     run_cusparse=True,
 ):
     """Benchmark Triton CSR SpMV vs cuSPARSE (CuPy CSR @ x)."""

@@ -93,7 +93,7 @@ def run_comprehensive_test():
                 f"{'Dense':>10} {'NNZ':>10} "
                 f"{'PyTorch(ms)':>12} {'FlagSparse(ms)':>16} {'cuSPARSE(ms)':>13} "
                 f"{'FS/PT':>12} {'FS/CS':>12} {'OK':>6} "
-                f"{'Err(T)':>12} {'Err(CS)':>12}"
+                f"{'Err(FS)':>12} {'Err(CS)':>12}"
             )
             print("-" * 132)
 

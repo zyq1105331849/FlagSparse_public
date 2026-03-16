@@ -34,8 +34,30 @@ def _fmt_ms(v):
     return "N/A" if v is None else f"{v:.4f}"
 
 
+def _fmt_speedup(other_ms, triton_ms):
+    if other_ms is None or triton_ms is None or triton_ms <= 0:
+        return "N/A"
+    return f"{other_ms / triton_ms:.2f}x"
+
+
 def _fmt_err(v):
     return "N/A" if v is None else f"{v:.2e}"
+
+
+def _tol_for_dtype(dtype):
+    if dtype == torch.float32:
+        return 1e-4, 1e-2
+    return 1e-12, 1e-10
+
+
+DENSE_REF_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+
+
+def _allow_dense_pytorch_ref(shape, dtype):
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    elem_bytes = torch.empty((), dtype=dtype).element_size()
+    dense_bytes = n_rows * n_cols * elem_bytes
+    return dense_bytes <= DENSE_REF_MAX_BYTES
 
 
 def _build_random_triangular_csr(n, value_dtype, index_dtype, device, lower=True):
@@ -267,8 +289,16 @@ def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
         lines = f.readlines()
     data_lines = []
     header_info = None
+    mm_field = "real"
+    mm_symmetry = "general"
     for line in lines:
         line = line.strip()
+        if line.startswith("%%MatrixMarket"):
+            parts = line.split()
+            if len(parts) >= 5:
+                mm_field = parts[3].lower()
+                mm_symmetry = parts[4].lower()
+            continue
         if line.startswith("%"):
             continue
         if not header_info and line:
@@ -285,30 +315,54 @@ def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
     n_rows, n_cols, nnz = header_info
     if n_rows != n_cols:
         raise ValueError("SpSV requires square matrices")
-    if nnz == 0:
-        data = torch.tensor([], dtype=dtype, device=device)
-        indices = torch.tensor([], dtype=torch.int64, device=device)
-        indptr = torch.zeros(n_rows + 1, dtype=torch.int64, device=device)
-        return data, indices, indptr, (n_rows, n_cols)
-    rows_host = []
-    cols_host = []
-    vals_host = []
+    row_maps = [dict() for _ in range(n_rows)]
+
+    def _accum(r, c, v):
+        row = row_maps[r]
+        row[c] = row.get(c, 0.0) + v
+
     for line in data_lines[:nnz]:
         parts = line.split()
+        if len(parts) < 2:
+            continue
+        r = int(parts[0]) - 1
+        c = int(parts[1]) - 1
         if len(parts) >= 3:
-            rows_host.append(int(parts[0]) - 1)
-            cols_host.append(int(parts[1]) - 1)
-            vals_host.append(float(parts[2]))
-    order = sorted(range(len(rows_host)), key=lambda i: (rows_host[i], cols_host[i]))
-    rows_s = [rows_host[i] for i in order]
-    cols_s = [cols_host[i] for i in order]
-    vals_s = [vals_host[i] for i in order]
-    indptr_list = [0]
-    idx = 0
+            v = float(parts[2])
+        elif mm_field == "pattern":
+            v = 1.0
+        else:
+            continue
+        _accum(r, c, v)
+        if mm_symmetry in ("symmetric", "hermitian") and r != c:
+            _accum(c, r, v)
+        elif mm_symmetry == "skew-symmetric" and r != c:
+            _accum(c, r, -v)
+
+    # SpSV test uses lower triangular solve semantics.
+    # Keep only lower-triangular entries (c <= r), then apply requested
+    # diagonal update: diag <- diag + sum(row off-diagonal), and enforce
+    # non-zero diagonal to avoid singular/nan solves.
     for r in range(n_rows):
-        while idx < len(rows_s) and rows_s[idx] == r:
-            idx += 1
-        indptr_list.append(idx)
+        row = row_maps[r]
+        lower_row = {}
+        off_abs_sum = 0.0
+        for c, v in row.items():
+            if c < r:
+                lower_row[c] = lower_row.get(c, 0.0) + v
+                off_abs_sum += abs(v)
+        lower_row[r] = off_abs_sum + 1.0
+        row_maps[r] = lower_row
+
+    cols_s = []
+    vals_s = []
+    indptr_list = [0]
+    for r in range(n_rows):
+        row = row_maps[r]
+        for c in sorted(row.keys()):
+            cols_s.append(c)
+            vals_s.append(row[c])
+        indptr_list.append(len(cols_s))
     data = torch.tensor(vals_s, dtype=dtype, device=device)
     indices = torch.tensor(cols_s, dtype=torch.int64, device=device)
     indptr = torch.tensor(indptr_list, dtype=torch.int64, device=device)
@@ -338,15 +392,20 @@ def run_all_dtypes_spsv_csv(mtx_paths, csv_path):
     rows_out = []
     for value_dtype in VALUE_DTYPES:
         for index_dtype in INDEX_DTYPES:
-            print("=" * 110)
-            print(f"SpSV CSV export — value_dtype: {_dtype_name(value_dtype)}  index_dtype: {_dtype_name(index_dtype)}")
-            print("=" * 110)
+            atol, rtol = _tol_for_dtype(value_dtype)
+            print("=" * 150)
             print(
-                f"{'Matrix':<28} {'N':>6} {'NNZ':>10} "
-                f"{'FS(ms)':>10} {'PT(ms)':>10} {'CU(ms)':>10} "
-                f"{'FS/PT':>8} {'FS/CU':>8} {'Err(PT)':>12} {'Err(CU)':>12}"
+                f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}"
             )
-            print("-" * 110)
+            print("Formats: FlagSparse=CSR, cuSPARSE=CSR, PyTorch=Dense solve.")
+            print("Err(PT)=|FlagSparse-PyTorch|, Err(CU)=|FlagSparse-cuSPARSE|.  PASS if either error within tolerance.")
+            print("-" * 150)
+            print(
+                f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
+                f"{'FlagSparse(ms)':>10} {'CSR(ms)':>10} {'CSC(ms)':>10} {'PyTorch(ms)':>11} "
+                f"{'FS/CSR':>7} {'FS/PT':>7} {'Status':>6} {'Err(PT)':>10} {'Err(CU)':>10}"
+            )
+            print("-" * 150)
             for path in mtx_paths:
                 try:
                     data, indices, indptr, shape = _load_mtx_to_csr_torch(
@@ -363,34 +422,50 @@ def run_all_dtypes_spsv_csv(mtx_paths, csv_path):
                     x, t_ms = fs.flagsparse_spsv_csr(
                         data, indices, indptr, b, shape, lower=True, return_time=True
                     )
-                    A_dense = _csr_to_dense(
-                        data, indices.to(torch.int64), indptr, shape
-                    )
-                    if value_dtype in (torch.float16, torch.bfloat16):
-                        A_ref = A_dense.to(torch.float32)
-                        b_ref = b.to(torch.float32)
+                    pytorch_ms = None
+                    err_pt = None
+                    ok_pt = False
+                    pt_skip_reason = None
+                    if _allow_dense_pytorch_ref(shape, value_dtype):
+                        try:
+                            A_dense = _csr_to_dense(
+                                data, indices.to(torch.int64), indptr, shape
+                            )
+                            if value_dtype in (torch.float16, torch.bfloat16):
+                                A_ref = A_dense.to(torch.float32)
+                                b_ref = b.to(torch.float32)
+                            else:
+                                A_ref = A_dense
+                                b_ref = b
+                            # PyTorch baseline (dense solve)
+                            e0 = torch.cuda.Event(True)
+                            e1 = torch.cuda.Event(True)
+                            torch.cuda.synchronize()
+                            e0.record()
+                            x_ref = torch.linalg.solve(
+                                A_ref, b_ref.unsqueeze(1)
+                            ).squeeze(1)
+                            e1.record()
+                            torch.cuda.synchronize()
+                            pytorch_ms = e0.elapsed_time(e1)
+                            if value_dtype in (torch.float16, torch.bfloat16):
+                                x_ref = x_ref.to(value_dtype)
+                            err_pt = float(torch.max(torch.abs(x - x_ref)).item()) if n_rows > 0 else 0.0
+                            ok_pt = torch.allclose(x, x_ref, atol=atol, rtol=rtol)
+                        except RuntimeError as e:
+                            if "out of memory" in str(e).lower():
+                                pt_skip_reason = "PyTorch dense ref OOM; skipped"
+                            else:
+                                raise
                     else:
-                        A_ref = A_dense
-                        b_ref = b
-                    # PyTorch baseline
-                    e0 = torch.cuda.Event(True)
-                    e1 = torch.cuda.Event(True)
-                    torch.cuda.synchronize()
-                    e0.record()
-                    x_ref = torch.linalg.solve(
-                        A_ref, b_ref.unsqueeze(1)
-                    ).squeeze(1)
-                    e1.record()
-                    torch.cuda.synchronize()
-                    pytorch_ms = e0.elapsed_time(e1)
-                    if value_dtype in (torch.float16, torch.bfloat16):
-                        x_ref = x_ref.to(value_dtype)
-
-                    err_pt = float(torch.max(torch.abs(x - x_ref)).item()) if n_rows > 0 else 0.0
+                        pt_skip_reason = (
+                            f"PyTorch dense ref skipped (> {DENSE_REF_MAX_BYTES // (1024**3)} GiB dense matrix)"
+                        )
 
                     # CuPy baseline (if supported)
                     cupy_ms = None
                     err_cu = None
+                    ok_cu = False
                     if (
                         cp is not None
                         and cpx_sparse is not None
@@ -416,66 +491,86 @@ def run_all_dtypes_spsv_csv(mtx_paths, csv_path):
                             cupy_ms = cp.cuda.get_elapsed_time(c0, c1) / ITERS
                             x_cu_t = torch.utils.dlpack.from_dlpack(x_cu.toDlpack()).to(x.dtype)
                             err_cu = float(torch.max(torch.abs(x - x_cu_t)).item()) if n_rows > 0 else 0.0
+                            ok_cu = torch.allclose(x, x_cu_t, atol=atol, rtol=rtol)
                         except Exception:
                             cupy_ms = None
                             err_cu = None
 
-                    fs_vs_pt = (pytorch_ms / t_ms) if (t_ms and t_ms > 0) else None
-                    fs_vs_cu = (cupy_ms / t_ms) if (cupy_ms is not None and t_ms and t_ms > 0) else None
+                    status = "PASS" if (ok_pt or ok_cu) else "FAIL"
+                    if (not ok_pt) and (not ok_cu) and (err_pt is None and err_cu is None):
+                        status = "REF_FAIL"
                     rows_out.append(
                         {
                             "matrix": os.path.basename(path),
                             "value_dtype": _dtype_name(value_dtype),
                             "index_dtype": _dtype_name(index_dtype),
-                            "n": n_rows,
+                            "n_rows": n_rows,
+                            "n_cols": n_cols,
                             "nnz": int(data.numel()),
-                            "flagsparse_ms": t_ms,
+                            "triton_ms": t_ms,
                             "pytorch_ms": pytorch_ms,
-                            "cupy_ms": cupy_ms,
-                            "fs_vs_pytorch": fs_vs_pt,
-                            "fs_vs_cupy": fs_vs_cu,
-                            "err_vs_pytorch": err_pt,
-                            "err_vs_cupy": err_cu,
+                            "cusparse_ms": cupy_ms,
+                            "csc_ms": None,
+                            "status": status,
+                            "err_pt": err_pt,
+                            "err_cu": err_cu,
                         }
                     )
-                    name = os.path.basename(path)
-                    fs_vs_pt_s = f"{fs_vs_pt:.2f}x" if fs_vs_pt is not None else "N/A"
-                    fs_vs_cu_s = f"{fs_vs_cu:.2f}x" if fs_vs_cu is not None else "N/A"
+                    name = os.path.basename(path)[:27]
+                    if len(os.path.basename(path)) > 27:
+                        name = name + "…"
                     print(
-                        f"{name:<28} {n_rows:>6} {int(data.numel()):>10} "
-                        f"{_fmt_ms(t_ms):>10} {_fmt_ms(pytorch_ms):>10} {_fmt_ms(cupy_ms):>10} "
-                        f"{fs_vs_pt_s:>8} {fs_vs_cu_s:>8} {_fmt_err(err_pt):>12} {_fmt_err(err_cu):>12}"
+                        f"{name:<28} {n_rows:>7} {n_cols:>7} {int(data.numel()):>10} "
+                        f"{_fmt_ms(t_ms):>10} {_fmt_ms(cupy_ms):>10} {_fmt_ms(None):>10} {_fmt_ms(pytorch_ms):>11} "
+                        f"{_fmt_speedup(cupy_ms, t_ms):>7} {_fmt_speedup(pytorch_ms, t_ms):>7} "
+                        f"{status:>6} {_fmt_err(err_pt):>10} {_fmt_err(err_cu):>10}"
                     )
+                    if pt_skip_reason:
+                        print(f"  NOTE: {pt_skip_reason}")
                 except Exception as e:
+                    err_msg = str(e)
+                    status = "SKIP" if "SpSV requires square matrices" in err_msg else "ERROR"
                     rows_out.append(
                         {
                             "matrix": os.path.basename(path),
                             "value_dtype": _dtype_name(value_dtype),
                             "index_dtype": _dtype_name(index_dtype),
-                            "n": "ERR",
+                            "n_rows": "ERR",
+                            "n_cols": "ERR",
                             "nnz": "ERR",
-                            "flagsparse_ms": None,
+                            "triton_ms": None,
                             "pytorch_ms": None,
-                            "cupy_ms": None,
-                            "fs_vs_pytorch": None,
-                            "fs_vs_cupy": None,
-                            "err_vs_pytorch": str(e),
-                            "err_vs_cupy": None,
+                            "cusparse_ms": None,
+                            "csc_ms": None,
+                            "status": status,
+                            "err_pt": None,
+                            "err_cu": None,
                         }
                     )
+                    name = os.path.basename(path)[:27]
+                    if len(os.path.basename(path)) > 27:
+                        name = name + "…"
+                    print(
+                        f"{name:<28} {'ERR':>7} {'ERR':>7} {'ERR':>10} "
+                        f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>11} "
+                        f"{'N/A':>7} {'N/A':>7} {status:>6} {_fmt_err(None):>10} {_fmt_err(None):>10}"
+                    )
+                    print(f"  {status}: {e}")
+            print("-" * 150)
     fieldnames = [
         "matrix",
         "value_dtype",
         "index_dtype",
-        "n",
+        "n_rows",
+        "n_cols",
         "nnz",
-        "flagsparse_ms",
+        "triton_ms",
         "pytorch_ms",
-        "cupy_ms",
-        "fs_vs_pytorch",
-        "fs_vs_cupy",
-        "err_vs_pytorch",
-        "err_vs_cupy",
+        "cusparse_ms",
+        "csc_ms",
+        "status",
+        "err_pt",
+        "err_cu",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)

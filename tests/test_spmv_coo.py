@@ -29,6 +29,12 @@ def _fmt_ms(v):
     return "N/A" if v is None else f"{v:.4f}"
 
 
+def _fmt_speedup(other_ms, triton_ms):
+    if other_ms is None or triton_ms is None or triton_ms <= 0:
+        return "N/A"
+    return f"{other_ms / triton_ms:.2f}x"
+
+
 def _fmt_err(v):
     return "N/A" if v is None else f"{v:.2e}"
 
@@ -147,37 +153,82 @@ def _load_mtx_to_coo_torch(file_path, dtype=torch.float32, device=None):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     with open(file_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
+
+    mm_field = "real"
+    mm_symmetry = "general"
     data_lines = []
     header_info = None
     for line in lines:
-        line = line.strip()
-        if line.startswith("%"):
+        stripped = line.strip()
+        if stripped.startswith("%%MatrixMarket"):
+            tokens = stripped.split()
+            if len(tokens) >= 5:
+                mm_field = tokens[3].lower()
+                mm_symmetry = tokens[4].lower()
             continue
-        if not header_info and line:
-            parts = line.split()
+        if stripped.startswith("%"):
+            continue
+        if not header_info and stripped:
+            parts = stripped.split()
             n_rows = int(parts[0])
             n_cols = int(parts[1])
             nnz = int(parts[2]) if len(parts) > 2 else 0
             header_info = (n_rows, n_cols, nnz)
             continue
-        if line:
-            data_lines.append(line)
+        if stripped:
+            data_lines.append(stripped)
     if header_info is None:
         raise ValueError(f"Cannot parse .mtx header: {file_path}")
     n_rows, n_cols, nnz = header_info
+
+    is_pattern = (mm_field == "pattern")
+    is_symmetric = mm_symmetry in ("symmetric", "hermitian")
+    is_skew = (mm_symmetry == "skew-symmetric")
+
     rows_host = []
     cols_host = []
     vals_host = []
     for line in data_lines[:nnz]:
         parts = line.split()
-        if len(parts) >= 3:
-            rows_host.append(int(parts[0]) - 1)
-            cols_host.append(int(parts[1]) - 1)
-            vals_host.append(float(parts[2]))
+        if len(parts) < 2:
+            continue
+        r = int(parts[0]) - 1
+        c = int(parts[1]) - 1
+        v = 1.0 if is_pattern else (float(parts[2]) if len(parts) >= 3 else 0.0)
+        if 0 <= r < n_rows and 0 <= c < n_cols:
+            rows_host.append(r)
+            cols_host.append(c)
+            vals_host.append(v)
+            if r != c:
+                if is_symmetric and 0 <= c < n_rows and 0 <= r < n_cols:
+                    rows_host.append(c)
+                    cols_host.append(r)
+                    vals_host.append(v)
+                elif is_skew and 0 <= c < n_rows and 0 <= r < n_cols:
+                    rows_host.append(c)
+                    cols_host.append(r)
+                    vals_host.append(-v)
     rows = torch.tensor(rows_host, dtype=torch.int64, device=device)
     cols = torch.tensor(cols_host, dtype=torch.int64, device=device)
     vals = torch.tensor(vals_host, dtype=dtype, device=device)
     return vals, rows, cols, (n_rows, n_cols)
+
+
+def _tol_for_dtype(dtype):
+    if dtype == torch.float32:
+        return 1e-4, 1e-2
+    return 1e-12, 1e-10
+
+
+# Dense PyTorch reference for SpSV can OOM on large matrices.
+DENSE_REF_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+
+
+def _allow_dense_pytorch_ref(shape, dtype):
+    n_rows, n_cols = shape
+    elem_bytes = torch.empty((), dtype=dtype).element_size()
+    dense_bytes = int(n_rows) * int(n_cols) * int(elem_bytes)
+    return dense_bytes <= DENSE_REF_MAX_BYTES
 
 
 def run_all_dtypes_coo_csv(mtx_paths, csv_path):
@@ -187,15 +238,18 @@ def run_all_dtypes_coo_csv(mtx_paths, csv_path):
     device = torch.device("cuda")
     rows_out = []
     for dtype in VALUE_DTYPES:
-        print("=" * 110)
-        print(f"COO SpMV CSV export — dtype: {_dtype_name(dtype)}")
-        print("=" * 110)
+        atol, rtol = _tol_for_dtype(dtype)
+        print("=" * 150)
+        print(f"Value dtype: {_dtype_name(dtype)}  |  Index dtype: int32")
+        print("Formats: FlagSparse=COO, cuSPARSE=CSR, PyTorch=COO.")
+        print("Err(PT)=|FlagSparse-PyTorch|, Err(CU)=|FlagSparse-cuSPARSE|.  PASS if either error within tolerance.")
+        print("-" * 150)
         print(
-            f"{'Matrix':<32} {'M':>6} {'N':>6} {'NNZ':>10} "
-            f"{'FS(ms)':>10} {'PT(ms)':>10} {'CU(ms)':>10} "
-            f"{'FS/PT':>8} {'FS/CU':>8} {'Err(PT)':>12} {'Err(CU)':>12}"
+            f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
+            f"{'FlagSparse(ms)':>10} {'CSR(ms)':>10} {'CSC(ms)':>10} {'PyTorch(ms)':>11} "
+            f"{'FS/CSR':>7} {'FS/PT':>7} {'Status':>6} {'Err(PT)':>10} {'Err(CU)':>10}"
         )
-        print("-" * 110)
+        print("-" * 150)
         for path in mtx_paths:
             try:
                 data, row, col, shape = _load_mtx_to_coo_torch(
@@ -227,9 +281,11 @@ def run_all_dtypes_coo_csv(mtx_paths, csv_path):
                     y_pt = torch.zeros(m, dtype=dtype, device=device)
                     pt_ms = 0.0
                 err_pt = float(torch.max(torch.abs(y_fs - y_pt)).item()) if m > 0 else 0.0
+                triton_ok_pt = torch.allclose(y_fs, y_pt, atol=atol, rtol=rtol)
                 # CuPy baseline (optional)
                 cu_ms = None
                 err_cu = None
+                triton_ok_cu = False
                 if cp is not None and cpx_sparse is not None:
                     try:
                         data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
@@ -252,65 +308,79 @@ def run_all_dtypes_coo_csv(mtx_paths, csv_path):
                         cu_ms = cp.cuda.get_elapsed_time(c0, c1) / ITERS
                         y_cu_t = torch.utils.dlpack.from_dlpack(y_cu.toDlpack()).to(dtype)
                         err_cu = float(torch.max(torch.abs(y_fs - y_cu_t)).item()) if m > 0 else 0.0
+                        triton_ok_cu = torch.allclose(y_fs, y_cu_t, atol=atol, rtol=rtol)
                     except Exception:
                         cu_ms = None
                         err_cu = None
-                fs_vs_pt = (pt_ms / fs_ms) if (fs_ms and fs_ms > 0) else None
-                fs_vs_cu = (cu_ms / fs_ms) if (cu_ms is not None and fs_ms and fs_ms > 0) else None
+                status = "PASS" if (triton_ok_pt or triton_ok_cu) else "FAIL"
                 rows_out.append(
                     {
                         "matrix": os.path.basename(path),
                         "value_dtype": _dtype_name(dtype),
-                        "m": m,
-                        "n": n,
+                        "index_dtype": "torch.int32",
+                        "n_rows": m,
+                        "n_cols": n,
                         "nnz": int(data.numel()),
-                        "flagsparse_ms": fs_ms,
+                        "triton_ms": fs_ms,
+                        "cusparse_ms": cu_ms,
                         "pytorch_ms": pt_ms,
-                        "cupy_ms": cu_ms,
-                        "fs_vs_pytorch": fs_vs_pt,
-                        "fs_vs_cupy": fs_vs_cu,
-                        "err_vs_pytorch": err_pt,
-                        "err_vs_cupy": err_cu,
+                        "csc_ms": None,
+                        "status": status,
+                        "err_pt": err_pt,
+                        "err_cu": err_cu,
                     }
                 )
-                name = os.path.basename(path)
-                fs_vs_pt_s = f"{fs_vs_pt:.2f}x" if fs_vs_pt is not None else "N/A"
-                fs_vs_cu_s = f"{fs_vs_cu:.2f}x" if fs_vs_cu is not None else "N/A"
+                name = os.path.basename(path)[:27]
+                if len(os.path.basename(path)) > 27:
+                    name = name + "…"
                 print(
-                    f"{name:<32} {m:>6} {n:>6} {int(data.numel()):>10} "
-                    f"{_fmt_ms(fs_ms):>10} {_fmt_ms(pt_ms):>10} {_fmt_ms(cu_ms):>10} "
-                    f"{fs_vs_pt_s:>8} {fs_vs_cu_s:>8} {_fmt_err(err_pt):>12} {_fmt_err(err_cu):>12}"
+                    f"{name:<28} {m:>7} {n:>7} {int(data.numel()):>10} "
+                    f"{_fmt_ms(fs_ms):>10} {_fmt_ms(cu_ms):>10} {_fmt_ms(None):>10} {_fmt_ms(pt_ms):>11} "
+                    f"{_fmt_speedup(cu_ms, fs_ms):>7} {_fmt_speedup(pt_ms, fs_ms):>7} "
+                    f"{status:>6} {_fmt_err(err_pt):>10} {_fmt_err(err_cu):>10}"
                 )
             except Exception as e:
                 rows_out.append(
                     {
                         "matrix": os.path.basename(path),
                         "value_dtype": _dtype_name(dtype),
-                        "m": "ERR",
-                        "n": "ERR",
+                        "index_dtype": "torch.int32",
+                        "n_rows": "ERR",
+                        "n_cols": "ERR",
                         "nnz": "ERR",
-                        "flagsparse_ms": None,
+                        "triton_ms": None,
+                        "cusparse_ms": None,
                         "pytorch_ms": None,
-                        "cupy_ms": None,
-                        "fs_vs_pytorch": None,
-                        "fs_vs_cupy": None,
-                        "err_vs_pytorch": str(e),
-                        "err_vs_cupy": None,
+                        "csc_ms": None,
+                        "status": "ERROR",
+                        "err_pt": None,
+                        "err_cu": None,
                     }
                 )
+                name = os.path.basename(path)[:27]
+                if len(os.path.basename(path)) > 27:
+                    name = name + "…"
+                print(
+                    f"{name:<28} {'ERR':>7} {'ERR':>7} {'ERR':>10} "
+                    f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>11} "
+                    f"{'N/A':>7} {'N/A':>7} {'ERROR':>6} {_fmt_err(None):>10} {_fmt_err(None):>10}"
+                )
+                print(f"  ERROR: {e}")
+        print("-" * 150)
     fieldnames = [
         "matrix",
         "value_dtype",
-        "m",
-        "n",
+        "index_dtype",
+        "n_rows",
+        "n_cols",
         "nnz",
-        "flagsparse_ms",
+        "triton_ms",
+        "cusparse_ms",
         "pytorch_ms",
-        "cupy_ms",
-        "fs_vs_pytorch",
-        "fs_vs_cupy",
-        "err_vs_pytorch",
-        "err_vs_cupy",
+        "csc_ms",
+        "status",
+        "err_pt",
+        "err_cu",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
