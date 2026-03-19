@@ -20,10 +20,14 @@ except ImportError:
 
 
 SUPPORTED_VALUE_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
     torch.float32,
     torch.float64,
+    torch.complex64,
+    torch.complex128,
 )
-SUPPORTED_INDEX_DTYPES = (torch.int32,)
+SUPPORTED_INDEX_DTYPES = (torch.int32, torch.int64)
 _INDEX_LIMIT_INT32 = 2**31 - 1
 
 
@@ -585,8 +589,10 @@ def flagsparse_spmv_csr(
     data, kernel_indices, kernel_indptr, x, n_rows, n_cols = _prepare_spmv_csr_inputs(
         data, indices, indptr, x, shape
     )
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
+    t0 = None
+    if return_time:
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
     y = _triton_spmv_csr_impl(
         data,
         kernel_indices,
@@ -596,8 +602,10 @@ def flagsparse_spmv_csr(
         block_nnz=block_nnz,
         max_segments=max_segments,
     )
-    torch.cuda.synchronize()
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    elapsed_ms = None
+    if return_time:
+        torch.cuda.synchronize()
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
     if out is not None:
         if out.shape != y.shape or out.dtype != y.dtype:
             raise ValueError("out shape/dtype must match result")
@@ -621,7 +629,7 @@ def flagsparse_spmv_coo(
 ):
     """COO SpMV: y = A @ x by converting COO (row, col, data) to CSR and calling flagsparse_spmv_csr.
 
-    Only float32/float64 values and int32 indices are supported (aligned with SUPPORTED_VALUE_DTYPES/INDEX_DTYPES).
+    Supports the same value and index dtypes as flagsparse_spmv_csr.
     """
     if not all(torch.is_tensor(t) for t in (data, row, col, x)):
         raise TypeError("data, row, col, x must all be torch.Tensor")
@@ -632,7 +640,9 @@ def flagsparse_spmv_coo(
 
     n_rows, n_cols = int(shape[0]), int(shape[1])
     if data.dtype not in SUPPORTED_VALUE_DTYPES:
-        raise TypeError("data dtype must be float32 or float64")
+        raise TypeError(
+            "data dtype must be one of: float16, bfloat16, float32, float64, complex64, complex128"
+        )
     if x.dtype != data.dtype:
         raise TypeError("x dtype must match data dtype")
 
@@ -1517,7 +1527,7 @@ def benchmark_spmv_case(
     data, kernel_indices, kernel_indptr, x, _, _ = _prepare_spmv_csr_inputs(
         data, indices, indptr, x, shape
     )
-    triton_y, triton_ms = flagsparse_spmv_csr(
+    triton_op = lambda: flagsparse_spmv_csr(
         data,
         kernel_indices,
         kernel_indptr,
@@ -1525,8 +1535,9 @@ def benchmark_spmv_case(
         shape,
         block_nnz=block_nnz,
         max_segments=max_segments,
-        return_time=True,
+        return_time=False,
     )
+    triton_y, triton_ms = _benchmark_cuda_op(triton_op, warmup=warmup, iters=iters)
     _cupy_supported_dtypes = (
         torch.float32,
         torch.float64,

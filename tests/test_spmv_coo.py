@@ -39,6 +39,52 @@ def _fmt_err(v):
     return "N/A" if v is None else f"{v:.2e}"
 
 
+def _status_str(ok, available):
+    if not available:
+        return "N/A"
+    return "PASS" if ok else "FAIL"
+
+
+def _allclose_error_ratio(actual, reference, atol, rtol):
+    if actual.numel() == 0:
+        return 0.0
+    diff = torch.abs(actual - reference).to(torch.float64)
+    tol = (atol + rtol * torch.abs(reference)).to(torch.float64)
+    return float(torch.max(diff / tol).item())
+
+
+def _reference_dtype(dtype):
+    return torch.float64 if dtype == torch.float32 else dtype
+
+
+def _pytorch_coo_reference(data, row, col, x, shape, out_dtype):
+    ref_dtype = _reference_dtype(out_dtype)
+    data_ref = data.to(ref_dtype)
+    x_ref = x.to(ref_dtype)
+    coo_ref = torch.sparse_coo_tensor(
+        torch.stack([row.to(torch.int64), col.to(torch.int64)]),
+        data_ref,
+        shape,
+        device=data.device,
+    ).coalesce()
+    y_ref = torch.sparse.mm(coo_ref, x_ref.unsqueeze(1)).squeeze(1)
+    return y_ref.to(out_dtype) if ref_dtype != out_dtype else y_ref
+
+
+def _cupy_coo_reference(data, row, col, x, shape, out_dtype):
+    ref_dtype = _reference_dtype(out_dtype)
+    data_ref = data.to(ref_dtype)
+    x_ref = x.to(ref_dtype)
+    data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data_ref))
+    row_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(row.to(torch.int64)))
+    col_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(col.to(torch.int64)))
+    x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x_ref))
+    A_cp_ref = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape).tocsr()
+    y_ref = A_cp_ref @ x_cp
+    y_ref_t = torch.utils.dlpack.from_dlpack(y_ref.toDlpack())
+    return y_ref_t.to(out_dtype) if ref_dtype != out_dtype else y_ref_t
+
+
 def _dense_to_coo(A):
     rows, cols = A.nonzero(as_tuple=True)
     data = A[rows, cols]
@@ -58,9 +104,12 @@ def run_synthetic():
     print()
 
     for dtype in VALUE_DTYPES:
+        atol, rtol = _tol_for_dtype(dtype)
         print("-" * 110)
         print(f"dtype: {_dtype_name(dtype)}  index_dtype: int32")
         print("-" * 110)
+        print("Timing stays in native dtype. For float32, correctness references use float64 compute then cast.")
+        print("Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|)).")
         print(
             f"{'M':>6} {'N':>6} {'NNZ':>10} "
             f"{'FS(ms)':>10} {'PT(ms)':>10} {'CU(ms)':>10} "
@@ -103,7 +152,8 @@ def run_synthetic():
                 y_pt = torch.zeros(m, dtype=dtype, device=device)
                 pt_ms = 0.0
 
-            err_pt = float(torch.max(torch.abs(y_fs - y_pt)).item()) if m > 0 else 0.0
+            y_pt_ref = _pytorch_coo_reference(data, row, col, x, (m, n), dtype)
+            err_pt = _allclose_error_ratio(y_fs, y_pt_ref, atol, rtol)
 
             # CuPy CSR 基线（若可用）
             cu_ms = None
@@ -128,8 +178,8 @@ def run_synthetic():
                     c1.record()
                     c1.synchronize()
                     cu_ms = cp.cuda.get_elapsed_time(c0, c1) / ITERS
-                    y_cu_t = torch.utils.dlpack.from_dlpack(y_cu.toDlpack()).to(dtype)
-                    err_cu = float(torch.max(torch.abs(y_fs - y_cu_t)).item()) if m > 0 else 0.0
+                    y_cu_ref = _cupy_coo_reference(data, row, col, x, (m, n), dtype)
+                    err_cu = _allclose_error_ratio(y_fs, y_cu_ref, atol, rtol)
                 except Exception:
                     cu_ms = None
                     err_cu = None
@@ -242,12 +292,13 @@ def run_all_dtypes_coo_csv(mtx_paths, csv_path):
         print("=" * 150)
         print(f"Value dtype: {_dtype_name(dtype)}  |  Index dtype: int32")
         print("Formats: FlagSparse=COO, cuSPARSE=CSR, PyTorch=COO.")
-        print("Err(PT)=|FlagSparse-PyTorch|, Err(CU)=|FlagSparse-cuSPARSE|.  PASS if either error within tolerance.")
+        print("Timing stays in native dtype. For float32, correctness references use float64 compute then cast.")
+        print("PT/CU show per-reference correctness. Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|)).")
         print("-" * 150)
         print(
             f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
             f"{'FlagSparse(ms)':>10} {'CSR(ms)':>10} {'CSC(ms)':>10} {'PyTorch(ms)':>11} "
-            f"{'FS/CSR':>7} {'FS/PT':>7} {'Status':>6} {'Err(PT)':>10} {'Err(CU)':>10}"
+            f"{'FS/CSR':>7} {'FS/PT':>7} {'PT':>6} {'CU':>6} {'Err(PT)':>10} {'Err(CU)':>10}"
         )
         print("-" * 150)
         for path in mtx_paths:
@@ -280,8 +331,9 @@ def run_all_dtypes_coo_csv(mtx_paths, csv_path):
                 else:
                     y_pt = torch.zeros(m, dtype=dtype, device=device)
                     pt_ms = 0.0
-                err_pt = float(torch.max(torch.abs(y_fs - y_pt)).item()) if m > 0 else 0.0
-                triton_ok_pt = torch.allclose(y_fs, y_pt, atol=atol, rtol=rtol)
+                y_pt_ref = _pytorch_coo_reference(data, row, col, x, shape, dtype)
+                err_pt = _allclose_error_ratio(y_fs, y_pt_ref, atol, rtol)
+                triton_ok_pt = (not math.isnan(err_pt)) and err_pt <= 1.0
                 # CuPy baseline (optional)
                 cu_ms = None
                 err_cu = None
@@ -306,13 +358,15 @@ def run_all_dtypes_coo_csv(mtx_paths, csv_path):
                         c1.record()
                         c1.synchronize()
                         cu_ms = cp.cuda.get_elapsed_time(c0, c1) / ITERS
-                        y_cu_t = torch.utils.dlpack.from_dlpack(y_cu.toDlpack()).to(dtype)
-                        err_cu = float(torch.max(torch.abs(y_fs - y_cu_t)).item()) if m > 0 else 0.0
-                        triton_ok_cu = torch.allclose(y_fs, y_cu_t, atol=atol, rtol=rtol)
+                        y_cu_ref = _cupy_coo_reference(data, row, col, x, shape, dtype)
+                        err_cu = _allclose_error_ratio(y_fs, y_cu_ref, atol, rtol)
+                        triton_ok_cu = (not math.isnan(err_cu)) and err_cu <= 1.0
                     except Exception:
                         cu_ms = None
                         err_cu = None
                 status = "PASS" if (triton_ok_pt or triton_ok_cu) else "FAIL"
+                pt_status = _status_str(triton_ok_pt, err_pt is not None)
+                cu_status = _status_str(triton_ok_cu, err_cu is not None)
                 rows_out.append(
                     {
                         "matrix": os.path.basename(path),
@@ -325,6 +379,8 @@ def run_all_dtypes_coo_csv(mtx_paths, csv_path):
                         "cusparse_ms": cu_ms,
                         "pytorch_ms": pt_ms,
                         "csc_ms": None,
+                        "pt_status": pt_status,
+                        "cu_status": cu_status,
                         "status": status,
                         "err_pt": err_pt,
                         "err_cu": err_cu,
@@ -337,7 +393,7 @@ def run_all_dtypes_coo_csv(mtx_paths, csv_path):
                     f"{name:<28} {m:>7} {n:>7} {int(data.numel()):>10} "
                     f"{_fmt_ms(fs_ms):>10} {_fmt_ms(cu_ms):>10} {_fmt_ms(None):>10} {_fmt_ms(pt_ms):>11} "
                     f"{_fmt_speedup(cu_ms, fs_ms):>7} {_fmt_speedup(pt_ms, fs_ms):>7} "
-                    f"{status:>6} {_fmt_err(err_pt):>10} {_fmt_err(err_cu):>10}"
+                    f"{pt_status:>6} {cu_status:>6} {_fmt_err(err_pt):>10} {_fmt_err(err_cu):>10}"
                 )
             except Exception as e:
                 rows_out.append(
@@ -378,6 +434,8 @@ def run_all_dtypes_coo_csv(mtx_paths, csv_path):
         "cusparse_ms",
         "pytorch_ms",
         "csc_ms",
+        "pt_status",
+        "cu_status",
         "status",
         "err_pt",
         "err_cu",

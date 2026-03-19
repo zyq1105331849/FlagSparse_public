@@ -4,10 +4,11 @@ import torch
 import flagsparse as ast
 
 VALUE_DTYPES = [
+    torch.float16,
     torch.float32,
     torch.float64,
 ]
-INDEX_DTYPES = [torch.int32]
+INDEX_DTYPES = [torch.int32, torch.int64]
 TEST_CASES = [
     (32_768, 1_024),
     (131_072, 4_096),
