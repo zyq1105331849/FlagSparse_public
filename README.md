@@ -18,7 +18,7 @@ pip install torch triton cupy-cuda12x
 
 ## Layout
 
-- `src/flagsparse/` — core package
+- `src/flagsparse/` — core package (`sparse_operations/` is emitted as several `.py` modules from string literals in `flagsparse.py`)
 - `tests/` — pytest tests
 - `benchmark/` — performance benchmarks
 

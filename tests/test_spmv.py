@@ -112,14 +112,17 @@ def _allclose_error_ratio(actual, reference, atol, rtol):
 
 
 def _benchmark_flagsparse_spmv(data, indices, indptr, x, shape, warmup, iters, block_nnz, max_segments):
-    op = lambda: ast.flagsparse_spmv_csr(
+    prepared = ast.prepare_spmv_csr(
         data,
         indices,
         indptr,
-        x,
         shape,
         block_nnz=block_nnz,
         max_segments=max_segments,
+    )
+    op = lambda: ast.flagsparse_spmv_csr(
+        x=x,
+        prepared=prepared,
         return_time=False,
     )
     y = op()

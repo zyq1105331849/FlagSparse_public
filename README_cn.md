@@ -18,7 +18,7 @@ pip install torch triton cupy-cuda12x
 
 ## 目录说明
 
-- `src/flagsparse/` — 核心包
+- `src/flagsparse/` — 核心包（`sparse_operations/` 由 `flagsparse.py` 内嵌字符串生成多个 `.py`）
 - `tests/` — pytest 测试
 - `benchmark/` — 性能基准
 
