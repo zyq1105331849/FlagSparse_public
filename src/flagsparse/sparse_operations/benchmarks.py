@@ -1,4 +1,4 @@
-"""Benchmarks for gather, scatter, and SpMV."""
+"""Benchmarks for gather, scatter, SpMV, SpMM, SpGEMM, SDDMM, and SpSM."""
 
 from ._common import *
 
@@ -11,6 +11,10 @@ from .gather_scatter import (
     _triton_scatter_impl,
 )
 from .spmv_csr import flagsparse_spmv_csr, prepare_spmv_csr
+from .spmm_csr import benchmark_spmm_case, comprehensive_spmm_test
+from .spgemm_csr import benchmark_spgemm_case
+from .sddmm_csr import benchmark_sddmm_case
+from .spsm import benchmark_spsm_case
 
 def benchmark_gather_case(
     dense_size=65536,
@@ -438,4 +442,33 @@ def comprehensive_scatter_test(
         iters=iters,
         run_cusparse=run_cusparse,
         unique_indices=unique_indices,
+    )
+
+
+def comprehensive_spsm_test(
+    fmt="csr",
+    n_rows=1024,
+    n_rhs=32,
+    nnz=8192,
+    dtype=torch.float32,
+    index_dtype=torch.int32,
+    alpha=1.0,
+    lower=True,
+    unit_diagonal=False,
+    warmup=10,
+    iters=50,
+):
+    """Full SpSM benchmark entry for one configuration."""
+    return benchmark_spsm_case(
+        fmt=fmt,
+        n_rows=n_rows,
+        n_rhs=n_rhs,
+        nnz=nnz,
+        value_dtype=dtype,
+        index_dtype=index_dtype,
+        alpha=alpha,
+        lower=lower,
+        unit_diagonal=unit_diagonal,
+        warmup=warmup,
+        iters=iters,
     )
