@@ -120,14 +120,17 @@ def _triton_gather_impl(dense_vector, kernel_indices, block_size=1024):
     return sparse_values
 
 
-def _triton_scatter_impl(sparse_values, kernel_indices, dense_size, out=None, block_size=1024):
+def _triton_scatter_impl(
+    sparse_values, kernel_indices, dense_size, out=None, block_size=1024, reset_output=True
+):
     if out is None:
         dense_values = torch.zeros(
             dense_size, dtype=sparse_values.dtype, device=sparse_values.device
         )
     else:
         dense_values = out
-        dense_values.zero_()
+        if reset_output:
+            dense_values.zero_()
 
     nnz = kernel_indices.numel()
     if nnz == 0:
@@ -240,14 +243,15 @@ def _make_scatter_selector_matrix(indices, dense_size, value_dtype):
     ).coalesce()
 
 
-def _pytorch_scatter_impl(sparse_values, indices, dense_size, out=None):
+def _pytorch_scatter_impl(sparse_values, indices, dense_size, out=None, reset_output=True):
     if out is None:
         dense_values = torch.zeros(
             dense_size, dtype=sparse_values.dtype, device=sparse_values.device
         )
     else:
         dense_values = out
-        dense_values.zero_()
+        if reset_output:
+            dense_values.zero_()
     dense_values.index_copy_(0, indices.to(torch.int64), sparse_values)
     return dense_values
 
@@ -290,6 +294,8 @@ def flagsparse_scatter(
     mode="raise",
     block_size=1024,
     return_time=False,
+    reset_output=True,
+    dtype_policy="auto",
 ):
     """CuPy-style scatter (put): a[indices] = values (in-place)."""
     if mode != "raise":
@@ -298,11 +304,13 @@ def flagsparse_scatter(
     dense_tensor, dense_backend = _to_torch_tensor(a, "a")
     values_tensor, _ = _to_torch_tensor(values, "values")
     indices_tensor, _ = _to_torch_tensor(indices, "indices")
-    values_tensor, _, kernel_indices, dense_size = _prepare_scatter_inputs(
+    values_tensor, _, kernel_indices, dense_size, _ = _prepare_scatter_inputs(
         values_tensor,
         indices_tensor,
         dense_size=dense_tensor.numel(),
         out=dense_tensor,
+        dtype_policy=dtype_policy,
+        return_metadata=True,
     )
 
     torch.cuda.synchronize()
@@ -313,6 +321,7 @@ def flagsparse_scatter(
         dense_size=dense_size,
         out=dense_tensor,
         block_size=block_size,
+        reset_output=reset_output,
     )
     torch.cuda.synchronize()
     execution_time_ms = (time.perf_counter() - start_time) * 1000.0
@@ -333,7 +342,15 @@ def triton_cusparse_gather(dense_vector, indices, block_size=1024):
     )
 
 
-def triton_cusparse_scatter(sparse_values, indices, dense_size=None, out=None, block_size=1024):
+def triton_cusparse_scatter(
+    sparse_values,
+    indices,
+    dense_size=None,
+    out=None,
+    block_size=1024,
+    reset_output=True,
+    dtype_policy="auto",
+):
     sparse_values_t, sparse_backend = _to_torch_tensor(sparse_values, "sparse_values")
     indices_t, _ = _to_torch_tensor(indices, "indices")
     if out is None:
@@ -343,7 +360,13 @@ def triton_cusparse_scatter(sparse_values, indices, dense_size=None, out=None, b
             int(dense_size), dtype=sparse_values_t.dtype, device=sparse_values_t.device
         )
     elapsed_ms = flagsparse_scatter(
-        out, indices_t, sparse_values_t, block_size=block_size, return_time=True
+        out,
+        indices_t,
+        sparse_values_t,
+        block_size=block_size,
+        return_time=True,
+        reset_output=reset_output,
+        dtype_policy=dtype_policy,
     )
     if sparse_backend == "cupy":
         return _to_backend_like(out, sparse_values), elapsed_ms
@@ -361,14 +384,23 @@ def pytorch_index_gather(dense_vector, indices):
     return sparse_values, execution_time_ms
 
 
-def pytorch_index_scatter(sparse_values, indices, dense_size=None, out=None):
+def pytorch_index_scatter(
+    sparse_values, indices, dense_size=None, out=None, reset_output=True, dtype_policy="auto"
+):
     """Baseline scatter using PyTorch index_copy_."""
-    sparse_values, indices, _, dense_size = _prepare_scatter_inputs(
-        sparse_values, indices, dense_size=dense_size, out=out
+    sparse_values, indices, _, dense_size, _ = _prepare_scatter_inputs(
+        sparse_values,
+        indices,
+        dense_size=dense_size,
+        out=out,
+        dtype_policy=dtype_policy,
+        return_metadata=True,
     )
     torch.cuda.synchronize()
     start_time = time.perf_counter()
-    dense_values = _pytorch_scatter_impl(sparse_values, indices, dense_size, out=out)
+    dense_values = _pytorch_scatter_impl(
+        sparse_values, indices, dense_size, out=out, reset_output=reset_output
+    )
     torch.cuda.synchronize()
     execution_time_ms = (time.perf_counter() - start_time) * 1000.0
     return dense_values, execution_time_ms
@@ -400,10 +432,17 @@ def cusparse_spmv_gather(dense_vector, indices, selector_matrix=None):
     return sparse_values, execution_time_ms, selector_matrix
 
 
-def cusparse_spmv_scatter(sparse_values, indices, dense_size=None, selector_matrix=None):
+def cusparse_spmv_scatter(
+    sparse_values, indices, dense_size=None, selector_matrix=None, dtype_policy="auto"
+):
     """Equivalent scatter baseline via cuSPARSE-backed COO SpMV."""
-    sparse_values, indices, _, dense_size = _prepare_scatter_inputs(
-        sparse_values, indices, dense_size=dense_size, out=None
+    sparse_values, indices, _, dense_size, _ = _prepare_scatter_inputs(
+        sparse_values,
+        indices,
+        dense_size=dense_size,
+        out=None,
+        dtype_policy=dtype_policy,
+        return_metadata=True,
     )
     skip_reason = _cusparse_baseline_skip_reason(sparse_values.dtype)
     if skip_reason:

@@ -7,20 +7,67 @@ from tests.pytest.param_shapes import FLOAT_DTYPE_IDS, FLOAT_DTYPES, GATHER_SCAT
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+INDEX_DTYPES = [torch.int32, torch.int64]
+INDEX_DTYPE_IDS = ["int32", "int64"]
+RESET_OUTPUT_CASES = [True, False]
+RESET_OUTPUT_IDS = ["reset", "inplace"]
+
+
+def _complex32_dtype():
+    dtype = getattr(torch, "complex32", None)
+    if dtype is None:
+        dtype = getattr(torch, "chalf", None)
+    return dtype
+
+
+def _scatter_dtype_cases():
+    cases = [(str(dtype).replace("torch.", ""), dtype) for dtype in FLOAT_DTYPES]
+    cases.append(("complex32", _complex32_dtype()))
+    cases.append(("complex64", torch.complex64))
+    cases.append(("complex128", torch.complex128))
+    return cases
+
+
+SCATTER_DTYPE_CASES = _scatter_dtype_cases()
+SCATTER_DTYPE_IDS = [name for name, _ in SCATTER_DTYPE_CASES]
+
+
+def _skip_unavailable_dtype(dtype_name, dtype):
+    if dtype is None:
+        pytest.skip(f"{dtype_name} dtype is unavailable in this torch build")
+    if dtype == torch.bfloat16 and not (
+        torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    ):
+        pytest.skip("bfloat16 not supported on this GPU")
+
+
+def _build_random_values(size, dtype, device):
+    if dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        return torch.randn(size, dtype=dtype, device=device)
+    if dtype == torch.complex64:
+        real = torch.randn(size, dtype=torch.float32, device=device)
+        imag = torch.randn(size, dtype=torch.float32, device=device)
+        return torch.complex(real, imag)
+    if dtype == torch.complex128:
+        real = torch.randn(size, dtype=torch.float64, device=device)
+        imag = torch.randn(size, dtype=torch.float64, device=device)
+        return torch.complex(real, imag)
+    if _complex32_dtype() is not None and dtype == _complex32_dtype():
+        stacked = torch.randn((size, 2), dtype=torch.float16, device=device)
+        return torch.view_as_complex(stacked)
+    raise TypeError(f"Unsupported dtype in test: {dtype}")
 
 
 @pytest.mark.gather
 @pytest.mark.parametrize("dense_size, nnz", GATHER_SCATTER_SHAPES)
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=FLOAT_DTYPE_IDS)
-def test_gather_matches_indexing(dense_size, nnz, dtype):
-    if dtype == torch.bfloat16 and not (
-        torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    ):
-        pytest.skip("bfloat16 not supported on this GPU")
+@pytest.mark.parametrize("index_dtype", INDEX_DTYPES, ids=INDEX_DTYPE_IDS)
+def test_gather_matches_indexing(dense_size, nnz, dtype, index_dtype):
+    _skip_unavailable_dtype(str(dtype).replace("torch.", ""), dtype)
     device = torch.device("cuda")
     nnz = min(nnz, dense_size)
     dense = torch.randn(dense_size, dtype=dtype, device=device)
-    indices = torch.randperm(dense_size, device=device)[:nnz].to(torch.int32)
+    indices = torch.randperm(dense_size, device=device)[:nnz].to(index_dtype)
     ref = dense[indices.to(torch.int64)]
     got = flagsparse_gather(dense, indices)
     assert torch.equal(ref, got)
@@ -28,18 +75,27 @@ def test_gather_matches_indexing(dense_size, nnz, dtype):
 
 @pytest.mark.scatter
 @pytest.mark.parametrize("dense_size, nnz", GATHER_SCATTER_SHAPES)
-@pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=FLOAT_DTYPE_IDS)
-def test_scatter_matches_index_copy(dense_size, nnz, dtype):
-    if dtype == torch.bfloat16 and not (
-        torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    ):
-        pytest.skip("bfloat16 not supported on this GPU")
+@pytest.mark.parametrize("dtype_name,dtype", SCATTER_DTYPE_CASES, ids=SCATTER_DTYPE_IDS)
+@pytest.mark.parametrize("index_dtype", INDEX_DTYPES, ids=INDEX_DTYPE_IDS)
+@pytest.mark.parametrize("reset_output", RESET_OUTPUT_CASES, ids=RESET_OUTPUT_IDS)
+def test_scatter_matches_index_copy(
+    dense_size, nnz, dtype_name, dtype, index_dtype, reset_output
+):
+    _skip_unavailable_dtype(dtype_name, dtype)
     device = torch.device("cuda")
     nnz = min(nnz, dense_size)
-    vals = torch.randn(nnz, dtype=dtype, device=device)
-    indices = torch.randperm(dense_size, device=device)[:nnz].to(torch.int32)
-    dense_ref = torch.zeros(dense_size, dtype=dtype, device=device)
+    vals = _build_random_values(nnz, dtype, device)
+    indices = torch.randperm(dense_size, device=device)[:nnz].to(index_dtype)
+    dense_ref = _build_random_values(dense_size, dtype, device)
+    dense = dense_ref.clone()
+    if reset_output:
+        dense_ref.zero_()
     dense_ref.index_copy_(0, indices.to(torch.int64), vals)
-    dense = torch.zeros(dense_size, dtype=dtype, device=device)
-    flagsparse_scatter(dense, indices, vals)
+    flagsparse_scatter(
+        dense,
+        indices,
+        vals,
+        reset_output=reset_output,
+        dtype_policy="auto",
+    )
     assert torch.equal(dense, dense_ref)
