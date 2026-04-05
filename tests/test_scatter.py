@@ -384,7 +384,7 @@ def build_parser():
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument("--no-cusparse", action="store_true")
     parser.add_argument("--unique-indices", default="true")
-    parser.add_argument("--reset-output", choices=["true", "false", "both"], default="both")
+    parser.add_argument("--reset-output", choices=["true", "false", "both"], default="true")
     parser.add_argument("--dtype-policy", choices=["auto", "strict"], default="auto")
     parser.add_argument("--index-fallback-policy", choices=["auto", "strict"], default="auto")
     parser.add_argument("--csv-summary", default=None)
