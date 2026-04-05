@@ -325,12 +325,6 @@ def _prepare_scatter_inputs(
             )
 
     kernel_indices = indices
-    if indices.dtype == torch.int64:
-        if max_index > _INDEX_LIMIT_INT32:
-            raise ValueError(
-                f"int64 index value {max_index} exceeds Triton int32 kernel range"
-            )
-        kernel_indices = indices.to(torch.int32)
 
     if out is not None:
         if out.ndim != 1:

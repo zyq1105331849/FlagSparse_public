@@ -148,6 +148,7 @@ def benchmark_scatter_case(
     unique_indices=True,
     reset_output=True,
     dtype_policy="auto",
+    index_fallback_policy="auto",
 ):
     """Benchmark Triton scatter vs PyTorch index_copy vs cuSPARSE-backed COO SpMV."""
     device = torch.device("cuda")
@@ -179,6 +180,20 @@ def benchmark_scatter_case(
     )
 
     pytorch_out = base_out.clone()
+    triton_probe_out = base_out.clone()
+    _, triton_index_meta = _triton_scatter_impl(
+        sparse_values,
+        kernel_indices,
+        dense_size=dense_size,
+        out=triton_probe_out,
+        block_size=block_size,
+        reset_output=reset_output,
+        index_fallback_policy=index_fallback_policy,
+        return_metadata=True,
+    )
+    effective_kernel_indices = kernel_indices
+    if triton_index_meta["index_fallback_applied"] and kernel_indices.dtype == torch.int64:
+        effective_kernel_indices = kernel_indices.to(torch.int32)
     triton_out = base_out.clone()
 
     pytorch_op = lambda: _pytorch_scatter_impl(
@@ -190,11 +205,12 @@ def benchmark_scatter_case(
     )
     triton_op = lambda: _triton_scatter_impl(
         sparse_values,
-        kernel_indices,
+        effective_kernel_indices,
         dense_size=dense_size,
         out=triton_out,
         block_size=block_size,
         reset_output=reset_output,
+        index_fallback_policy="strict",
     )
 
     pytorch_values, pytorch_ms = _benchmark_cuda_op(pytorch_op, warmup=warmup, iters=iters)
@@ -261,6 +277,8 @@ def benchmark_scatter_case(
             "reset_output": bool(reset_output),
             "dtype_policy": str(dtype_policy).lower(),
             "fallback_applied": bool(fallback_applied),
+            "index_fallback_policy": str(index_fallback_policy).lower(),
+            "kernel_index_dtype": triton_index_meta["kernel_index_dtype"],
         },
         "performance": {
             "pytorch_ms": pytorch_ms,
@@ -278,6 +296,8 @@ def benchmark_scatter_case(
         "backend_status": {
             "cusparse_unavailable_reason": cusparse_reason,
             "fallback_reason": fallback_reason,
+            "index_fallback_applied": bool(triton_index_meta["index_fallback_applied"]),
+            "index_fallback_reason": triton_index_meta["index_fallback_reason"],
         },
         "samples": {
             "pytorch": pytorch_values,
@@ -491,6 +511,7 @@ def comprehensive_scatter_test(
     unique_indices=True,
     reset_output=True,
     dtype_policy="auto",
+    index_fallback_policy="auto",
 ):
     """Full scatter test entry for one configuration."""
     return benchmark_scatter_case(
@@ -504,6 +525,7 @@ def comprehensive_scatter_test(
         unique_indices=unique_indices,
         reset_output=reset_output,
         dtype_policy=dtype_policy,
+        index_fallback_policy=index_fallback_policy,
     )
 
 

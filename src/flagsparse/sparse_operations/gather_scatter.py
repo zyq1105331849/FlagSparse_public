@@ -121,8 +121,19 @@ def _triton_gather_impl(dense_vector, kernel_indices, block_size=1024):
 
 
 def _triton_scatter_impl(
-    sparse_values, kernel_indices, dense_size, out=None, block_size=1024, reset_output=True
+    sparse_values,
+    kernel_indices,
+    dense_size,
+    out=None,
+    block_size=1024,
+    reset_output=True,
+    index_fallback_policy="auto",
+    return_metadata=False,
 ):
+    index_fallback_policy = str(index_fallback_policy).lower()
+    if index_fallback_policy not in ("auto", "strict"):
+        raise ValueError("index_fallback_policy must be 'auto' or 'strict'")
+
     if out is None:
         dense_values = torch.zeros(
             dense_size, dtype=sparse_values.dtype, device=sparse_values.device
@@ -133,11 +144,68 @@ def _triton_scatter_impl(
             dense_values.zero_()
 
     nnz = kernel_indices.numel()
+    scatter_meta = {
+        "index_fallback_applied": False,
+        "index_fallback_reason": None,
+        "kernel_index_dtype": str(kernel_indices.dtype).replace("torch.", ""),
+    }
     if nnz == 0:
+        if return_metadata:
+            return dense_values, scatter_meta
         return dense_values
 
-    grid = lambda meta: (triton.cdiv(nnz, meta["BLOCK_SIZE"]),)
+    try:
+        _launch_triton_scatter_kernel(
+            dense_values,
+            sparse_values,
+            kernel_indices,
+            nnz,
+            block_size=block_size,
+        )
+    except Exception as exc:
+        if kernel_indices.dtype != torch.int64 or index_fallback_policy != "auto":
+            raise RuntimeError(
+                f"Triton scatter failed for index dtype {kernel_indices.dtype}: "
+                f"{exc.__class__.__name__}: {str(exc)}"
+            ) from exc
 
+        max_index = int(kernel_indices.max().item()) if nnz > 0 else -1
+        if max_index > _INDEX_LIMIT_INT32:
+            raise RuntimeError(
+                "Triton scatter failed for int64 indices, and int32 fallback is invalid: "
+                f"max index {max_index} exceeds int32 range"
+            ) from exc
+
+        fallback_indices = kernel_indices.to(torch.int32)
+        try:
+            _launch_triton_scatter_kernel(
+                dense_values,
+                sparse_values,
+                fallback_indices,
+                nnz,
+                block_size=block_size,
+            )
+        except Exception as fallback_exc:
+            raise RuntimeError(
+                "Triton scatter failed for int64 indices, and int32 fallback also failed: "
+                f"{fallback_exc.__class__.__name__}: {str(fallback_exc)}"
+            ) from fallback_exc
+
+        scatter_meta["index_fallback_applied"] = True
+        scatter_meta["index_fallback_reason"] = (
+            f"int64 kernel launch failed: {exc.__class__.__name__}: {str(exc)}"
+        )
+        scatter_meta["kernel_index_dtype"] = "int32"
+
+    if return_metadata:
+        return dense_values, scatter_meta
+    return dense_values
+
+
+def _launch_triton_scatter_kernel(
+    dense_values, sparse_values, kernel_indices, nnz, block_size=1024
+):
+    grid = lambda meta: (triton.cdiv(nnz, meta["BLOCK_SIZE"]),)
     if not _is_complex_dtype(sparse_values.dtype):
         _scatter_real_kernel[grid](
             dense_values,
@@ -146,8 +214,7 @@ def _triton_scatter_impl(
             nnz,
             BLOCK_SIZE=block_size,
         )
-        return dense_values
-
+        return
     dense_values_ri = torch.view_as_real(dense_values).reshape(-1)
     sparse_values_ri = torch.view_as_real(sparse_values).reshape(-1)
     _scatter_complex_kernel[grid](
@@ -157,7 +224,6 @@ def _triton_scatter_impl(
         nnz,
         BLOCK_SIZE=block_size,
     )
-    return dense_values
 
 
 def _cusparse_spmv(selector_matrix, dense_vector):
@@ -296,6 +362,7 @@ def flagsparse_scatter(
     return_time=False,
     reset_output=True,
     dtype_policy="auto",
+    index_fallback_policy="auto",
 ):
     """CuPy-style scatter (put): a[indices] = values (in-place)."""
     if mode != "raise":
@@ -322,6 +389,7 @@ def flagsparse_scatter(
         out=dense_tensor,
         block_size=block_size,
         reset_output=reset_output,
+        index_fallback_policy=index_fallback_policy,
     )
     torch.cuda.synchronize()
     execution_time_ms = (time.perf_counter() - start_time) * 1000.0
@@ -350,6 +418,7 @@ def triton_cusparse_scatter(
     block_size=1024,
     reset_output=True,
     dtype_policy="auto",
+    index_fallback_policy="auto",
 ):
     sparse_values_t, sparse_backend = _to_torch_tensor(sparse_values, "sparse_values")
     indices_t, _ = _to_torch_tensor(indices, "indices")
@@ -367,6 +436,7 @@ def triton_cusparse_scatter(
         return_time=True,
         reset_output=reset_output,
         dtype_policy=dtype_policy,
+        index_fallback_policy=index_fallback_policy,
     )
     if sparse_backend == "cupy":
         return _to_backend_like(out, sparse_values), elapsed_ms
