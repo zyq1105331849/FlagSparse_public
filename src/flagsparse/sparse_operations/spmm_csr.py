@@ -1366,36 +1366,19 @@ def _run_spmm_opt_bucket_stable(prepared, bucket, B, C_out, block_n):
         return
     dtype = prepared.data.dtype
     kernel_map = {
-        ("batched", torch.float32): _spmm_csr_stable_batched_f32_kernel,
-        ("batched", torch.float64): _spmm_csr_stable_batched_f64_kernel,
         ("vector", torch.float32): _spmm_csr_stable_vector_f32_kernel,
         ("vector", torch.float64): _spmm_csr_stable_vector_f64_kernel,
     }
     if bucket["kind"] == "batched":
-        batch_rows = int(bucket["batch_rows"])
-        grid = (triton.cdiv(rows.numel(), batch_rows), triton.cdiv(B.shape[1], block_n))
-        kernel = kernel_map[(bucket["kind"], dtype)]
-        kernel[grid](
-            prepared.data,
-            prepared.kernel_indices,
-            prepared.kernel_indptr,
-            B,
-            C_out,
-            rows,
-            rows.numel(),
-            B.shape[1],
-            B.stride(0),
-            B.stride(1),
-            C_out.stride(0),
-            C_out.stride(1),
-            BATCH=batch_rows,
-            BLOCK_N=block_n,
-            BLOCK_NNZ=bucket["block_nnz"],
-        )
-        return
+        # Diagnose-only stable path: run short-row buckets through the
+        # row-per-program fp64-accum vector kernel instead of the merged
+        # batched kernel. This favors numerical stability over throughput.
+        kind = "vector"
+    else:
+        kind = bucket["kind"]
 
     grid = (rows.numel(), triton.cdiv(B.shape[1], block_n))
-    kernel = kernel_map[(bucket["kind"], dtype)]
+    kernel = kernel_map[(kind, dtype)]
     kernel[grid](
         prepared.data,
         prepared.kernel_indices,
