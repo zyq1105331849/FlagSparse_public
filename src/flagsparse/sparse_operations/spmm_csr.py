@@ -1454,6 +1454,332 @@ def _run_spmm_opt_split_bucket_stable(prepared, B, C_out, block_n):
     return False
 
 
+_SPMM_OPT_CANDIDATE_SHORT_BUCKET_SPECS = (
+    {"label": "batched_16", "min_row_nnz": 0, "max_row_nnz": 16, "block_nnz": 16},
+    {"label": "batched_32", "min_row_nnz": 17, "max_row_nnz": 32, "block_nnz": 32},
+    {"label": "batched_64", "min_row_nnz": 33, "max_row_nnz": 64, "block_nnz": 64},
+    {"label": "batched_128", "min_row_nnz": 65, "max_row_nnz": 128, "block_nnz": 128},
+)
+
+
+@triton.jit
+def _spmm_csr_candidate_short_rows_f32_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    c_ptr,
+    rows_ptr,
+    n_bucket_rows,
+    n_dense_cols,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if pid_row >= n_bucket_rows:
+        return
+    row = tl.load(rows_ptr + pid_row)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
+    row_nnz = end - start
+    acc0 = tl.zeros([BLOCK_N], dtype=tl.float32)
+    acc1 = tl.zeros([BLOCK_N], dtype=tl.float32)
+    acc2 = tl.zeros([BLOCK_N], dtype=tl.float32)
+    acc3 = tl.zeros([BLOCK_N], dtype=tl.float32)
+    for chunk_start in tl.range(0, row_nnz, BLOCK_NNZ):
+        for kk in tl.static_range(0, BLOCK_NNZ, 4):
+            idx0 = start + chunk_start + kk
+            valid0 = idx0 < end
+            a_val0 = tl.load(data_ptr + idx0, mask=valid0, other=0.0)
+            a_col0 = tl.load(indices_ptr + idx0, mask=valid0, other=0)
+            b_vals0 = tl.load(
+                b_ptr + a_col0 * stride_bk + offs_n * stride_bn,
+                mask=mask_n & valid0,
+                other=0.0,
+            )
+            acc0 = acc0 + a_val0 * b_vals0
+
+            idx1 = idx0 + 1
+            valid1 = idx1 < end
+            a_val1 = tl.load(data_ptr + idx1, mask=valid1, other=0.0)
+            a_col1 = tl.load(indices_ptr + idx1, mask=valid1, other=0)
+            b_vals1 = tl.load(
+                b_ptr + a_col1 * stride_bk + offs_n * stride_bn,
+                mask=mask_n & valid1,
+                other=0.0,
+            )
+            acc1 = acc1 + a_val1 * b_vals1
+
+            idx2 = idx0 + 2
+            valid2 = idx2 < end
+            a_val2 = tl.load(data_ptr + idx2, mask=valid2, other=0.0)
+            a_col2 = tl.load(indices_ptr + idx2, mask=valid2, other=0)
+            b_vals2 = tl.load(
+                b_ptr + a_col2 * stride_bk + offs_n * stride_bn,
+                mask=mask_n & valid2,
+                other=0.0,
+            )
+            acc2 = acc2 + a_val2 * b_vals2
+
+            idx3 = idx0 + 3
+            valid3 = idx3 < end
+            a_val3 = tl.load(data_ptr + idx3, mask=valid3, other=0.0)
+            a_col3 = tl.load(indices_ptr + idx3, mask=valid3, other=0)
+            b_vals3 = tl.load(
+                b_ptr + a_col3 * stride_bk + offs_n * stride_bn,
+                mask=mask_n & valid3,
+                other=0.0,
+            )
+            acc3 = acc3 + a_val3 * b_vals3
+
+    acc = (acc0 + acc1) + (acc2 + acc3)
+    tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n)
+
+
+@triton.jit
+def _spmm_csr_candidate_short_rows_f64_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    c_ptr,
+    rows_ptr,
+    n_bucket_rows,
+    n_dense_cols,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if pid_row >= n_bucket_rows:
+        return
+    row = tl.load(rows_ptr + pid_row)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
+    row_nnz = end - start
+    acc0 = tl.zeros([BLOCK_N], dtype=tl.float64)
+    acc1 = tl.zeros([BLOCK_N], dtype=tl.float64)
+    acc2 = tl.zeros([BLOCK_N], dtype=tl.float64)
+    acc3 = tl.zeros([BLOCK_N], dtype=tl.float64)
+    for chunk_start in tl.range(0, row_nnz, BLOCK_NNZ):
+        for kk in tl.static_range(0, BLOCK_NNZ, 4):
+            idx0 = start + chunk_start + kk
+            valid0 = idx0 < end
+            a_val0 = tl.load(data_ptr + idx0, mask=valid0, other=0.0)
+            a_col0 = tl.load(indices_ptr + idx0, mask=valid0, other=0)
+            b_vals0 = tl.load(
+                b_ptr + a_col0 * stride_bk + offs_n * stride_bn,
+                mask=mask_n & valid0,
+                other=0.0,
+            )
+            acc0 = acc0 + a_val0 * b_vals0
+
+            idx1 = idx0 + 1
+            valid1 = idx1 < end
+            a_val1 = tl.load(data_ptr + idx1, mask=valid1, other=0.0)
+            a_col1 = tl.load(indices_ptr + idx1, mask=valid1, other=0)
+            b_vals1 = tl.load(
+                b_ptr + a_col1 * stride_bk + offs_n * stride_bn,
+                mask=mask_n & valid1,
+                other=0.0,
+            )
+            acc1 = acc1 + a_val1 * b_vals1
+
+            idx2 = idx0 + 2
+            valid2 = idx2 < end
+            a_val2 = tl.load(data_ptr + idx2, mask=valid2, other=0.0)
+            a_col2 = tl.load(indices_ptr + idx2, mask=valid2, other=0)
+            b_vals2 = tl.load(
+                b_ptr + a_col2 * stride_bk + offs_n * stride_bn,
+                mask=mask_n & valid2,
+                other=0.0,
+            )
+            acc2 = acc2 + a_val2 * b_vals2
+
+            idx3 = idx0 + 3
+            valid3 = idx3 < end
+            a_val3 = tl.load(data_ptr + idx3, mask=valid3, other=0.0)
+            a_col3 = tl.load(indices_ptr + idx3, mask=valid3, other=0)
+            b_vals3 = tl.load(
+                b_ptr + a_col3 * stride_bk + offs_n * stride_bn,
+                mask=mask_n & valid3,
+                other=0.0,
+            )
+            acc3 = acc3 + a_val3 * b_vals3
+
+    acc = (acc0 + acc1) + (acc2 + acc3)
+    tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n)
+
+
+def _build_spmm_opt_candidate_buckets(prepared):
+    row_lengths = prepared.row_lengths
+    device = row_lengths.device
+    row_count = int(row_lengths.numel())
+    max_row_index = row_count - 1
+    row_index_dtype = torch.int32 if max_row_index <= _INDEX_LIMIT_INT32 else torch.int64
+    all_rows = torch.arange(row_count, device=device, dtype=row_index_dtype)
+    buckets = []
+    for spec in _SPMM_OPT_CANDIDATE_SHORT_BUCKET_SPECS:
+        lower = int(spec["min_row_nnz"])
+        upper = int(spec["max_row_nnz"])
+        if lower <= 0:
+            mask = row_lengths <= upper
+        else:
+            mask = (row_lengths >= lower) & (row_lengths <= upper)
+        rows = all_rows[mask]
+        if rows.numel() == 0:
+            continue
+        buckets.append(
+            {
+                "label": spec["label"],
+                "kind": "short",
+                "rows": rows,
+                "block_nnz": int(spec["block_nnz"]),
+            }
+        )
+
+    vector_512 = all_rows[(row_lengths >= 129) & (row_lengths <= 512)]
+    if vector_512.numel() > 0:
+        buckets.append({"label": "vector_512", "kind": "vector", "rows": vector_512, "block_nnz": 128})
+
+    vector_2048 = all_rows[(row_lengths >= 513) & (row_lengths <= 2048)]
+    if vector_2048.numel() > 0:
+        buckets.append({"label": "vector_2048", "kind": "vector", "rows": vector_2048, "block_nnz": 128})
+
+    split_rows = all_rows[row_lengths > 2048]
+    if split_rows.numel() > 0:
+        buckets.append({"label": "split", "kind": "split", "rows": split_rows, "block_nnz": 256})
+    return buckets
+
+
+def _run_spmm_opt_bucket_candidate(prepared, bucket, B, C_out, block_n):
+    rows = bucket["rows"]
+    if rows.numel() == 0:
+        return
+    dtype = prepared.data.dtype
+    if bucket["kind"] == "short":
+        kernel = _spmm_csr_candidate_short_rows_f64_kernel if dtype == torch.float64 else _spmm_csr_candidate_short_rows_f32_kernel
+        grid = (rows.numel(), triton.cdiv(B.shape[1], block_n))
+        kernel[grid](
+            prepared.data,
+            prepared.kernel_indices,
+            prepared.kernel_indptr,
+            B,
+            C_out,
+            rows,
+            rows.numel(),
+            B.shape[1],
+            B.stride(0),
+            B.stride(1),
+            C_out.stride(0),
+            C_out.stride(1),
+            BLOCK_N=block_n,
+            BLOCK_NNZ=bucket["block_nnz"],
+        )
+        return
+
+    kernel = _spmm_csr_vector_rows_f64_kernel if dtype == torch.float64 else _spmm_csr_vector_rows_f32_kernel
+    grid = (rows.numel(), triton.cdiv(B.shape[1], block_n))
+    kernel[grid](
+        prepared.data,
+        prepared.kernel_indices,
+        prepared.kernel_indptr,
+        B,
+        C_out,
+        rows,
+        rows.numel(),
+        B.shape[1],
+        B.stride(0),
+        B.stride(1),
+        C_out.stride(0),
+        C_out.stride(1),
+        BLOCK_N=block_n,
+        BLOCK_NNZ=bucket["block_nnz"],
+    )
+
+
+def _run_spmm_opt_split_bucket_candidate(prepared, B, C_out, block_n):
+    if prepared.long_part_rows.numel() == 0:
+        return False
+    workspace = torch.empty((prepared.long_part_rows.numel(), B.shape[1]), dtype=B.dtype, device=B.device)
+    split_kernel = _spmm_csr_split_part_f64_kernel if B.dtype == torch.float64 else _spmm_csr_split_part_f32_kernel
+    reduce_kernel = _spmm_csr_split_reduce_f64_kernel if B.dtype == torch.float64 else _spmm_csr_split_reduce_f32_kernel
+    split_grid = (prepared.long_part_rows.numel(), triton.cdiv(B.shape[1], block_n))
+    split_kernel[split_grid](
+        prepared.data,
+        prepared.kernel_indices,
+        B,
+        workspace,
+        prepared.long_part_starts,
+        prepared.long_part_ends,
+        prepared.long_part_rows.numel(),
+        B.shape[1],
+        B.stride(0),
+        B.stride(1),
+        workspace.stride(0),
+        workspace.stride(1),
+        BLOCK_N=block_n,
+    )
+    reduce_grid = (prepared.long_row_ids.numel(), triton.cdiv(B.shape[1], block_n))
+    reduce_kernel[reduce_grid](
+        workspace,
+        C_out,
+        prepared.long_row_ids,
+        prepared.long_row_part_ptr,
+        prepared.long_row_ids.numel(),
+        B.shape[1],
+        workspace.stride(0),
+        workspace.stride(1),
+        C_out.stride(0),
+        C_out.stride(1),
+        BLOCK_N=block_n,
+    )
+    return False
+
+
+def _triton_spmm_csr_impl_opt_prepared_candidate(prepared, B):
+    if not prepared.supports_opt:
+        raise TypeError("spmm opt only supports float32 and float64")
+    if not B.is_cuda:
+        raise ValueError("B must be a CUDA tensor")
+    if B.device != prepared.data.device:
+        raise ValueError("B must be on the same CUDA device as the sparse matrix")
+    if B.dtype != prepared.data.dtype:
+        raise TypeError("B dtype must match sparse matrix dtype")
+    if B.shape[0] != prepared.n_cols:
+        raise ValueError(f"B.shape[0] must be n_cols={prepared.n_cols}, got {B.shape[0]}")
+    if B.ndim != 2:
+        raise ValueError("B must be a 2D dense tensor")
+    B = B.contiguous()
+    block_n = _select_spmm_opt_block_n(int(B.shape[1]))
+    C_out = torch.zeros((prepared.n_rows, int(B.shape[1])), dtype=B.dtype, device=B.device)
+    long_row_fallback_used = False
+    for bucket in _build_spmm_opt_candidate_buckets(prepared):
+        if bucket["kind"] == "split":
+            long_row_fallback_used = _run_spmm_opt_split_bucket_candidate(prepared, B, C_out, block_n)
+            continue
+        _run_spmm_opt_bucket_candidate(prepared, bucket, B, C_out, block_n)
+    return C_out, long_row_fallback_used
+
+
+def _flagsparse_spmm_csr_opt_candidate_for_diagnose(prepared, B):
+    C_out, _ = _triton_spmm_csr_impl_opt_prepared_candidate(prepared, B)
+    return C_out
+
+
 def _triton_spmm_csr_impl_opt_prepared(prepared, B):
     if not prepared.supports_opt:
         raise TypeError("spmm opt only supports float32 and float64")
