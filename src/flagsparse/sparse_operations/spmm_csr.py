@@ -1463,7 +1463,7 @@ _SPMM_OPT_CANDIDATE_SHORT_BUCKET_SPECS = (
 
 
 @triton.jit
-def _spmm_csr_candidate_short_rows_f32_kernel(
+def _spmm_csr_candidate_short_rows_kernel(
     data_ptr,
     indices_ptr,
     indptr_ptr,
@@ -1478,6 +1478,7 @@ def _spmm_csr_candidate_short_rows_f32_kernel(
     stride_cn,
     BLOCK_N: tl.constexpr,
     BLOCK_NNZ: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
 ):
     pid_row = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -1489,62 +1490,26 @@ def _spmm_csr_candidate_short_rows_f32_kernel(
     start = tl.load(indptr_ptr + row)
     end = tl.load(indptr_ptr + row + 1)
     row_nnz = end - start
-    acc0 = tl.zeros([BLOCK_N], dtype=tl.float32)
-    acc1 = tl.zeros([BLOCK_N], dtype=tl.float32)
-    acc2 = tl.zeros([BLOCK_N], dtype=tl.float32)
-    acc3 = tl.zeros([BLOCK_N], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
     for chunk_start in tl.range(0, row_nnz, BLOCK_NNZ):
-        for kk in tl.static_range(0, BLOCK_NNZ, 4):
-            idx0 = start + chunk_start + kk
-            valid0 = idx0 < end
-            a_val0 = tl.load(data_ptr + idx0, mask=valid0, other=0.0)
-            a_col0 = tl.load(indices_ptr + idx0, mask=valid0, other=0)
-            b_vals0 = tl.load(
-                b_ptr + a_col0 * stride_bk + offs_n * stride_bn,
-                mask=mask_n & valid0,
+        chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+        for kk in tl.static_range(0, BLOCK_NNZ):
+            idx = start + chunk_start + kk
+            valid = idx < end
+            a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+            a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+            b_vals = tl.load(
+                b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                mask=mask_n & valid,
                 other=0.0,
             )
-            acc0 = acc0 + a_val0 * b_vals0
-
-            idx1 = idx0 + 1
-            valid1 = idx1 < end
-            a_val1 = tl.load(data_ptr + idx1, mask=valid1, other=0.0)
-            a_col1 = tl.load(indices_ptr + idx1, mask=valid1, other=0)
-            b_vals1 = tl.load(
-                b_ptr + a_col1 * stride_bk + offs_n * stride_bn,
-                mask=mask_n & valid1,
-                other=0.0,
-            )
-            acc1 = acc1 + a_val1 * b_vals1
-
-            idx2 = idx0 + 2
-            valid2 = idx2 < end
-            a_val2 = tl.load(data_ptr + idx2, mask=valid2, other=0.0)
-            a_col2 = tl.load(indices_ptr + idx2, mask=valid2, other=0)
-            b_vals2 = tl.load(
-                b_ptr + a_col2 * stride_bk + offs_n * stride_bn,
-                mask=mask_n & valid2,
-                other=0.0,
-            )
-            acc2 = acc2 + a_val2 * b_vals2
-
-            idx3 = idx0 + 3
-            valid3 = idx3 < end
-            a_val3 = tl.load(data_ptr + idx3, mask=valid3, other=0.0)
-            a_col3 = tl.load(indices_ptr + idx3, mask=valid3, other=0)
-            b_vals3 = tl.load(
-                b_ptr + a_col3 * stride_bk + offs_n * stride_bn,
-                mask=mask_n & valid3,
-                other=0.0,
-            )
-            acc3 = acc3 + a_val3 * b_vals3
-
-    acc = (acc0 + acc1) + (acc2 + acc3)
+            chunk_acc = chunk_acc + a_val * b_vals
+        acc = acc + chunk_acc
     tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n)
 
 
 @triton.jit
-def _spmm_csr_candidate_short_rows_f64_kernel(
+def _spmm_csr_candidate_vector_rows_kernel(
     data_ptr,
     indices_ptr,
     indptr_ptr,
@@ -1559,6 +1524,7 @@ def _spmm_csr_candidate_short_rows_f64_kernel(
     stride_cn,
     BLOCK_N: tl.constexpr,
     BLOCK_NNZ: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
 ):
     pid_row = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -1570,57 +1536,21 @@ def _spmm_csr_candidate_short_rows_f64_kernel(
     start = tl.load(indptr_ptr + row)
     end = tl.load(indptr_ptr + row + 1)
     row_nnz = end - start
-    acc0 = tl.zeros([BLOCK_N], dtype=tl.float64)
-    acc1 = tl.zeros([BLOCK_N], dtype=tl.float64)
-    acc2 = tl.zeros([BLOCK_N], dtype=tl.float64)
-    acc3 = tl.zeros([BLOCK_N], dtype=tl.float64)
+    acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
     for chunk_start in tl.range(0, row_nnz, BLOCK_NNZ):
-        for kk in tl.static_range(0, BLOCK_NNZ, 4):
-            idx0 = start + chunk_start + kk
-            valid0 = idx0 < end
-            a_val0 = tl.load(data_ptr + idx0, mask=valid0, other=0.0)
-            a_col0 = tl.load(indices_ptr + idx0, mask=valid0, other=0)
-            b_vals0 = tl.load(
-                b_ptr + a_col0 * stride_bk + offs_n * stride_bn,
-                mask=mask_n & valid0,
+        chunk_acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+        for kk in tl.static_range(0, BLOCK_NNZ):
+            idx = start + chunk_start + kk
+            valid = idx < end
+            a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+            a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+            b_vals = tl.load(
+                b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                mask=mask_n & valid,
                 other=0.0,
             )
-            acc0 = acc0 + a_val0 * b_vals0
-
-            idx1 = idx0 + 1
-            valid1 = idx1 < end
-            a_val1 = tl.load(data_ptr + idx1, mask=valid1, other=0.0)
-            a_col1 = tl.load(indices_ptr + idx1, mask=valid1, other=0)
-            b_vals1 = tl.load(
-                b_ptr + a_col1 * stride_bk + offs_n * stride_bn,
-                mask=mask_n & valid1,
-                other=0.0,
-            )
-            acc1 = acc1 + a_val1 * b_vals1
-
-            idx2 = idx0 + 2
-            valid2 = idx2 < end
-            a_val2 = tl.load(data_ptr + idx2, mask=valid2, other=0.0)
-            a_col2 = tl.load(indices_ptr + idx2, mask=valid2, other=0)
-            b_vals2 = tl.load(
-                b_ptr + a_col2 * stride_bk + offs_n * stride_bn,
-                mask=mask_n & valid2,
-                other=0.0,
-            )
-            acc2 = acc2 + a_val2 * b_vals2
-
-            idx3 = idx0 + 3
-            valid3 = idx3 < end
-            a_val3 = tl.load(data_ptr + idx3, mask=valid3, other=0.0)
-            a_col3 = tl.load(indices_ptr + idx3, mask=valid3, other=0)
-            b_vals3 = tl.load(
-                b_ptr + a_col3 * stride_bk + offs_n * stride_bn,
-                mask=mask_n & valid3,
-                other=0.0,
-            )
-            acc3 = acc3 + a_val3 * b_vals3
-
-    acc = (acc0 + acc1) + (acc2 + acc3)
+            chunk_acc = chunk_acc + a_val * b_vals
+        acc = acc + chunk_acc
     tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n)
 
 
@@ -1653,11 +1583,11 @@ def _build_spmm_opt_candidate_buckets(prepared):
 
     vector_512 = all_rows[(row_lengths >= 129) & (row_lengths <= 512)]
     if vector_512.numel() > 0:
-        buckets.append({"label": "vector_512", "kind": "vector", "rows": vector_512, "block_nnz": 128})
+        buckets.append({"label": "vector_512", "kind": "vector", "rows": vector_512, "block_nnz": 64})
 
     vector_2048 = all_rows[(row_lengths >= 513) & (row_lengths <= 2048)]
     if vector_2048.numel() > 0:
-        buckets.append({"label": "vector_2048", "kind": "vector", "rows": vector_2048, "block_nnz": 128})
+        buckets.append({"label": "vector_2048", "kind": "vector", "rows": vector_2048, "block_nnz": 32})
 
     split_rows = all_rows[row_lengths > 2048]
     if split_rows.numel() > 0:
@@ -1670,10 +1600,10 @@ def _run_spmm_opt_bucket_candidate(prepared, bucket, B, C_out, block_n):
     if rows.numel() == 0:
         return
     dtype = prepared.data.dtype
+    acc_dtype = tl.float64 if dtype == torch.float64 else tl.float32
     if bucket["kind"] == "short":
-        kernel = _spmm_csr_candidate_short_rows_f64_kernel if dtype == torch.float64 else _spmm_csr_candidate_short_rows_f32_kernel
         grid = (rows.numel(), triton.cdiv(B.shape[1], block_n))
-        kernel[grid](
+        _spmm_csr_candidate_short_rows_kernel[grid](
             prepared.data,
             prepared.kernel_indices,
             prepared.kernel_indptr,
@@ -1688,12 +1618,12 @@ def _run_spmm_opt_bucket_candidate(prepared, bucket, B, C_out, block_n):
             C_out.stride(1),
             BLOCK_N=block_n,
             BLOCK_NNZ=bucket["block_nnz"],
+            ACC_DTYPE=acc_dtype,
         )
         return
 
-    kernel = _spmm_csr_vector_rows_f64_kernel if dtype == torch.float64 else _spmm_csr_vector_rows_f32_kernel
     grid = (rows.numel(), triton.cdiv(B.shape[1], block_n))
-    kernel[grid](
+    _spmm_csr_candidate_vector_rows_kernel[grid](
         prepared.data,
         prepared.kernel_indices,
         prepared.kernel_indptr,
@@ -1708,6 +1638,7 @@ def _run_spmm_opt_bucket_candidate(prepared, bucket, B, C_out, block_n):
         C_out.stride(1),
         BLOCK_N=block_n,
         BLOCK_NNZ=bucket["block_nnz"],
+        ACC_DTYPE=acc_dtype,
     )
 
 
