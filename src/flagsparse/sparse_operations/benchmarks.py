@@ -317,13 +317,18 @@ def benchmark_spmv_case(
     block_nnz=256,
     max_segments=None,
     run_cusparse=True,
+    transpose=False,
+    index_fallback_policy="auto",
 ):
     """Benchmark Triton CSR SpMV vs cuSPARSE (CuPy CSR @ x)."""
     device = torch.device("cuda")
     data, indices, indptr = _build_random_csr(
         n_rows, n_cols, nnz, value_dtype, index_dtype, device
     )
-    x = _build_random_dense(n_cols, value_dtype, device)
+    transpose = bool(transpose)
+    x_size = n_rows if transpose else n_cols
+    y_size = n_cols if transpose else n_rows
+    x = _build_random_dense(x_size, value_dtype, device)
     shape = (n_rows, n_cols)
     prepared = prepare_spmv_csr(
         data,
@@ -332,6 +337,8 @@ def benchmark_spmv_case(
         shape,
         block_nnz=block_nnz,
         max_segments=max_segments,
+        transpose=transpose,
+        index_fallback_policy=index_fallback_policy,
     )
     triton_op = lambda: flagsparse_spmv_csr(
         x=x,
@@ -357,7 +364,7 @@ def benchmark_spmv_case(
         A_csr = cpx_sparse.csr_matrix(
             (data_cp, indices_cp, indptr_cp), shape=shape
         )
-        ref_y = A_csr @ x_cp
+        ref_y = (A_csr.T @ x_cp) if transpose else (A_csr @ x_cp)
         expected = _torch_from_cupy(ref_y)
     else:
         row_indices = torch.repeat_interleave(
@@ -375,14 +382,16 @@ def benchmark_spmv_case(
         if value_dtype in (torch.float16, torch.bfloat16):
             coo_f32 = coo.to(torch.float32)
             x_2d_f32 = x_2d.to(torch.float32)
-            expected = torch.sparse.mm(coo_f32, x_2d_f32).squeeze(1).to(value_dtype)
+            coo_ref = coo_f32.transpose(0, 1) if transpose else coo_f32
+            expected = torch.sparse.mm(coo_ref, x_2d_f32).squeeze(1).to(value_dtype)
         else:
-            expected = torch.sparse.mm(coo, x_2d).squeeze(1)
+            coo_ref = coo.transpose(0, 1) if transpose else coo
+            expected = torch.sparse.mm(coo_ref, x_2d).squeeze(1)
     atol, rtol = _tolerance_for_dtype(value_dtype)
     triton_match = torch.allclose(triton_y, expected, atol=atol, rtol=rtol)
     triton_max_error = (
         float(torch.max(torch.abs(triton_y - expected)).item())
-        if n_rows > 0
+        if y_size > 0
         else 0.0
     )
     cusparse_ms = None
@@ -401,7 +410,9 @@ def benchmark_spmv_case(
         else:
             try:
                 cusparse_op = lambda: _torch_from_cupy(
-                    A_csr @ _cupy_from_torch(x)
+                    (A_csr.T @ _cupy_from_torch(x))
+                    if transpose
+                    else (A_csr @ _cupy_from_torch(x))
                 )
                 cusparse_values, cusparse_ms = _benchmark_cuda_op(
                     cusparse_op, warmup=warmup, iters=iters
@@ -411,7 +422,7 @@ def benchmark_spmv_case(
                 )
                 cusparse_max_error = (
                     float(torch.max(torch.abs(cusparse_values - expected)).item())
-                    if n_rows > 0
+                    if y_size > 0
                     else 0.0
                 )
             except Exception as exc:
@@ -432,6 +443,8 @@ def benchmark_spmv_case(
             "nnz": nnz,
             "value_dtype": str(value_dtype),
             "index_dtype": str(index_dtype),
+            "transpose": transpose,
+            "index_fallback_policy": str(index_fallback_policy).lower(),
             "warmup": warmup,
             "iters": iters,
         },
