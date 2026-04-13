@@ -1,21 +1,18 @@
 import pytest
 import torch
 
-from flagsparse import flagsparse_spsv_csr
+from flagsparse import flagsparse_spsv_coo, flagsparse_spsv_csr
 
-from tests.pytest.param_shapes import SPSV_N
+from tests.pytest.param_shapes import SPSV_N, TRIANGULAR_DTYPE_IDS, TRIANGULAR_DTYPES
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 @pytest.mark.spsv
+@pytest.mark.spsv_csr
 @pytest.mark.parametrize("n", SPSV_N)
-@pytest.mark.parametrize(
-    "dtype",
-    [torch.float32, torch.float64],
-    ids=["float32", "float64"],
-)
+@pytest.mark.parametrize("dtype", TRIANGULAR_DTYPES, ids=TRIANGULAR_DTYPE_IDS)
 def test_spsv_csr_lower_matches_dense(n, dtype):
     device = torch.device("cuda")
     base = torch.tril(torch.randn(n, n, dtype=dtype, device=device))
@@ -34,6 +31,35 @@ def test_spsv_csr_lower_matches_dense(n, dtype):
         data,
         indices,
         indptr,
+        b,
+        (n, n),
+        lower=True,
+        unit_diagonal=False,
+    )
+    rtol = 1e-4 if dtype == torch.float32 else 1e-10
+    atol = 1e-5 if dtype == torch.float32 else 1e-10
+    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.spsv
+@pytest.mark.spsv_coo
+@pytest.mark.parametrize("n", SPSV_N)
+@pytest.mark.parametrize("dtype", TRIANGULAR_DTYPES, ids=TRIANGULAR_DTYPE_IDS)
+def test_spsv_coo_lower_matches_dense(n, dtype):
+    device = torch.device("cuda")
+    base = torch.tril(torch.randn(n, n, dtype=dtype, device=device))
+    eye = torch.eye(n, dtype=dtype, device=device)
+    A = base + eye * (float(n) * 0.5 + 2.0)
+    b = torch.randn(n, dtype=dtype, device=device)
+    x_ref = torch.linalg.solve_triangular(
+        A, b.unsqueeze(-1), upper=False
+    ).squeeze(-1)
+    Acoo = A.to_sparse_coo().coalesce()
+    coo_indices = Acoo.indices()
+    x = flagsparse_spsv_coo(
+        Acoo.values(),
+        coo_indices[0].contiguous(),
+        coo_indices[1].contiguous(),
         b,
         (n, n),
         lower=True,

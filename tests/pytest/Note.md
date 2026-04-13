@@ -13,6 +13,15 @@
 
 参数列表定义在 `param_shapes.py`；`--mode quick|normal` 在 `conftest.py` 中切换 **QUICK_MODE**，会缩短形状列表。
 
+当前 accuracy suite 可直接通过 marker 选择算子，例如：
+
+```bash
+pytest tests/pytest --mode quick -m "spmv_csr or spmm_csr"
+python run_flagsparse_pytest.py --mode quick --ops gather,scatter,spmv_csr --gpus 0
+```
+
+`run_flagsparse_pytest.py` 借鉴 FlagGems 的调度方式：按算子单独启动 pytest、设置 `CUDA_VISIBLE_DEVICES`、保存每个算子的 `accuracy.log`，并汇总为 `summary.json`、`summary.csv`、可选 `summary.xlsx`。
+
 ---
 
 ### 合成数据生成规则（CUDA）
@@ -105,6 +114,15 @@ Strings like `test_xxx[float32-1024-256]` are **pytest case instance IDs**: the 
 - **Numeric segments**: Shape or order parameters for that test (see below).
 
 Grids live in `param_shapes.py`. `--mode quick|normal` in `conftest.py` toggles **QUICK_MODE** (fewer shapes).
+
+The accuracy suite can be selected by operator marker, for example:
+
+```bash
+pytest tests/pytest --mode quick -m "spmv_csr or spmm_csr"
+python run_flagsparse_pytest.py --mode quick --ops gather,scatter,spmv_csr --gpus 0
+```
+
+`run_flagsparse_pytest.py` follows the useful FlagGems runner pattern: one pytest process per operator, per-op `CUDA_VISIBLE_DEVICES`, per-op `accuracy.log`, and `summary.json` / `summary.csv` / optional `summary.xlsx`.
 
 ---
 

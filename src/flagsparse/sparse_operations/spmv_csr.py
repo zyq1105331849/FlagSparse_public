@@ -68,6 +68,8 @@ class PreparedCsrSpmv:
             self._baseline_compute_dtype = torch.float32
         elif data.dtype == torch.float32:
             self._baseline_compute_dtype = torch.float64
+        elif _is_complex32_dtype(data.dtype):
+            self._baseline_compute_dtype = torch.complex64
         else:
             self._baseline_compute_dtype = data.dtype
         self._baseline_data = None

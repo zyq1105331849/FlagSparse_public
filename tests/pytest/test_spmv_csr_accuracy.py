@@ -131,6 +131,7 @@ def test_spmv_csr_matches_dense_reference(M, N, name, dtype, index_dtype, transp
     _assert_close(out, ref, dtype)
 
 
+@pytest.mark.spmv_csr
 def test_spmv_csr_prepared_transpose_mismatch_rejected():
     device = torch.device("cuda")
     data, indices, indptr, _dense = _random_csr_mn(8, 10, torch.float32, torch.int32, device)
@@ -140,6 +141,7 @@ def test_spmv_csr_prepared_transpose_mismatch_rejected():
         flagsparse_spmv_csr(x=x, prepared=prepared, transpose=False)
 
 
+@pytest.mark.spmv_csr
 def test_spmv_csr_int64_auto_fallback_to_int32(monkeypatch):
     device = torch.device("cuda")
     data, indices, indptr, dense = _random_csr_mn(12, 9, torch.float32, torch.int64, device)
@@ -167,6 +169,7 @@ def test_spmv_csr_int64_auto_fallback_to_int32(monkeypatch):
     assert torch.allclose(out.to(torch.float64), ref, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.spmv_csr
 def test_spmv_csr_int64_strict_no_fallback(monkeypatch):
     device = torch.device("cuda")
     data, indices, indptr, _dense = _random_csr_mn(12, 9, torch.float32, torch.int64, device)
@@ -189,6 +192,7 @@ def test_spmv_csr_int64_strict_no_fallback(monkeypatch):
         )
 
 
+@pytest.mark.spmv_csr
 def test_spmv_csr_int64_auto_does_not_fallback_when_index_exceeds_int32(monkeypatch):
     device = torch.device("cuda")
     limit = spmv_mod._INDEX_LIMIT_INT32

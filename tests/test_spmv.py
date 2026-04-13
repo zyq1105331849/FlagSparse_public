@@ -171,15 +171,34 @@ def _has_non_finite(tensor):
 
 
 def _non_finite_error_reason(actual, reference, reference_name):
-    if _has_non_finite(actual):
+    actual_non_finite = _has_non_finite(actual)
+    reference_non_finite = _has_non_finite(reference)
+    if actual_non_finite and reference_non_finite:
+        return f"non-finite FlagSparse output and {reference_name}"
+    if actual_non_finite:
         return "non-finite FlagSparse output"
-    if _has_non_finite(reference):
+    if reference_non_finite:
         return f"non-finite {reference_name}"
     return None
 
 
 def _has_numeric_error(error_value):
     return error_value is not None and not math.isnan(error_value)
+
+
+def _complex32_output_range_exceeded(reference, out_dtype):
+    if (
+        not _is_complex32_dtype(out_dtype)
+        or reference is None
+        or reference.numel() == 0
+    ):
+        return False
+    reference = reference.to(torch.complex64)
+    if not bool(torch.isfinite(reference).all().item()):
+        return False
+    limit = torch.finfo(torch.float16).max
+    components = torch.view_as_real(reference)
+    return bool(torch.any(torch.abs(components) > limit).item())
 
 
 def _benchmark_flagsparse_spmv(
@@ -242,7 +261,16 @@ def _cast_reference_output(y_ref, out_dtype):
     return torch.view_as_complex(pair)
 
 
-def _pytorch_spmv_reference(data, indices, indptr, x, shape, out_dtype, transpose=False):
+def _pytorch_spmv_reference(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    out_dtype,
+    transpose=False,
+    return_compute=False,
+):
     device = data.device
     ref_dtype = _reference_dtype(out_dtype)
     data_ref = data.to(ref_dtype)
@@ -271,6 +299,8 @@ def _pytorch_spmv_reference(data, indices, indptr, x, shape, out_dtype, transpos
         ).coalesce()
         ref_mat = coo_ref.transpose(0, 1) if transpose else coo_ref
         y_ref = torch.sparse.mm(ref_mat, x_ref.unsqueeze(1)).squeeze(1)
+    if return_compute:
+        return y_ref
     return _cast_reference_output(y_ref, out_dtype)
 
 
@@ -347,9 +377,17 @@ def run_one_mtx(
     triton_ok_pt = False
     pt_error_reason = None
     try:
-        pt_ref_y = _pytorch_spmv_reference(
-            data, indices, indptr, x, shape, value_dtype, transpose=transpose
+        pt_ref_compute_y = _pytorch_spmv_reference(
+            data,
+            indices,
+            indptr,
+            x,
+            shape,
+            value_dtype,
+            transpose=transpose,
+            return_compute=True,
         )
+        pt_ref_y = _cast_reference_output(pt_ref_compute_y, value_dtype)
         start_ev = torch.cuda.Event(enable_timing=True)
         end_ev = torch.cuda.Event(enable_timing=True)
         for _ in range(warmup):
@@ -366,9 +404,12 @@ def run_one_mtx(
         torch.cuda.synchronize()
         pytorch_ms = start_ev.elapsed_time(end_ev) / iters
         if y_size:
-            pt_error_reason = _non_finite_error_reason(
-                triton_y, pt_ref_y, "PyTorch reference"
-            )
+            if _complex32_output_range_exceeded(pt_ref_compute_y, value_dtype):
+                pt_error_reason = "complex32 output range exceeded"
+            else:
+                pt_error_reason = _non_finite_error_reason(
+                    triton_y, pt_ref_y, "PyTorch reference"
+                )
             if pt_error_reason is None:
                 err_pt = _allclose_error_ratio(triton_y, pt_ref_y, atol, rtol)
                 triton_ok_pt = (not math.isnan(err_pt)) and err_pt <= 1.0
@@ -462,9 +503,18 @@ def run_one_mtx(
             "triton_ok_cu": False,
             "status": "FAIL" if triton_non_finite else "REF_FAIL",
         }
-    if _has_non_finite(triton_y):
+    if pt_error_reason == "complex32 output range exceeded":
         status = "FAIL"
-        error_reason = "non-finite FlagSparse output"
+        error_reason = pt_error_reason
+    elif _has_non_finite(triton_y):
+        status = "FAIL"
+        if (
+            pt_error_reason
+            and pt_error_reason.startswith("non-finite FlagSparse output")
+        ):
+            error_reason = pt_error_reason
+        else:
+            error_reason = "non-finite FlagSparse output"
     elif triton_ok_pt or triton_ok_cu:
         status = "PASS"
         error_reason = None

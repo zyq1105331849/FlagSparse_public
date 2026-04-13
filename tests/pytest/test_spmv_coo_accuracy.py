@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from flagsparse import flagsparse_spmv_coo
+from flagsparse import flagsparse_spmv_coo, flagsparse_spmv_coo_tocsr, prepare_spmv_coo_tocsr
 
 from tests.pytest.param_shapes import (
     SPMV_COO_DTYPES,
@@ -20,7 +20,7 @@ def _random_coo_mn(M, N, dtype, device):
     if int(mask.sum().item()) == 0:
         mask[0, 0] = True
     vals = torch.randn(M, N, dtype=dtype, device=device) * mask.to(dtype=dtype)
-    return vals.to_sparse_coo()
+    return vals.to_sparse_coo().coalesce()
 
 
 def _tol(dtype):
@@ -44,3 +44,37 @@ def test_spmv_coo_matches_torch(M, N, dtype):
     out = flagsparse_spmv_coo(data, row, col, x, shape=(M, N))
     rtol, atol = _tol(dtype)
     assert torch.allclose(out, ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.spmv_coo_tocsr
+@pytest.mark.parametrize("M, N", SPMV_MN_SHAPES)
+@pytest.mark.parametrize("dtype", SPMV_COO_DTYPES, ids=SPMV_COO_DTYPE_IDS)
+def test_spmv_coo_tocsr_matches_torch(M, N, dtype):
+    device = torch.device("cuda")
+    Asp = _random_coo_mn(M, N, dtype, device).coalesce()
+    data = Asp.values()
+    indices = Asp.indices()
+    row = indices[0].contiguous()
+    col = indices[1].contiguous()
+    x = torch.randn(N, dtype=dtype, device=device)
+    ref = torch.sparse.mm(Asp, x.unsqueeze(1)).squeeze(1)
+    out = flagsparse_spmv_coo_tocsr(data, row, col, x, shape=(M, N))
+    rtol, atol = _tol(dtype)
+    assert torch.allclose(out, ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.spmv_coo_tocsr
+def test_spmv_coo_tocsr_prepared_path_matches_torch():
+    device = torch.device("cuda")
+    M, N = 8, 10
+    dtype = torch.float32
+    Asp = _random_coo_mn(M, N, dtype, device).coalesce()
+    data = Asp.values()
+    indices = Asp.indices()
+    row = indices[0].contiguous()
+    col = indices[1].contiguous()
+    x = torch.randn(N, dtype=dtype, device=device)
+    prepared = prepare_spmv_coo_tocsr(data, row, col, (M, N))
+    ref = torch.sparse.mm(Asp, x.unsqueeze(1)).squeeze(1)
+    out = flagsparse_spmv_coo_tocsr(x=x, prepared=prepared)
+    assert torch.allclose(out, ref, rtol=1e-4, atol=1e-4)
