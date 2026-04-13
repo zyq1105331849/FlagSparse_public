@@ -66,6 +66,8 @@ def _build_random_values(size, dtype, device):
 
 
 def _to_cupy(tensor):
+    if tensor.dtype == torch.bfloat16:
+        pytest.skip("CuPy DLPack bfloat16 conversion is unsafe in this environment")
     return cp.from_dlpack(torch.utils.dlpack.to_dlpack(tensor))
 
 

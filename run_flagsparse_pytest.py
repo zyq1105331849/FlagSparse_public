@@ -64,6 +64,10 @@ def parse_pytest_summary(text: str) -> dict[str, int]:
 
 
 def status_from_counts(counts: dict[str, int], returncode: int) -> str:
+    if returncode not in (0, 5) and not any(
+        counts[key] for key in ("passed", "failed", "skipped", "errors")
+    ):
+        return "CRASH"
     if counts["failed"] or counts["errors"] or returncode not in (0, 5):
         return "FAIL"
     if counts["passed"]:
@@ -253,7 +257,7 @@ def main() -> int:
             future.result()
 
     write_summary(results, results_dir)
-    return 1 if any(result["status"] in ("FAIL", "NO_TESTS") for result in results) else 0
+    return 1 if any(result["status"] in ("FAIL", "NO_TESTS", "CRASH") for result in results) else 0
 
 
 if __name__ == "__main__":
