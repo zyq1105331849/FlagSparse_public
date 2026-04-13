@@ -163,6 +163,25 @@ def _allclose_error_ratio(actual, reference, atol, rtol):
     return float(torch.max(diff / tol).item())
 
 
+def _has_non_finite(tensor):
+    if tensor is None or tensor.numel() == 0:
+        return False
+    probe = tensor.to(torch.complex64) if _is_complex32_dtype(tensor.dtype) else tensor
+    return not bool(torch.isfinite(probe).all().item())
+
+
+def _non_finite_error_reason(actual, reference, reference_name):
+    if _has_non_finite(actual):
+        return "non-finite FlagSparse output"
+    if _has_non_finite(reference):
+        return f"non-finite {reference_name}"
+    return None
+
+
+def _has_numeric_error(error_value):
+    return error_value is not None and not math.isnan(error_value)
+
+
 def _benchmark_flagsparse_spmv(
     data,
     indices,
@@ -275,6 +294,8 @@ def _cupy_csr_reference(data, indices, indptr, x, shape, out_dtype, transpose=Fa
 def _tolerance(value_dtype):
     if value_dtype in (torch.float16, torch.bfloat16):
         return 2e-3, 2e-3
+    if _is_complex32_dtype(value_dtype):
+        return 5e-3, 1.25e-2
     if value_dtype in (torch.float32, torch.complex64):
         return 1.25e-4, 1.25e-2
     if value_dtype in (torch.float64, torch.complex128):
@@ -324,6 +345,7 @@ def run_one_mtx(
     pytorch_ms = None
     err_pt = None
     triton_ok_pt = False
+    pt_error_reason = None
     try:
         pt_ref_y = _pytorch_spmv_reference(
             data, indices, indptr, x, shape, value_dtype, transpose=transpose
@@ -344,14 +366,22 @@ def run_one_mtx(
         torch.cuda.synchronize()
         pytorch_ms = start_ev.elapsed_time(end_ev) / iters
         if y_size:
-            err_pt = _allclose_error_ratio(triton_y, pt_ref_y, atol, rtol)
-            triton_ok_pt = (not math.isnan(err_pt)) and err_pt <= 1.0
-    except Exception:
+            pt_error_reason = _non_finite_error_reason(
+                triton_y, pt_ref_y, "PyTorch reference"
+            )
+            if pt_error_reason is None:
+                err_pt = _allclose_error_ratio(triton_y, pt_ref_y, atol, rtol)
+                triton_ok_pt = (not math.isnan(err_pt)) and err_pt <= 1.0
+            else:
+                err_pt = float("nan")
+    except Exception as exc:
         pytorch_ms = None
+        pt_error_reason = f"PyTorch reference error: {exc}"
 
     cusparse_ms = None
     err_cu = None
     triton_ok_cu = False
+    cu_error_reason = None
     csc_ms = None
     if (
         run_cusparse
@@ -383,8 +413,14 @@ def run_one_mtx(
                 data, indices, indptr, x, shape, value_dtype, transpose=transpose
             )
             if y_size:
-                err_cu = _allclose_error_ratio(triton_y, cs_ref_t, atol, rtol)
-                triton_ok_cu = (not math.isnan(err_cu)) and err_cu <= 1.0
+                cu_error_reason = _non_finite_error_reason(
+                    triton_y, cs_ref_t, "cuSPARSE reference"
+                )
+                if cu_error_reason is None:
+                    err_cu = _allclose_error_ratio(triton_y, cs_ref_t, atol, rtol)
+                    triton_ok_cu = (not math.isnan(err_cu)) and err_cu <= 1.0
+                else:
+                    err_cu = float("nan")
 
             A_csc_op = A_csr.tocsc().T if transpose else A_csr.tocsc()
             for _ in range(warmup):
@@ -396,18 +432,25 @@ def run_one_mtx(
             end.record()
             torch.cuda.synchronize()
             csc_ms = start.elapsed_time(end) / iters
-        except Exception:
+        except Exception as exc:
             cusparse_ms = None
             err_cu = None
             csc_ms = None
+            cu_error_reason = f"cuSPARSE reference error: {exc}"
 
     if pt_ref_y is None and err_cu is None:
+        triton_non_finite = _has_non_finite(triton_y)
+        error_reason = "non-finite FlagSparse output" if triton_non_finite else (
+            pt_error_reason
+            or cu_error_reason
+            or "ref: no PyTorch or cuSPARSE result"
+        )
         return {
             "path": mtx_path,
             "shape": shape,
             "nnz": nnz,
-            "error": "ref: no PyTorch or cuSPARSE result",
-            "error_reason": "ref: no PyTorch or cuSPARSE result",
+            "error": error_reason,
+            "error_reason": error_reason,
             "transpose": transpose,
             "triton_ms": triton_ms,
             "cusparse_ms": None,
@@ -417,15 +460,30 @@ def run_one_mtx(
             "err_cu": None,
             "triton_ok_pt": False,
             "triton_ok_cu": False,
-            "status": "REF_FAIL",
+            "status": "FAIL" if triton_non_finite else "REF_FAIL",
         }
-    status = "PASS" if (triton_ok_pt or triton_ok_cu) else "FAIL"
+    if _has_non_finite(triton_y):
+        status = "FAIL"
+        error_reason = "non-finite FlagSparse output"
+    elif triton_ok_pt or triton_ok_cu:
+        status = "PASS"
+        error_reason = None
+    elif pt_error_reason == "non-finite PyTorch reference" and err_cu is None:
+        status = "REF_FAIL"
+        error_reason = pt_error_reason
+    else:
+        status = "FAIL"
+        error_reason = (
+            "tolerance exceeded"
+            if (_has_numeric_error(err_pt) or _has_numeric_error(err_cu))
+            else (pt_error_reason or cu_error_reason or "tolerance exceeded")
+        )
     return {
         "path": mtx_path,
         "shape": shape,
         "nnz": nnz,
         "error": None,
-        "error_reason": None,
+        "error_reason": error_reason,
         "transpose": transpose,
         "triton_ms": triton_ms,
         "cusparse_ms": cusparse_ms,
