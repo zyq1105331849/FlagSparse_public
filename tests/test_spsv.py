@@ -22,8 +22,8 @@ except Exception:
     cpx_sparse = None
     cpx_spsolve_triangular = None
 
-VALUE_DTYPES = [torch.float32, torch.float64]
-INDEX_DTYPES = [torch.int32]
+VALUE_DTYPES = [torch.float32, torch.float64, torch.complex64, torch.complex128]
+INDEX_DTYPES = [torch.int32, torch.int64]
 TEST_SIZES = [256, 512, 1024, 2048]
 WARMUP = 5
 ITERS = 20
@@ -42,6 +42,15 @@ CSR_FULL_VALUE_DTYPES = [
 if COMPLEX32_DTYPE is not None:
     CSR_FULL_VALUE_DTYPES.append(COMPLEX32_DTYPE)
 CSR_FULL_VALUE_DTYPES.append(torch.complex64)
+CSR_FULL_INDEX_DTYPES = [torch.int32, torch.int64]
+
+# CSR 完整组合覆盖（在原 csv-csr 逻辑外新增，不影响原入口）
+CSR_FULL_VALUE_DTYPES = [
+    torch.float32,
+    torch.float64,
+    torch.complex64,
+    torch.complex128,
+]
 CSR_FULL_INDEX_DTYPES = [torch.int32, torch.int64]
 
 
@@ -64,8 +73,11 @@ def _fmt_err(v):
 
 
 def _tol_for_dtype(dtype):
+<<<<<<< HEAD
     if COMPLEX32_DTYPE is not None and dtype == COMPLEX32_DTYPE:
         return 5e-3, 5e-3
+=======
+>>>>>>> 5a83e0f (test)
     if dtype in (torch.float32, torch.complex64):
         return 1e-4, 1e-2
     return 1e-12, 1e-10
@@ -74,22 +86,30 @@ def _tol_for_dtype(dtype):
 def _randn_by_dtype(n, dtype, device):
     if dtype in (torch.float32, torch.float64):
         return torch.randn(n, dtype=dtype, device=device)
+<<<<<<< HEAD
     if COMPLEX32_DTYPE is not None and dtype == COMPLEX32_DTYPE:
         pair = torch.randn((n, 2), dtype=torch.float16, device=device) * 0.1
         return torch.view_as_complex(pair)
     base = torch.float32
+=======
+    base = torch.float32 if dtype == torch.complex64 else torch.float64
+>>>>>>> 5a83e0f (test)
     real = torch.randn(n, dtype=base, device=device)
     imag = torch.randn(n, dtype=base, device=device)
     return torch.complex(real, imag)
 
 
 def _dense_ref_dtype(dtype):
+<<<<<<< HEAD
     if COMPLEX32_DTYPE is not None and dtype == COMPLEX32_DTYPE:
         return torch.complex64
+=======
+>>>>>>> 5a83e0f (test)
     return dtype
 
 
 def _tensor_from_scalar_values(values, dtype, device):
+<<<<<<< HEAD
     if COMPLEX32_DTYPE is not None and dtype == COMPLEX32_DTYPE:
         real = torch.clamp(
             torch.tensor(values, dtype=torch.float32, device=device),
@@ -98,18 +118,24 @@ def _tensor_from_scalar_values(values, dtype, device):
         ).to(torch.float16)
         imag = torch.zeros_like(real)
         return torch.view_as_complex(torch.stack([real, imag], dim=-1).contiguous())
+=======
+>>>>>>> 5a83e0f (test)
     return torch.tensor(values, dtype=dtype, device=device)
 
 
 def _safe_cast_tensor(tensor, dtype):
+<<<<<<< HEAD
     if COMPLEX32_DTYPE is not None and dtype == COMPLEX32_DTYPE:
         real = torch.clamp(tensor.real, min=-FLOAT16_LIMIT, max=FLOAT16_LIMIT).to(torch.float16)
         imag = torch.clamp(tensor.imag, min=-FLOAT16_LIMIT, max=FLOAT16_LIMIT).to(torch.float16)
         return torch.view_as_complex(torch.stack([real, imag], dim=-1).contiguous())
+=======
+>>>>>>> 5a83e0f (test)
     return tensor.to(dtype)
 
 
 def _cast_real_tensor_to_value_dtype(values, value_dtype):
+<<<<<<< HEAD
     if COMPLEX32_DTYPE is not None and value_dtype == COMPLEX32_DTYPE:
         real = torch.clamp(values, min=-FLOAT16_LIMIT, max=FLOAT16_LIMIT).to(torch.float16)
         imag = torch.zeros_like(real)
@@ -120,12 +146,45 @@ def _cast_real_tensor_to_value_dtype(values, value_dtype):
 def _cupy_ref_inputs(data, b):
     if COMPLEX32_DTYPE is not None and data.dtype == COMPLEX32_DTYPE:
         return data.to(torch.complex64), b.to(torch.complex64)
+=======
+    return values.to(value_dtype)
+
+
+def _matrix_market_value(parts, mm_field):
+    if mm_field == "complex":
+        if len(parts) < 4:
+            raise ValueError("MatrixMarket complex entry requires real and imag parts")
+        return complex(float(parts[2]), float(parts[3]))
+    if len(parts) >= 3:
+        return float(parts[2])
+    if mm_field == "pattern":
+        return 1.0
+    raise ValueError("MatrixMarket entry is missing a numeric value")
+
+
+def _triangular_solve_reference(A, b, *, lower, op_mode="NON"):
+    if op_mode == "TRANS":
+        A_eff = A.transpose(0, 1)
+        upper = lower
+    else:
+        A_eff = A
+        upper = not lower
+    return torch.linalg.solve_triangular(
+        A_eff, b.unsqueeze(1), upper=upper
+    ).squeeze(1)
+
+
+def _cupy_ref_inputs(data, b):
+>>>>>>> 5a83e0f (test)
     return data, b
 
 
 def _compare_view(tensor, value_dtype):
+<<<<<<< HEAD
     if COMPLEX32_DTYPE is not None and value_dtype == COMPLEX32_DTYPE:
         return tensor.to(torch.complex64)
+=======
+>>>>>>> 5a83e0f (test)
     return tensor
 
 
@@ -147,7 +206,7 @@ def _allow_dense_pytorch_ref(shape, dtype):
 
 
 def _build_random_triangular_csr(n, value_dtype, index_dtype, device, lower=True):
-    """Build a well-conditioned triangular CSR (float32/float64)."""
+    """Build a well-conditioned triangular CSR for real and complex dtypes."""
     max_bandwidth = max(4, min(n, 16))
     rows_host = []
     cols_host = []
@@ -156,10 +215,17 @@ def _build_random_triangular_csr(n, value_dtype, index_dtype, device, lower=True
         base_real_dtype = torch.float32
     elif value_dtype == torch.float64:
         base_real_dtype = torch.float64
+<<<<<<< HEAD
     elif COMPLEX32_DTYPE is not None and value_dtype == COMPLEX32_DTYPE:
         base_real_dtype = torch.float16
     else:
         base_real_dtype = torch.float32
+=======
+    elif value_dtype == torch.complex64:
+        base_real_dtype = torch.float32
+    else:
+        base_real_dtype = torch.float64
+>>>>>>> 5a83e0f (test)
 
     for i in range(n):
         if lower:
@@ -176,23 +242,44 @@ def _build_random_triangular_csr(n, value_dtype, index_dtype, device, lower=True
             off_cols = [off_cand[j] for j in perm]
         else:
             off_cols = []
-        off_vals_real = torch.randn(len(off_cols), dtype=base_real_dtype).mul_(0.01)
-        sum_abs = float(torch.sum(torch.abs(off_vals_real)).item()) if off_vals_real.numel() else 0.0
-        diag_val = sum_abs + 1.0
+        if value_dtype in (torch.complex64, torch.complex128):
+            off_vals = torch.complex(
+                torch.randn(len(off_cols), dtype=base_real_dtype, device=device).mul_(0.01),
+                torch.randn(len(off_cols), dtype=base_real_dtype, device=device).mul_(0.01),
+            )
+            sum_abs = (
+                float(torch.sum(torch.abs(off_vals)).item()) if off_vals.numel() else 0.0
+            )
+            diag_imag = float(
+                torch.randn((), dtype=base_real_dtype, device=device).mul_(0.05).item()
+            )
+            diag_val = complex(sum_abs + 1.0, diag_imag)
+            off_vals_host = [complex(v) for v in off_vals.cpu().tolist()]
+        else:
+            off_vals = torch.randn(len(off_cols), dtype=base_real_dtype, device=device).mul_(0.01)
+            sum_abs = (
+                float(torch.sum(torch.abs(off_vals)).item()) if off_vals.numel() else 0.0
+            )
+            diag_val = sum_abs + 1.0
+            off_vals_host = off_vals.cpu().tolist()
         rows_host.append(i)
         cols_host.append(diag_col)
         vals_host.append(diag_val)
-        for c, v in zip(off_cols, off_vals_real.tolist()):
+        for c, v in zip(off_cols, off_vals_host):
             rows_host.append(i)
             cols_host.append(int(c))
             vals_host.append(v)
 
     rows_t = torch.tensor(rows_host, dtype=torch.int64, device=device)
     cols_t = torch.tensor(cols_host, dtype=torch.int64, device=device)
+<<<<<<< HEAD
     vals_t = _cast_real_tensor_to_value_dtype(
         torch.tensor(vals_host, dtype=base_real_dtype, device=device),
         value_dtype,
     )
+=======
+    vals_t = torch.tensor(vals_host, dtype=value_dtype, device=device)
+>>>>>>> 5a83e0f (test)
     order = torch.argsort(rows_t * max(1, n) + cols_t)
     rows_t = rows_t[order]
     cols_t = cols_t[order]
@@ -257,7 +344,11 @@ def _csr_transpose(data, indices, indptr, shape):
     return data_t, col_t.to(torch.int64), indptr_t
 
 
+<<<<<<< HEAD
 def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
+=======
+def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None, lower=True):
+>>>>>>> 5a83e0f (test)
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     with open(file_path, "r", encoding="utf-8") as f:
@@ -302,28 +393,26 @@ def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
             continue
         r = int(parts[0]) - 1
         c = int(parts[1]) - 1
-        if len(parts) >= 3:
-            v = float(parts[2])
-        elif mm_field == "pattern":
-            v = 1.0
-        else:
-            continue
+        v = _matrix_market_value(parts, mm_field)
         _accum(r, c, v)
-        if mm_symmetry in ("symmetric", "hermitian") and r != c:
+        if mm_symmetry == "symmetric" and r != c:
             _accum(c, r, v)
+        elif mm_symmetry == "hermitian" and r != c:
+            _accum(c, r, v.conjugate() if isinstance(v, complex) else v)
         elif mm_symmetry == "skew-symmetric" and r != c:
             _accum(c, r, -v)
 
     for r in range(n_rows):
         row = row_maps[r]
-        lower_row = {}
+        tri_row = {}
         off_abs_sum = 0.0
         for c, v in row.items():
-            if c < r:
-                lower_row[c] = lower_row.get(c, 0.0) + v
+            keep = c < r if lower else c > r
+            if keep:
+                tri_row[c] = tri_row.get(c, 0.0) + v
                 off_abs_sum += abs(v)
-        lower_row[r] = off_abs_sum + 1.0
-        row_maps[r] = lower_row
+        tri_row[r] = off_abs_sum + 1.0
+        row_maps[r] = tri_row
 
     cols_s = []
     vals_s = []
@@ -360,6 +449,7 @@ def _coo_inputs_for_csv(data, indices, indptr, shape, coo_mode):
 
 
 def _build_rhs_for_csr_op(data, indices, indptr, x_true, shape, op_mode):
+<<<<<<< HEAD
     if COMPLEX32_DTYPE is not None and data.dtype == COMPLEX32_DTYPE:
         data_ref = data.to(torch.complex64)
         x_ref = x_true.to(torch.complex64)
@@ -380,6 +470,8 @@ def _build_rhs_for_csr_op(data, indices, indptr, x_true, shape, op_mode):
             )
             return _safe_cast_tensor(b_ref, x_true.dtype)
         raise ValueError("op_mode must be 'NON' or 'TRANS'")
+=======
+>>>>>>> 5a83e0f (test)
     if op_mode == "NON":
         b, _ = fs.flagsparse_spmv_csr(
             data, indices, indptr, x_true, shape, return_time=True
@@ -408,6 +500,7 @@ def _cupy_spsolve_lower_csr_or_coo(
     b,
     warmup,
     iters,
+    lower,
 ):
     """Triangular solve via CuPy: CSR or COO storage. Returns (ms, x_torch) or (None, None)."""
     if (
@@ -439,7 +532,7 @@ def _cupy_spsolve_lower_csr_or_coo(
             A_cp = cpx_sparse.csr_matrix((data_cp, idx_cp, ptr_cp), shape=shape)
         for _ in range(warmup):
             _ = cpx_spsolve_triangular(
-                A_cp, b_cp, lower=True, unit_diagonal=False
+                A_cp, b_cp, lower=lower, unit_diagonal=False
             )
         cp.cuda.runtime.deviceSynchronize()
         t0 = cp.cuda.Event()
@@ -447,22 +540,30 @@ def _cupy_spsolve_lower_csr_or_coo(
         t0.record()
         for _ in range(iters):
             x_cu = cpx_spsolve_triangular(
-                A_cp, b_cp, lower=True, unit_diagonal=False
+                A_cp, b_cp, lower=lower, unit_diagonal=False
             )
         t1.record()
         t1.synchronize()
         cupy_ms = cp.cuda.get_elapsed_time(t0, t1) / iters
         x_cu_t = torch.utils.dlpack.from_dlpack(x_cu.toDlpack())
+<<<<<<< HEAD
         if COMPLEX32_DTYPE is not None and b.dtype == COMPLEX32_DTYPE:
             x_cu_t = x_cu_t.to(torch.complex64)
         else:
             x_cu_t = x_cu_t.to(b.dtype)
+=======
+        x_cu_t = x_cu_t.to(b.dtype)
+>>>>>>> 5a83e0f (test)
         return cupy_ms, x_cu_t
     except Exception:
         return None, None
 
 
+<<<<<<< HEAD
 def _cupy_spsolve_csr_with_op(data, indices, indptr, shape, b, op_mode):
+=======
+def _cupy_spsolve_csr_with_op(data, indices, indptr, shape, b, op_mode, lower):
+>>>>>>> 5a83e0f (test)
     if (
         cp is None
         or cpx_sparse is None
@@ -482,10 +583,17 @@ def _cupy_spsolve_csr_with_op(data, indices, indptr, shape, b, op_mode):
         A_cp = cpx_sparse.csr_matrix((data_cp, idx_cp, ptr_cp), shape=shape)
         if op_mode == "TRANS":
             A_eff = A_cp.transpose().tocsr()
+<<<<<<< HEAD
             lower_eff = False
         else:
             A_eff = A_cp
             lower_eff = True
+=======
+            lower_eff = not lower
+        else:
+            A_eff = A_cp
+            lower_eff = lower
+>>>>>>> 5a83e0f (test)
 
         for _ in range(WARMUP):
             _ = cpx_spsolve_triangular(
@@ -508,7 +616,11 @@ def _cupy_spsolve_csr_with_op(data, indices, indptr, shape, b, op_mode):
         return None, None
 
 
+<<<<<<< HEAD
 def run_spsv_synthetic_all():
+=======
+def run_spsv_synthetic_all(lower=True):
+>>>>>>> 5a83e0f (test)
     if not torch.cuda.is_available():
         print("CUDA is not available. Please run on a GPU-enabled system.")
         return
@@ -519,10 +631,11 @@ def run_spsv_synthetic_all():
     print(sep)
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Warmup: {WARMUP} | Iters: {ITERS}")
+    print(f"Triangle: {'LOWER' if lower else 'UPPER'}")
     print()
 
     hdr = (
-        f"{'Fmt':>5} {'N':>6} {'FlagSparse(ms)':>14} {'PyTorch(ms)':>12} {'CuPy(ms)':>10} "
+        f"{'Fmt':>5} {'opA':>5} {'N':>6} {'FlagSparse(ms)':>14} {'PyTorch(ms)':>12} {'CuPy(ms)':>10} "
         f"{'FS/PT':>8} {'FS/CU':>8} {'Status':>8} {'Err(PT)':>12} {'Err(CU)':>12}"
     )
 
@@ -540,101 +653,121 @@ def run_spsv_synthetic_all():
             print("-" * 110)
             for n in TEST_SIZES:
                 for fmt in ("CSR", "COO"):
-                    data, indices, indptr, shape = _build_random_triangular_csr(
-                        n, value_dtype, index_dtype, device, lower=True
+                    op_modes = (
+                        _supported_csr_full_ops(value_dtype, index_dtype)
+                        if fmt == "CSR"
+                        else ["NON"]
                     )
-                    A_dense = _csr_to_dense(
-                        data, indices.to(torch.int64), indptr, shape
-                    )
-                    x_true = torch.randn(n, dtype=value_dtype, device=device)
-                    b = A_dense @ x_true
-
-                    torch.cuda.synchronize()
-                    if fmt == "CSR":
-                        x, t_ms = fs.flagsparse_spsv_csr(
-                            data,
-                            indices,
-                            indptr,
-                            b,
-                            shape,
-                            lower=True,
-                            return_time=True,
+                    for op_mode in op_modes:
+                        data, indices, indptr, shape = _build_random_triangular_csr(
+                            n, value_dtype, index_dtype, device, lower=lower
                         )
-                    else:
-                        dc, rr, cc = _csr_to_coo(data, indices, indptr, shape)
-                        x, t_ms = fs.flagsparse_spsv_coo(
-                            dc,
-                            rr,
-                            cc,
-                            b,
-                            shape,
-                            lower=True,
-                            coo_mode="auto",
-                            return_time=True,
+                        A_dense = _csr_to_dense(
+                            data, indices.to(torch.int64), indptr, shape
                         )
-                    torch.cuda.synchronize()
+                        x_true = _randn_by_dtype(n, value_dtype, device)
+                        if fmt == "CSR":
+                            b = _build_rhs_for_csr_op(data, indices, indptr, x_true, shape, op_mode)
+                        else:
+                            b = A_dense @ x_true
 
-                    A_ref = A_dense
-                    b_ref = b
-                    torch.cuda.synchronize()
-                    e0 = torch.cuda.Event(True)
-                    e1 = torch.cuda.Event(True)
-                    e0.record()
-                    x_pt = torch.linalg.solve(
-                        A_ref, b_ref.unsqueeze(1)
-                    ).squeeze(1)
-                    e1.record()
-                    torch.cuda.synchronize()
-                    pytorch_ms = e0.elapsed_time(e1)
-                    err_pt = float(torch.max(torch.abs(x - x_pt)).item()) if n > 0 else 0.0
+                        torch.cuda.synchronize()
+                        if fmt == "CSR":
+                            x, t_ms = fs.flagsparse_spsv_csr(
+                                data,
+                                indices,
+                                indptr,
+                                b,
+                                shape,
+                                lower=lower,
+                                transpose=(op_mode == "TRANS"),
+                                return_time=True,
+                            )
+                        else:
+                            dc, rr, cc = _csr_to_coo(data, indices, indptr, shape)
+                            x, t_ms = fs.flagsparse_spsv_coo(
+                                dc,
+                                rr,
+                                cc,
+                                b,
+                                shape,
+                                lower=lower,
+                                coo_mode="auto",
+                                return_time=True,
+                            )
+                        torch.cuda.synchronize()
 
-                    cupy_ms = None
-                    err_cu = None
-                    x_cu_t = None
-                    if value_dtype in (torch.float32, torch.float64):
-                        cupy_ms, x_cu_t = _cupy_spsolve_lower_csr_or_coo(
-                            fmt,
-                            data,
-                            indices,
-                            indptr,
-                            shape,
-                            b,
-                            WARMUP,
-                            ITERS,
+                        A_ref = A_dense
+                        b_ref = b
+                        torch.cuda.synchronize()
+                        e0 = torch.cuda.Event(True)
+                        e1 = torch.cuda.Event(True)
+                        e0.record()
+                        x_pt = _triangular_solve_reference(
+                            A_ref, b_ref, lower=lower, op_mode=op_mode
                         )
+                        e1.record()
+                        torch.cuda.synchronize()
+                        pytorch_ms = e0.elapsed_time(e1)
+                        err_pt = float(torch.max(torch.abs(x - x_pt)).item()) if n > 0 else 0.0
+
+                        cupy_ms = None
+                        err_cu = None
+                        x_cu_t = None
+                        if fmt == "CSR":
+                            cupy_ms, x_cu_t = _cupy_spsolve_csr_with_op(
+                                data, indices, indptr, shape, b, op_mode, lower
+                            )
+                        elif value_dtype in (
+                            torch.float32,
+                            torch.float64,
+                            torch.complex64,
+                            torch.complex128,
+                        ):
+                            cupy_ms, x_cu_t = _cupy_spsolve_lower_csr_or_coo(
+                                fmt,
+                                data,
+                                indices,
+                                indptr,
+                                shape,
+                                b,
+                                WARMUP,
+                                ITERS,
+                                lower,
+                            )
                         if x_cu_t is not None and n > 0:
                             err_cu = float(
                                 torch.max(torch.abs(x - x_cu_t)).item()
                             )
 
-                    atol, rtol = _tol_for_dtype(value_dtype)
-                    ok_pt = torch.allclose(x, x_pt, atol=atol, rtol=rtol)
-                    ok_cu = (
-                        True
-                        if x_cu_t is None
-                        else torch.allclose(x, x_cu_t, atol=atol, rtol=rtol)
-                    )
-                    ok = ok_pt or ok_cu
-                    status = "PASS" if ok else "FAIL"
-                    if not ok:
-                        failed += 1
-                    total += 1
+                        atol, rtol = _tol_for_dtype(value_dtype)
+                        ok_pt = torch.allclose(x, x_pt, atol=atol, rtol=rtol)
+                        ok_cu = (
+                            True
+                            if x_cu_t is None
+                            else torch.allclose(x, x_cu_t, atol=atol, rtol=rtol)
+                        )
+                        ok = ok_pt or ok_cu
+                        status = "PASS" if ok else "FAIL"
+                        if not ok:
+                            failed += 1
+                        total += 1
 
-                    fs_vs_pt = (
-                        (pytorch_ms / t_ms) if (t_ms and t_ms > 0) else None
-                    )
-                    fs_vs_cu = (
-                        (cupy_ms / t_ms)
-                        if (cupy_ms is not None and t_ms and t_ms > 0)
-                        else None
-                    )
-                    print(
-                        f"{fmt:>5} {n:>6} {_fmt_ms(t_ms):>14} {_fmt_ms(pytorch_ms):>12} "
-                        f"{_fmt_ms(cupy_ms):>10} "
-                        f"{(f'{fs_vs_pt:.2f}x' if fs_vs_pt is not None else 'N/A'):>8} "
-                        f"{(f'{fs_vs_cu:.2f}x' if fs_vs_cu is not None else 'N/A'):>8} "
-                        f"{status:>8} {_fmt_err(err_pt):>12} {_fmt_err(err_cu):>12}"
-                    )
+                        fs_vs_pt = (
+                            (pytorch_ms / t_ms) if (t_ms and t_ms > 0) else None
+                        )
+                        fs_vs_cu = (
+                            (cupy_ms / t_ms)
+                            if (cupy_ms is not None and t_ms and t_ms > 0)
+                            else None
+                        )
+                        print(
+                            f"{fmt:>5} {op_mode:>5} {n:>6} {_fmt_ms(t_ms):>14} {_fmt_ms(pytorch_ms):>12} "
+                            f"{_fmt_ms(cupy_ms):>10} "
+                            f"{(f'{fs_vs_pt:.2f}x' if fs_vs_pt is not None else 'N/A'):>8} "
+                            f"{(f'{fs_vs_cu:.2f}x' if fs_vs_cu is not None else 'N/A'):>8} "
+                            f"{status:>8} {_fmt_err(err_pt):>12} {_fmt_err(err_cu):>12}"
+                        )
             print("-" * 110)
             print()
 
@@ -643,32 +776,32 @@ def run_spsv_synthetic_all():
     print(sep)
 
 
-def _run_one_csv_row_csr(path, value_dtype, index_dtype, device):
+def _run_one_csv_row_csr(path, value_dtype, index_dtype, device, lower=True):
     data, indices, indptr, shape = _load_mtx_to_csr_torch(
-        path, dtype=value_dtype, device=device
+        path, dtype=value_dtype, device=device, lower=lower
     )
     indices = indices.to(index_dtype)
     n_rows, n_cols = shape
-    x_true = torch.randn(n_rows, dtype=value_dtype, device=device)
+    x_true = _randn_by_dtype(n_rows, value_dtype, device)
     b, _ = fs.flagsparse_spmv_csr(
         data, indices, indptr, x_true, shape, return_time=True
     )
     x, t_ms = fs.flagsparse_spsv_csr(
-        data, indices, indptr, b, shape, lower=True, return_time=True
+        data, indices, indptr, b, shape, lower=lower, return_time=True
     )
     return _finalize_csv_row(
         path, value_dtype, index_dtype, data, indices, indptr, shape,
-        x, t_ms, b, n_rows, n_cols,
+        x, t_ms, b, n_rows, n_cols, lower=lower,
     )
 
 
-def _run_one_csv_row_coo(path, value_dtype, index_dtype, device, coo_mode):
+def _run_one_csv_row_coo(path, value_dtype, index_dtype, device, coo_mode, lower=True):
     data, indices, indptr, shape = _load_mtx_to_csr_torch(
-        path, dtype=value_dtype, device=device
+        path, dtype=value_dtype, device=device, lower=lower
     )
     indices = indices.to(index_dtype)
     n_rows, n_cols = shape
-    x_true = torch.randn(n_rows, dtype=value_dtype, device=device)
+    x_true = _randn_by_dtype(n_rows, value_dtype, device)
     b, _ = fs.flagsparse_spmv_csr(
         data, indices, indptr, x_true, shape, return_time=True
     )
@@ -681,7 +814,7 @@ def _run_one_csv_row_coo(path, value_dtype, index_dtype, device, coo_mode):
         c_in,
         b,
         shape,
-        lower=True,
+        lower=lower,
         coo_mode=coo_mode,
         return_time=True,
     )
@@ -698,6 +831,7 @@ def _run_one_csv_row_coo(path, value_dtype, index_dtype, device, coo_mode):
         b,
         n_rows,
         n_cols,
+        lower=lower,
         nnz_display=int(d_in.numel()),
         cupy_coo_data=d_in,
         cupy_coo_row=r_in,
@@ -719,6 +853,7 @@ def _finalize_csv_row(
     n_rows,
     n_cols,
     *,
+    lower=True,
     nnz_display=None,
     cupy_coo_data=None,
     cupy_coo_row=None,
@@ -741,7 +876,13 @@ def _finalize_csv_row(
             e1 = torch.cuda.Event(True)
             torch.cuda.synchronize()
             e0.record()
+<<<<<<< HEAD
             x_ref = torch.linalg.solve(A_ref, b_ref.unsqueeze(1)).squeeze(1)
+=======
+            x_ref = _triangular_solve_reference(
+                A_ref, b_ref, lower=lower, op_mode="NON"
+            )
+>>>>>>> 5a83e0f (test)
             x_cmp = _compare_view(x, value_dtype)
             x_ref_cmp = _compare_view(x_ref, value_dtype)
             e1.record()
@@ -814,7 +955,7 @@ def _finalize_csv_row(
                 )
             for _ in range(WARMUP):
                 _ = cpx_spsolve_triangular(
-                    A_cp, b_cp, lower=True, unit_diagonal=False
+                    A_cp, b_cp, lower=lower, unit_diagonal=False
                 )
             cp.cuda.runtime.deviceSynchronize()
             c0 = cp.cuda.Event()
@@ -822,7 +963,7 @@ def _finalize_csv_row(
             c0.record()
             for _ in range(ITERS):
                 x_cu = cpx_spsolve_triangular(
-                    A_cp, b_cp, lower=True, unit_diagonal=False
+                    A_cp, b_cp, lower=lower, unit_diagonal=False
                 )
             c1.record()
             c1.synchronize()
@@ -865,9 +1006,15 @@ def _finalize_csv_row(
     return row, pt_skip_reason
 
 
+<<<<<<< HEAD
 def _run_one_csv_row_csr_full(path, value_dtype, index_dtype, op_mode, device):
     data, indices, indptr, shape = _load_mtx_to_csr_torch(
         path, dtype=value_dtype, device=device
+=======
+def _run_one_csv_row_csr_full(path, value_dtype, index_dtype, op_mode, device, lower=True):
+    data, indices, indptr, shape = _load_mtx_to_csr_torch(
+        path, dtype=value_dtype, device=device, lower=lower
+>>>>>>> 5a83e0f (test)
     )
     indices = indices.to(index_dtype)
     indptr = indptr.to(index_dtype)
@@ -880,7 +1027,11 @@ def _run_one_csv_row_csr_full(path, value_dtype, index_dtype, op_mode, device):
         indptr,
         b,
         shape,
+<<<<<<< HEAD
         lower=True,
+=======
+        lower=lower,
+>>>>>>> 5a83e0f (test)
         transpose=(op_mode == "TRANS"),
         return_time=True,
     )
@@ -898,6 +1049,10 @@ def _run_one_csv_row_csr_full(path, value_dtype, index_dtype, op_mode, device):
         b,
         n_rows,
         n_cols,
+<<<<<<< HEAD
+=======
+        lower=lower,
+>>>>>>> 5a83e0f (test)
     )
 
 
@@ -915,6 +1070,10 @@ def _finalize_csv_row_csr_full(
     b,
     n_rows,
     n_cols,
+<<<<<<< HEAD
+=======
+    lower=True,
+>>>>>>> 5a83e0f (test)
 ):
     atol, rtol = _tol_for_dtype(value_dtype)
 
@@ -927,12 +1086,21 @@ def _finalize_csv_row_csr_full(
             A_dense = _csr_to_dense(
                 data, indices.to(torch.int64), indptr.to(torch.int64), shape
             ).to(_dense_ref_dtype(value_dtype))
+<<<<<<< HEAD
             A_ref = A_dense.transpose(0, 1) if op_mode == "TRANS" else A_dense
+=======
+>>>>>>> 5a83e0f (test)
             e0 = torch.cuda.Event(True)
             e1 = torch.cuda.Event(True)
             torch.cuda.synchronize()
             e0.record()
+<<<<<<< HEAD
             x_ref = torch.linalg.solve(A_ref, b.to(A_ref.dtype).unsqueeze(1)).squeeze(1)
+=======
+            x_ref = _triangular_solve_reference(
+                A_dense, b.to(A_dense.dtype), lower=lower, op_mode=op_mode
+            )
+>>>>>>> 5a83e0f (test)
             x_cmp = _compare_view(x, value_dtype)
             x_ref_cmp = _compare_view(x_ref, value_dtype)
             e1.record()
@@ -959,7 +1127,11 @@ def _finalize_csv_row_csr_full(
     ok_cu = False
     x_cu_t = None
     cupy_ms, x_cu_t = _cupy_spsolve_csr_with_op(
+<<<<<<< HEAD
         data, indices, indptr, shape, b, op_mode
+=======
+        data, indices, indptr, shape, b, op_mode, lower
+>>>>>>> 5a83e0f (test)
     )
     if x_cu_t is not None:
         x_cmp = _compare_view(x, value_dtype)
@@ -994,6 +1166,7 @@ def _finalize_csv_row_csr_full(
     return row, pt_skip_reason
 
 
+<<<<<<< HEAD
 def run_all_supported_spsv_csr_csv(mtx_paths, csv_path):
     if not torch.cuda.is_available():
         print("CUDA is not available.")
@@ -1103,8 +1276,122 @@ def run_all_supported_spsv_csr_csv(mtx_paths, csv_path):
 
 
 def run_all_dtypes_spsv_csv(mtx_paths, csv_path, use_coo=False, coo_mode="auto"):
+=======
+def run_all_supported_spsv_csr_csv(mtx_paths, csv_path, lower=True):
+>>>>>>> 5a83e0f (test)
     if not torch.cuda.is_available():
         print("CUDA is not available.")
+        return
+    device = torch.device("cuda")
+    rows_out = []
+    for value_dtype in CSR_FULL_VALUE_DTYPES:
+        for index_dtype in CSR_FULL_INDEX_DTYPES:
+            op_modes = _supported_csr_full_ops(value_dtype, index_dtype)
+            for op_mode in op_modes:
+                print("=" * 150)
+                print(
+                    f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}  |  CSR  |  triA={'LOWER' if lower else 'UPPER'}  |  opA={op_mode}"
+                )
+                print(
+                    "Formats: FlagSparse=CSR, cuSPARSE=CSR ref, PyTorch=Dense solve."
+                )
+                print(
+                    "Err(PT)=|FlagSparse-PyTorch|, Err(CU)=|FlagSparse-cuSPARSE|. "
+                    "PASS if either error within tolerance."
+                )
+                print("-" * 150)
+                print(
+                    f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
+                    f"{'FlagSparse(ms)':>10} {'CSR(ms)':>10} {'CSC(ms)':>10} {'PyTorch(ms)':>11} "
+                    f"{'FS/CSR':>7} {'FS/PT':>7} {'Status':>6} {'Err(PT)':>10} {'Err(CU)':>10}"
+                )
+                print("-" * 150)
+                for path in mtx_paths:
+                    try:
+                        row, pt_skip = _run_one_csv_row_csr_full(
+                            path, value_dtype, index_dtype, op_mode, device, lower=lower
+                        )
+                        rows_out.append(row)
+                        name = os.path.basename(path)[:27]
+                        if len(os.path.basename(path)) > 27:
+                            name = name + "…"
+                        n_rows, n_cols = row["n_rows"], row["n_cols"]
+                        nnz = row["nnz"]
+                        t_ms = row["triton_ms"]
+                        cupy_ms = row["cusparse_ms"]
+                        pytorch_ms = row["pytorch_ms"]
+                        err_pt, err_cu = row["err_pt"], row["err_cu"]
+                        status = row["status"]
+                        print(
+                            f"{name:<28} {n_rows:>7} {n_cols:>7} {nnz:>10} "
+                            f"{_fmt_ms(t_ms):>10} {_fmt_ms(cupy_ms):>10} {_fmt_ms(None):>10} {_fmt_ms(pytorch_ms):>11} "
+                            f"{_fmt_speedup(cupy_ms, t_ms):>7} {_fmt_speedup(pytorch_ms, t_ms):>7} "
+                            f"{status:>6} {_fmt_err(err_pt):>10} {_fmt_err(err_cu):>10}"
+                        )
+                        if pt_skip:
+                            print(f"  NOTE: {pt_skip}")
+                    except Exception as e:
+                        err_msg = str(e)
+                        status = "SKIP" if "SpSV requires square matrices" in err_msg else "ERROR"
+                        rows_out.append(
+                            {
+                                "matrix": os.path.basename(path),
+                                "value_dtype": _dtype_name(value_dtype),
+                                "index_dtype": _dtype_name(index_dtype),
+                                "opA": op_mode,
+                                "n_rows": "ERR",
+                                "n_cols": "ERR",
+                                "nnz": "ERR",
+                                "triton_ms": None,
+                                "pytorch_ms": None,
+                                "cusparse_ms": None,
+                                "csc_ms": None,
+                                "status": status,
+                                "err_pt": None,
+                                "err_cu": None,
+                            }
+                        )
+                        name = os.path.basename(path)[:27]
+                        if len(os.path.basename(path)) > 27:
+                            name = name + "…"
+                        print(
+                            f"{name:<28} {'ERR':>7} {'ERR':>7} {'ERR':>10} "
+                            f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>11} "
+                            f"{'N/A':>7} {'N/A':>7} "
+                            f"{status:>6} {_fmt_err(None):>10} {_fmt_err(None):>10}"
+                        )
+                        print(f"  {status}: {e}")
+                print("-" * 150)
+    fieldnames = [
+        "matrix",
+        "value_dtype",
+        "index_dtype",
+        "opA",
+        "n_rows",
+        "n_cols",
+        "nnz",
+        "triton_ms",
+        "pytorch_ms",
+        "cusparse_ms",
+        "csc_ms",
+        "status",
+        "err_pt",
+        "err_cu",
+    ]
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows_out:
+            w.writerow(r)
+    print(f"Wrote {len(rows_out)} rows to {csv_path}")
+
+
+def run_all_dtypes_spsv_csv(mtx_paths, csv_path, use_coo=False, coo_mode="auto", lower=True):
+    if not torch.cuda.is_available():
+        print("CUDA is not available.")
+        return
+    if not use_coo:
+        run_all_supported_spsv_csr_csv(mtx_paths, csv_path, lower=lower)
         return
     device = torch.device("cuda")
     rows_out = []
@@ -1117,7 +1404,7 @@ def run_all_dtypes_spsv_csv(mtx_paths, csv_path, use_coo=False, coo_mode="auto")
             print("=" * 150)
             print(
                 f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}  |  {label}"
-                + (f"  coo_mode={coo_mode}" if use_coo else "")
+                + (f"  triA={'LOWER' if lower else 'UPPER'}" if not use_coo else f"  triA={'LOWER' if lower else 'UPPER'}  coo_mode={coo_mode}")
             )
             if use_coo:
                 print(
@@ -1143,11 +1430,11 @@ def run_all_dtypes_spsv_csv(mtx_paths, csv_path, use_coo=False, coo_mode="auto")
                 try:
                     if use_coo:
                         row, pt_skip = _run_one_csv_row_coo(
-                            path, value_dtype, index_dtype, device, coo_mode
+                            path, value_dtype, index_dtype, device, coo_mode, lower=lower
                         )
                     else:
                         row, pt_skip = _run_one_csv_row_csr(
-                            path, value_dtype, index_dtype, device
+                            path, value_dtype, index_dtype, device, lower=lower
                         )
                     rows_out.append(row)
                     name = os.path.basename(path)[:27]
@@ -1254,10 +1541,16 @@ def main():
         choices=["auto", "direct", "csr"],
         help="COO mode for --csv-coo (default: auto)",
     )
+    parser.add_argument(
+        "--upper",
+        action="store_true",
+        help="Use upper-triangular inputs instead of the default lower-triangular inputs",
+    )
     args = parser.parse_args()
+    lower = not args.upper
 
     if args.synthetic:
-        run_spsv_synthetic_all()
+        run_spsv_synthetic_all(lower=lower)
         return
 
     paths = []
@@ -1272,7 +1565,11 @@ def main():
         if not paths:
             print("No .mtx files found for --csv-csr")
             return
+<<<<<<< HEAD
         run_all_supported_spsv_csr_csv(paths, args.csv_csr)
+=======
+        run_all_supported_spsv_csr_csv(paths, args.csv_csr, lower=lower)
+>>>>>>> 5a83e0f (test)
         return
     if args.csv_coo:
         if not paths:
@@ -1281,7 +1578,7 @@ def main():
             print("No .mtx files found for --csv-coo")
             return
         run_all_dtypes_spsv_csv(
-            paths, args.csv_coo, use_coo=True, coo_mode=args.coo_mode
+            paths, args.csv_coo, use_coo=True, coo_mode=args.coo_mode, lower=lower
         )
         return
 

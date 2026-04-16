@@ -2,6 +2,7 @@
 
 from ._common import *
 
+from collections import OrderedDict
 import os
 import time
 import triton
@@ -11,31 +12,34 @@ SUPPORTED_SPSV_VALUE_DTYPES = (
     torch.bfloat16,
     torch.float32,
     torch.float64,
-    *((_torch_complex32_dtype(),) if _torch_complex32_dtype() is not None else ()),
     torch.complex64,
+    torch.complex128,
+
 )
 SUPPORTED_SPSV_INDEX_DTYPES = (torch.int32, torch.int64)
 SPSV_NON_TRANS_PRIMARY_COMBOS = (
     (torch.float32, torch.int32),
     (torch.float64, torch.int32),
-    *(((_torch_complex32_dtype(), torch.int32),) if _torch_complex32_dtype() is not None else ()),
     (torch.complex64, torch.int32),
+    (torch.complex128, torch.int32),
 )
 SPSV_NON_TRANS_EXTENDED_COMBOS = (
     (torch.float32, torch.int64),
     (torch.float64, torch.int64),
-    *(((_torch_complex32_dtype(), torch.int64),) if _torch_complex32_dtype() is not None else ()),
     (torch.complex64, torch.int64),
+    (torch.complex128, torch.int64),
 )
 SPSV_TRANS_PRIMARY_COMBOS = (
     (torch.float32, torch.int32),
     (torch.float64, torch.int32),
-    *(((_torch_complex32_dtype(), torch.int32),) if _torch_complex32_dtype() is not None else ()),
     (torch.complex64, torch.int32),
+    (torch.complex128, torch.int32),
 )
 SPSV_PROMOTE_FP32_TO_FP64 = str(
     os.environ.get("FLAGSPARSE_SPSV_PROMOTE_FP32_TO_FP64", "0")
 ).lower() in ("1", "true", "yes", "on")
+_SPSV_CSR_PREPROCESS_CACHE = OrderedDict()
+_SPSV_CSR_PREPROCESS_CACHE_SIZE = 8
 
 def _csr_to_dense(data, indices, indptr, shape):
     """Convert CSR (torch CUDA tensors) to dense matrix on the same device."""
@@ -69,7 +73,11 @@ def _validate_spsv_non_trans_combo(data_dtype, index_dtype, fmt_name):
     raise TypeError(
         f"{fmt_name} SpSV currently supports NON_TRANS combinations: "
         "(float32, int32/int64), (float64, int32/int64), "
+<<<<<<< HEAD
         "(complex32, int32/int64), (complex64, int32/int64), (bfloat16, int32)"
+=======
+        "(complex64, int32/int64), (complex128, int32/int64), (bfloat16, int32)"
+>>>>>>> 5a83e0f (test)
     )
 
 
@@ -78,7 +86,11 @@ def _validate_spsv_trans_combo(data_dtype, index_dtype, fmt_name):
         return
     raise TypeError(
         f"{fmt_name} SpSV currently supports TRANS combinations with int32 indices only: "
+<<<<<<< HEAD
         "(float32, int32), (float64, int32), (complex32, int32), (complex64, int32)"
+=======
+        "(float32, int32), (float64, int32), (complex64, int32), (complex128, int32)"
+>>>>>>> 5a83e0f (test)
     )
 
 
@@ -118,7 +130,11 @@ def _prepare_spsv_inputs(data, indices, indptr, b, shape):
 
     if data.dtype not in SUPPORTED_SPSV_VALUE_DTYPES:
         raise TypeError(
+<<<<<<< HEAD
             "data dtype must be one of: bfloat16, float32, float64, complex32, complex64"
+=======
+            "data dtype must be one of: bfloat16, float32, float64, complex64, complex128"
+>>>>>>> 5a83e0f (test)
         )
     if indices.dtype not in SUPPORTED_SPSV_INDEX_DTYPES:
         raise TypeError("indices dtype must be torch.int32 or torch.int64")
@@ -158,6 +174,7 @@ def _prepare_spsv_inputs(data, indices, indptr, b, shape):
     )
 
 
+<<<<<<< HEAD
 def _promote_complex32_spsv_inputs(data, b):
     if _is_complex32_dtype(data.dtype):
         return data.to(torch.complex64), b.to(torch.complex64), data.dtype
@@ -173,6 +190,62 @@ def _restore_complex32_spsv_output(x, target_dtype):
     return x.to(target_dtype)
 
 
+=======
+def _prepare_spsv_working_inputs(data, b):
+    return data, b, None
+
+
+def _restore_spsv_output(x, target_dtype):
+    return x.to(target_dtype)
+
+
+def _spsv_diag_eps_for_dtype(value_dtype):
+    return 1e-12 if value_dtype in (torch.float64, torch.complex128) else 1e-6
+
+
+def _tensor_cache_token(tensor):
+    try:
+        storage_ptr = int(tensor.untyped_storage().data_ptr())
+    except Exception:
+        storage_ptr = 0
+    return (
+        str(tensor.device),
+        str(tensor.dtype),
+        tuple(int(v) for v in tensor.shape),
+        int(tensor.numel()),
+        storage_ptr,
+        int(getattr(tensor, "_version", 0)),
+    )
+
+
+def _spsv_cache_get(cache, key):
+    value = cache.get(key)
+    if value is not None:
+        cache.move_to_end(key)
+    return value
+
+
+def _spsv_cache_put(cache, key, value, max_entries):
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > max_entries:
+        cache.popitem(last=False)
+
+
+def _csr_preprocess_cache_key(data, indices, indptr, shape, lower, trans_mode):
+    return (
+        "csr_preprocess",
+        trans_mode,
+        bool(lower),
+        int(shape[0]),
+        int(shape[1]),
+        _tensor_cache_token(data),
+        _tensor_cache_token(indices),
+        _tensor_cache_token(indptr),
+    )
+
+
+>>>>>>> 5a83e0f (test)
 @triton.jit
 def _spsv_csr_level_kernel(
     data_ptr,
@@ -536,7 +609,19 @@ def _triton_spsv_csr_vector_complex(
             indptr, block_nnz=block_nnz, max_segments=max_segments
         )
 
+<<<<<<< HEAD
     data_ri = torch.view_as_real(data.contiguous()).reshape(-1).contiguous()
+=======
+    # Some PyTorch builds return CSR values with a non-strided layout wrapper.
+    # Materialize a plain 1D strided buffer before splitting into real/imag parts.
+    if data.layout != torch.strided:
+        data_strided = torch.empty(data.shape, dtype=data.dtype, device=data.device)
+        data_strided.copy_(data)
+    else:
+        data_strided = data.contiguous()
+
+    data_ri = torch.view_as_real(data_strided).reshape(-1).contiguous()
+>>>>>>> 5a83e0f (test)
     b_ri = torch.view_as_real(b_vec.contiguous()).reshape(-1).contiguous()
     component_dtype = _component_dtype_for_complex(data.dtype)
     use_fp64 = component_dtype == torch.float64
@@ -589,17 +674,27 @@ def _prepare_spsv_coo_inputs(data, row, col, b, shape, transpose=False):
     if b.ndim == 2 and b.shape[0] != n_rows:
         raise ValueError(f"b.shape[0] must equal n_rows={n_rows}")
 
+<<<<<<< HEAD
     if data.dtype not in (torch.bfloat16, torch.float32, torch.float64):
         raise TypeError("data dtype must be one of: bfloat16, float32, float64")
+=======
+    if data.dtype not in (
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+        torch.complex64,
+        torch.complex128,
+    ):
+        raise TypeError(
+            "data dtype must be one of: bfloat16, float32, float64, complex64, complex128"
+        )
+>>>>>>> 5a83e0f (test)
     if b.dtype != data.dtype:
         raise TypeError("b dtype must match data dtype")
     if row.dtype not in SUPPORTED_SPSV_INDEX_DTYPES:
         raise TypeError("row dtype must be torch.int32 or torch.int64")
     if col.dtype not in SUPPORTED_SPSV_INDEX_DTYPES:
         raise TypeError("col dtype must be torch.int32 or torch.int64")
-    if transpose:
-        raise NotImplementedError("transpose=True is not implemented in Triton SpSV yet")
-
     row64 = row.to(torch.int64).contiguous()
     col64 = col.to(torch.int64).contiguous()
     if col64.numel() > 0 and int(col64.max().item()) > _INDEX_LIMIT_INT32:
@@ -782,20 +877,36 @@ def flagsparse_spsv_csr(
     """Sparse triangular solve using Triton level-scheduling kernels.
 
     Primary support matrix:
+<<<<<<< HEAD
     - NON_TRANS: float32/float64/complex32/complex64 with int32/int64 indices
     - TRANS: float32/float64/complex32/complex64 with int32 indices
     - bfloat16 remains NON_TRANS + int32
     """
+=======
+    - NON_TRANS: float32/float64/complex64/complex128 with int32/int64 indices
+    - TRANS: float32/float64/complex64/complex128 with int32 indices
+    - bfloat16 remains NON_TRANS + int32
+    """
+    input_data = data
+    input_indices = indices
+    input_indptr = indptr
+>>>>>>> 5a83e0f (test)
     trans_mode = _normalize_spsv_transpose_mode(transpose)
     data, input_index_dtype, indices, indptr, b, n_rows, n_cols = _prepare_spsv_inputs(
         data, indices, indptr, b, shape
     )
     original_output_dtype = None
+<<<<<<< HEAD
     data, b, original_output_dtype = _promote_complex32_spsv_inputs(data, b)
+=======
+    rev_perm = None
+    data, b, original_output_dtype = _prepare_spsv_working_inputs(data, b)
+>>>>>>> 5a83e0f (test)
     if n_rows != n_cols:
         raise ValueError(f"A must be square, got shape={shape}")
     if trans_mode == "N":
         _validate_spsv_non_trans_combo(data.dtype, input_index_dtype, "CSR")
+<<<<<<< HEAD
         lower_eff = lower
         kernel_data = data
         kernel_indices64 = indices
@@ -806,6 +917,46 @@ def flagsparse_spsv_csr(
         kernel_data, kernel_indices64, kernel_indptr64 = _csr_transpose(
             data, indices, indptr, n_rows, n_cols
         )
+=======
+    else:
+        _validate_spsv_trans_combo(data.dtype, input_index_dtype, "CSR")
+
+    preprocess_key = _csr_preprocess_cache_key(
+        input_data, input_indices, input_indptr, (n_rows, n_cols), lower, trans_mode
+    )
+    cached = _spsv_cache_get(_SPSV_CSR_PREPROCESS_CACHE, preprocess_key)
+    if cached is None:
+        if trans_mode == "N":
+            lower_eff = lower
+            kernel_data = data
+            kernel_indices64 = indices
+            kernel_indptr64 = indptr
+            rev_perm = None
+        else:
+            lower_eff = not lower
+            kernel_data, kernel_indices64, kernel_indptr64 = _csr_transpose(
+                data, indices, indptr, n_rows, n_cols
+            )
+            rev_perm = None
+        levels = _build_spsv_levels(
+            kernel_indptr64, kernel_indices64, n_rows, lower=lower_eff
+        )
+        cached = (
+            kernel_data,
+            kernel_indices64,
+            kernel_indptr64,
+            rev_perm,
+            lower_eff,
+            levels,
+        )
+        _spsv_cache_put(
+            _SPSV_CSR_PREPROCESS_CACHE,
+            preprocess_key,
+            cached,
+            _SPSV_CSR_PREPROCESS_CACHE_SIZE,
+        )
+    kernel_data, kernel_indices64, kernel_indptr64, rev_perm, lower_eff, levels = cached
+>>>>>>> 5a83e0f (test)
 
     kernel_indices = (
         kernel_indices64.to(torch.int32)
@@ -828,6 +979,7 @@ def flagsparse_spsv_csr(
         # Optional high-precision mode; disabled by default for throughput.
         compute_dtype = torch.float64
         data_in = kernel_data.to(torch.float64)
+<<<<<<< HEAD
         b_in = b.to(torch.float64)
     elif data.dtype == torch.float32 and trans_mode == "T":
         compute_dtype = torch.float64
@@ -836,10 +988,17 @@ def flagsparse_spsv_csr(
     levels = _build_spsv_levels(
         kernel_indptr, kernel_indices, n_rows, lower=lower_eff
     )
+=======
+        b_in = b.to(torch.float64)
+    elif data.dtype == torch.float32 and trans_mode == "T":
+        compute_dtype = torch.float64
+        data_in = kernel_data.to(torch.float64)
+        b_in = b.to(torch.float64)
+>>>>>>> 5a83e0f (test)
     block_nnz_use, max_segments_use = _auto_spsv_launch_config(
         kernel_indptr, block_nnz=block_nnz, max_segments=max_segments
     )
-    diag_eps = 1e-12 if compute_dtype == torch.float64 else 1e-6
+    diag_eps = _spsv_diag_eps_for_dtype(compute_dtype)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     if b_in.ndim == 1:
@@ -918,7 +1077,11 @@ def flagsparse_spsv_csr(
         x = torch.stack(cols, dim=1)
     target_dtype = original_output_dtype if original_output_dtype is not None else data.dtype
     if x.dtype != target_dtype:
+<<<<<<< HEAD
         x = _restore_complex32_spsv_output(x, target_dtype)
+=======
+        x = _restore_spsv_output(x, target_dtype)
+>>>>>>> 5a83e0f (test)
     torch.cuda.synchronize()
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     if out is not None:
@@ -950,11 +1113,11 @@ def flagsparse_spsv_coo(
     """COO SpSV with dual mode:
     - direct: use COO level kernel directly (requires sorted+unique COO)
     - csr: convert COO -> CSR (sorted+deduplicated) then call flagsparse_spsv_csr
-    - auto: pick direct when sorted+unique, otherwise csr
+    - auto: pick direct when sorted+unique and supported, otherwise csr
 
-    Primary NON_TRANS support matrix:
-    - float32 + int32 indices
-    - float64 + int32 indices
+    Notes:
+    - direct mode currently supports only non-transposed real-valued inputs
+    - complex dtypes and transpose=True always route through the CSR implementation
     """
     data, row64, col64, b, n_rows, n_cols = _prepare_spsv_coo_inputs(
         data, row, col, b, shape, transpose=transpose
@@ -967,7 +1130,13 @@ def flagsparse_spsv_coo(
         raise ValueError("coo_mode must be one of: 'auto', 'direct', 'csr'")
 
     sorted_unique = _coo_is_sorted_unique(row64, col64, n_cols)
-    use_direct = mode == "direct" or (mode == "auto" and sorted_unique)
+    direct_supported = (not transpose) and (not torch.is_complex(data))
+    use_direct = direct_supported and (mode == "direct" or (mode == "auto" and sorted_unique))
+    if mode == "direct" and not direct_supported:
+        raise ValueError(
+            "coo_mode='direct' supports only non-transposed real-valued inputs; "
+            "use coo_mode='csr' or 'auto' for transpose or complex dtypes"
+        )
     if mode == "direct" and not sorted_unique:
         raise ValueError(
             "coo_mode='direct' requires COO sorted by (row, col) with no duplicate coordinates; "
@@ -978,6 +1147,8 @@ def flagsparse_spsv_coo(
         data_csr, indices_csr, indptr_csr = _coo_to_csr_sorted_unique(
             data, row64, col64, n_rows, n_cols
         )
+        if transpose:
+            indices_csr = indices_csr.to(torch.int32)
         return flagsparse_spsv_csr(
             data_csr,
             indices_csr,
@@ -1011,7 +1182,7 @@ def flagsparse_spsv_coo(
     block_nnz_use, max_segments_use = _auto_spsv_launch_config(
         row_ptr, block_nnz=block_nnz, max_segments=max_segments
     )
-    diag_eps = 1e-12 if compute_dtype == torch.float64 else 1e-6
+    diag_eps = _spsv_diag_eps_for_dtype(compute_dtype)
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
