@@ -14,9 +14,9 @@ except Exception:
     cp = None
     cpx_sparse = None
 
-VALUE_DTYPES = [torch.float32, torch.float64]
-INDEX_DTYPES = [torch.int32]
-OPS = ["non"]
+VALUE_DTYPES = [torch.float32, torch.float64, torch.complex64, torch.complex128]
+INDEX_DTYPES = [torch.int32, torch.int64]
+OPS = ["non", "trans", "conj"]
 TEST_SIZES = [(512, 512), (1024, 1024), (2048, 2048)]
 WARMUP = 10
 ITERS = 50
@@ -81,6 +81,12 @@ def _fmt_speedup(other_ms, triton_ms):
     if other_ms is None or triton_ms is None or triton_ms <= 0:
         return "N/A"
     return f"{other_ms / triton_ms:.2f}x"
+
+
+def _speedup_ratio(other_ms, triton_ms):
+    if other_ms is None or triton_ms is None or triton_ms <= 0:
+        return None
+    return other_ms / triton_ms
 
 
 def _fmt_err(v):
@@ -348,6 +354,8 @@ def _run_one_coo_case(
         "cusparse_ms": cu_ms,
         "pytorch_ms": pt_ms,
         "csc_ms": None,
+        "triton_speedup_vs_cusparse": _speedup_ratio(cu_ms, opt_ms),
+        "triton_speedup_vs_pytorch": _speedup_ratio(pt_ms, opt_ms),
         "pt_status": _status_str(triton_ok_pt, err_pt is not None),
         "cu_status": _status_str(triton_ok_cu, err_cu is not None),
         "status": status,
@@ -536,6 +544,8 @@ def _error_row(path, dtype, index_dtype, op):
         "cusparse_ms": None,
         "pytorch_ms": None,
         "csc_ms": None,
+        "triton_speedup_vs_cusparse": None,
+        "triton_speedup_vs_pytorch": None,
         "status": "ERROR",
         "err_base": None,
         "err_opt": None,
@@ -619,6 +629,8 @@ def run_all_dtypes_coo_csv(
         "cusparse_ms",
         "pytorch_ms",
         "csc_ms",
+        "triton_speedup_vs_cusparse",
+        "triton_speedup_vs_pytorch",
         "pt_status",
         "cu_status",
         "status",
@@ -657,19 +669,19 @@ def main():
     parser.add_argument(
         "--dtypes",
         type=str,
-        default="float32,float64",
+        default="float32,float64,complex64,complex128",
         help="Comma-separated value dtypes: float32,float64,complex64,complex128",
     )
     parser.add_argument(
         "--index-dtypes",
         type=str,
-        default="int32",
+        default="int32,int64",
         help="Comma-separated index dtypes: int32,int64",
     )
     parser.add_argument(
         "--ops",
         type=str,
-        default="non",
+        default="non,trans,conj",
         help="Comma-separated matrix ops: non,trans,conj",
     )
     args = parser.parse_args()
