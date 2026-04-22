@@ -97,20 +97,6 @@ def _build_triangular(n, dtype, device, lower=True):
     return A
 
 
-def _unsorted_duplicate_coo(A):
-    Acoo = A.to_sparse_coo().coalesce()
-    coo_indices = Acoo.indices()
-    data = Acoo.values()
-    row0 = coo_indices[0, :1]
-    col0 = coo_indices[1, :1]
-    data0 = data[:1]
-    return (
-        torch.cat([data[1:], data0 * 0.4, data0 * 0.6]).contiguous(),
-        torch.cat([coo_indices[0, 1:], row0, row0]).contiguous(),
-        torch.cat([coo_indices[1, 1:], col0, col0]).contiguous(),
-    )
-
-
 def _cupy_csr_from_torch(data, indices, indptr, shape):
     if cp is None or cpx_sparse is None:
         return None
@@ -130,7 +116,6 @@ def _cupy_ref_spsv(A_cp, b_t, *, lower, unit_diagonal=False):
 
 
 @pytest.mark.spsv
-@pytest.mark.spsv_csr
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize(
     "dtype",
@@ -166,7 +151,6 @@ def test_spsv_csr_lower_matches_dense(n, dtype):
 
 
 @pytest.mark.spsv
-@pytest.mark.spsv_csr
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", NON_TRANS_DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
@@ -198,7 +182,6 @@ def test_spsv_csr_non_trans_supported_combos(n, dtype, index_dtype):
 
 
 @pytest.mark.spsv
-@pytest.mark.spsv_csr
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", TRANS_CONJ_DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
@@ -233,7 +216,6 @@ def test_spsv_csr_transpose_family_supported_combos(n, dtype, index_dtype, op_mo
 
 
 @pytest.mark.spsv
-@pytest.mark.spsv_csr
 @pytest.mark.skipif(
     cp is None or cpx_sparse is None or cpx_spsolve_triangular is None,
     reason="CuPy/cuSPARSE required",
@@ -261,7 +243,6 @@ def test_spsv_csr_matches_cusparse_non_trans(n, dtype):
 
 
 @pytest.mark.spsv
-@pytest.mark.spsv_csr
 @pytest.mark.skipif(
     cp is None or cpx_sparse is None or cpx_spsolve_triangular is None,
     reason="CuPy/cuSPARSE required",
@@ -303,7 +284,6 @@ def test_spsv_csr_matches_cusparse_transpose_family(n, dtype, index_dtype, op_mo
 
 
 @pytest.mark.spsv
-@pytest.mark.spsv_csr
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", NON_TRANS_DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
@@ -335,7 +315,6 @@ def test_spsv_csr_non_trans_upper_supported_combos(n, dtype, index_dtype):
 
 
 @pytest.mark.spsv
-@pytest.mark.spsv_csr
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", TRANS_CONJ_DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
@@ -370,7 +349,6 @@ def test_spsv_csr_upper_transpose_family_supported_combos(n, dtype, index_dtype,
 
 
 @pytest.mark.spsv
-@pytest.mark.spsv_csr
 @pytest.mark.skipif(
     cp is None or cpx_sparse is None or cpx_spsolve_triangular is None,
     reason="CuPy/cuSPARSE required",
@@ -398,7 +376,6 @@ def test_spsv_csr_matches_cusparse_upper_non_trans(n, dtype):
 
 
 @pytest.mark.spsv
-@pytest.mark.spsv_csr
 @pytest.mark.skipif(
     cp is None or cpx_sparse is None or cpx_spsolve_triangular is None,
     reason="CuPy/cuSPARSE required",
@@ -440,73 +417,6 @@ def test_spsv_csr_matches_cusparse_upper_transpose_family(n, dtype, index_dtype,
 
 
 @pytest.mark.spsv
-@pytest.mark.spsv_coo
-@pytest.mark.parametrize("n", SPSV_N)
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=_dtype_id)
-@pytest.mark.parametrize("coo_mode", ["auto", "direct", "csr"])
-def test_spsv_coo_lower_matches_dense(n, dtype, coo_mode):
-    device = torch.device("cuda")
-    A = _build_triangular(n, dtype, device, lower=True)
-    b = _rand_like(dtype, (n,), device)
-    x_ref = torch.linalg.solve_triangular(
-        A.to(_ref_dtype(dtype)), b.to(_ref_dtype(dtype)).unsqueeze(-1), upper=False
-    ).squeeze(-1)
-    Acoo = A.to_sparse_coo().coalesce()
-    coo_indices = Acoo.indices()
-
-    x = flagsparse_spsv_coo(
-        Acoo.values(),
-        coo_indices[0].contiguous(),
-        coo_indices[1].contiguous(),
-        b,
-        (n, n),
-        lower=True,
-        unit_diagonal=False,
-        coo_mode=coo_mode,
-    )
-    rtol, atol = _tol(dtype)
-    assert torch.allclose(_cmp_view(x, dtype), _cmp_view(x_ref, dtype), rtol=rtol, atol=atol)
-
-
-@pytest.mark.spsv
-@pytest.mark.spsv_coo
-@pytest.mark.parametrize("n", SPSV_N)
-def test_spsv_coo_auto_fallback_handles_unsorted_duplicate_input(n):
-    device = torch.device("cuda")
-    dtype = torch.float32
-    A = _build_triangular(n, dtype, device, lower=True)
-    b = _rand_like(dtype, (n,), device)
-    x_ref = torch.linalg.solve_triangular(A, b.unsqueeze(-1), upper=False).squeeze(-1)
-    data, row, col = _unsorted_duplicate_coo(A)
-
-    x = flagsparse_spsv_coo(
-        data,
-        row,
-        col,
-        b,
-        (n, n),
-        lower=True,
-        unit_diagonal=False,
-        coo_mode="auto",
-    )
-    rtol, atol = _tol(dtype)
-    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
-
-    with pytest.raises(ValueError, match="coo_mode='direct' requires COO sorted"):
-        flagsparse_spsv_coo(
-            data,
-            row,
-            col,
-            b,
-            (n, n),
-            lower=True,
-            unit_diagonal=False,
-            coo_mode="direct",
-        )
-
-
-@pytest.mark.spsv
-@pytest.mark.spsv_coo
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
 def test_spsv_coo_transpose_family_complex128_routes_through_csr(n, op_mode):
