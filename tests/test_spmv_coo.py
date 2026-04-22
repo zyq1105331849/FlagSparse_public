@@ -7,6 +7,7 @@ import os
 
 import torch
 import flagsparse as fs
+import flagsparse.sparse_operations.spmv_coo as spmv_coo_mod
 try:
     import cupy as cp
     import cupyx.scipy.sparse as cpx_sparse
@@ -149,6 +150,31 @@ def _apply_coo_op(data, row, col, shape, op):
     return data_op, col, row, (n_cols, n_rows)
 
 
+def _apply_torch_sparse_op(matrix, x_2d, op):
+    if op == "non":
+        return torch.sparse.mm(matrix, x_2d).squeeze(1)
+    if op == "trans":
+        return torch.sparse.mm(matrix.transpose(0, 1), x_2d).squeeze(1)
+    if op == "conj":
+        return torch.sparse.mm(matrix.conj().transpose(0, 1), x_2d).squeeze(1)
+    raise ValueError(f"unsupported op: {op}")
+
+
+def _cupy_sparse_op_matrix(matrix, op):
+    if op == "non":
+        return matrix
+    if op == "trans":
+        return matrix.T
+    if op == "conj":
+        matrix_conj = matrix.conj() if hasattr(matrix, "conj") else matrix.conjugate()
+        return matrix_conj.T
+    raise ValueError(f"unsupported op: {op}")
+
+
+def _apply_cupy_sparse_op(matrix, x, op):
+    return _cupy_sparse_op_matrix(matrix, op) @ x
+
+
 def _pytorch_coo_reference(data, row, col, x, shape, out_dtype, op="non"):
     data, row, col, shape = _apply_coo_op(data, row, col, shape, op)
     ref_dtype = _reference_dtype(out_dtype)
@@ -205,28 +231,80 @@ COO_ATOMIC_BLOCK = 256
 COO_ATOMIC_WARPS = 4
 COO_SEG_BLOCK_INNER = 128
 
-def _timed_flagsparse_coo(prepared, x, warmup, iters):
-    op = lambda: fs.flagsparse_spmv_coo(
-        x=x,
-        prepared=prepared,
-        return_time=False,
-        block_inner=COO_SEG_BLOCK_INNER,
-        block_size=COO_ATOMIC_BLOCK,
-        num_warps=COO_ATOMIC_WARPS,
+def _timed_flagsparse_coo(
+    prepared,
+    data,
+    row,
+    col,
+    x,
+    shape,
+    sort_by_row,
+    op,
+    warmup,
+    iters,
+):
+    op = op.lower()
+    spmv_op = lambda: _run_flagsparse_coo_timed_op(
+        prepared,
+        data,
+        row,
+        col,
+        x,
+        shape,
+        sort_by_row,
+        op,
     )
-    y = op()
+    y = spmv_op()
     torch.cuda.synchronize()
     for _ in range(warmup):
-        op()
+        spmv_op()
     torch.cuda.synchronize()
     e0 = torch.cuda.Event(True)
     e1 = torch.cuda.Event(True)
     e0.record()
     for _ in range(iters):
-        y = op()
+        y = spmv_op()
     e1.record()
     torch.cuda.synchronize()
     return y, e0.elapsed_time(e1) / iters
+
+
+def _run_flagsparse_coo_timed_op(
+    prepared,
+    data,
+    row,
+    col,
+    x,
+    shape,
+    sort_by_row,
+    op,
+):
+    if op == "non":
+        return fs.flagsparse_spmv_coo(
+            x=x,
+            prepared=prepared,
+            return_time=False,
+            block_inner=COO_SEG_BLOCK_INNER,
+            block_size=COO_ATOMIC_BLOCK,
+            num_warps=COO_ATOMIC_WARPS,
+        )
+    data_op, row_op, col_op, shape_op = _apply_coo_op(data, row, col, shape, op)
+    timed_prepared = spmv_coo_mod.prepare_spmv_coo(
+        data_op,
+        row_op,
+        col_op,
+        shape_op,
+        sort_by_row=sort_by_row,
+        op="non",
+    )
+    return fs.flagsparse_spmv_coo(
+        x=x,
+        prepared=timed_prepared,
+        return_time=False,
+        block_inner=COO_SEG_BLOCK_INNER,
+        block_size=COO_ATOMIC_BLOCK,
+        num_warps=COO_ATOMIC_WARPS,
+    )
 
 
 def run_synthetic(value_dtypes=None, index_dtypes=None, ops=None):
@@ -306,8 +384,30 @@ def _run_one_coo_case(
     prepared_at = fs.prepare_spmv_coo(
         data, row, col, shape, sort_by_row=False, op=op
     )
-    y_base, base_ms = _timed_flagsparse_coo(prepared_seg, x, warmup, iters)
-    y_opt, opt_ms = _timed_flagsparse_coo(prepared_at, x, warmup, iters)
+    y_base, base_ms = _timed_flagsparse_coo(
+        prepared_seg,
+        data,
+        row,
+        col,
+        x,
+        shape,
+        True,
+        op,
+        warmup,
+        iters,
+    )
+    y_opt, opt_ms = _timed_flagsparse_coo(
+        prepared_at,
+        data,
+        row,
+        col,
+        x,
+        shape,
+        False,
+        op,
+        warmup,
+        iters,
+    )
     y_ref = _pytorch_coo_reference(data, row, col, x, shape, dtype, op=op)
     err_base = _allclose_error_ratio(y_base, y_ref, atol, rtol)
     err_opt = _allclose_error_ratio(y_opt, y_ref, atol, rtol)
@@ -367,44 +467,45 @@ def _run_one_coo_case(
 
 
 def _time_pytorch_coo(data, row, col, x, shape, op, warmup, iters):
-    data_op, row_op, col_op, shape_op = _apply_coo_op(data, row, col, shape, op)
+    ref_dtype = _reference_dtype(data.dtype)
+    data_ref = data.to(ref_dtype)
+    x_ref_2d = x.to(ref_dtype).unsqueeze(1)
     coo = torch.sparse_coo_tensor(
-        torch.stack([row_op.to(torch.int64), col_op.to(torch.int64)]),
-        data_op,
-        shape_op,
+        torch.stack([row.to(torch.int64), col.to(torch.int64)]),
+        data_ref,
+        shape,
         device=data.device,
     ).coalesce()
     if data.numel() == 0:
         return 0.0
     torch.cuda.synchronize()
     for _ in range(warmup):
-        _ = torch.sparse.mm(coo, x.unsqueeze(1)).squeeze(1)
+        _ = _apply_torch_sparse_op(coo, x_ref_2d, op)
     torch.cuda.synchronize()
     e0 = torch.cuda.Event(True)
     e1 = torch.cuda.Event(True)
     e0.record()
     for _ in range(iters):
-        _ = torch.sparse.mm(coo, x.unsqueeze(1)).squeeze(1)
+        _ = _apply_torch_sparse_op(coo, x_ref_2d, op)
     e1.record()
     torch.cuda.synchronize()
     return e0.elapsed_time(e1) / iters
 
 
 def _time_cupy_coo(data, row, col, x, shape, op, warmup, iters):
-    data_op, row_op, col_op, shape_op = _apply_coo_op(data, row, col, shape, op)
-    data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data_op))
-    row_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(row_op.to(torch.int64)))
-    col_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(col_op.to(torch.int64)))
-    A_cp = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape_op)
+    data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
+    row_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(row.to(torch.int64)))
+    col_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(col.to(torch.int64)))
+    A_cp = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
     x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x))
     for _ in range(warmup):
-        _ = A_cp @ x_cp
+        _ = _apply_cupy_sparse_op(A_cp, x_cp, op)
     cp.cuda.runtime.deviceSynchronize()
     c0 = cp.cuda.Event()
     c1 = cp.cuda.Event()
     c0.record()
     for _ in range(iters):
-        _ = A_cp @ x_cp
+        _ = _apply_cupy_sparse_op(A_cp, x_cp, op)
     c1.record()
     c1.synchronize()
     return cp.cuda.get_elapsed_time(c0, c1) / iters

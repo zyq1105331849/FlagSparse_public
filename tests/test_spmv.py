@@ -11,6 +11,7 @@ import os
 
 import torch
 import flagsparse as ast
+import flagsparse.sparse_operations.spmv_csr as spmv_csr_mod
 
 
 VALUE_DTYPES = [
@@ -227,10 +228,14 @@ def _benchmark_flagsparse_spmv(
         max_segments=max_segments,
         op=OP_TO_CODE[op],
     )
-    spmv_op = lambda: ast.flagsparse_spmv_csr(
-        x=x,
-        prepared=prepared,
-        return_time=False,
+    spmv_op = lambda: _run_flagsparse_spmv_timed_op(
+        prepared,
+        data,
+        indices,
+        indptr,
+        x,
+        shape,
+        op,
     )
     y = spmv_op()
     torch.cuda.synchronize()
@@ -245,6 +250,53 @@ def _benchmark_flagsparse_spmv(
     end_ev.record()
     torch.cuda.synchronize()
     return y, start_ev.elapsed_time(end_ev) / iters
+
+
+def _clone_csr_prepared_for_timed_op(template, data, indices, indptr):
+    return spmv_csr_mod.PreparedCsrSpmv(
+        data=data,
+        kernel_indices=indices,
+        kernel_indptr=indptr,
+        shape=template.shape,
+        n_rows=template.n_rows,
+        n_cols=template.n_cols,
+        block_nnz=template.block_nnz,
+        max_segments=template.max_segments,
+        max_row_nnz=template.max_row_nnz,
+        opt_buckets=template.opt_buckets,
+        transpose=template.transpose,
+        op=template.op,
+        index_fallback_policy=template.index_fallback_policy,
+    )
+
+
+def _materialize_csr_op_for_timing(data, indices, indptr, shape, op):
+    if op == "non":
+        return data, indices, indptr, shape
+    data_op = data
+    if op == "conj" and data.is_complex():
+        data_op = data.conj()
+        if hasattr(data_op, "resolve_conj"):
+            data_op = data_op.resolve_conj()
+    return spmv_csr_mod._transpose_csr_for_spmv(data_op, indices, indptr, shape)
+
+
+def _run_flagsparse_spmv_timed_op(prepared, data, indices, indptr, x, shape, op):
+    if op == "non":
+        return ast.flagsparse_spmv_csr(
+            x=x,
+            prepared=prepared,
+            return_time=False,
+        )
+    data_op, indices_op, indptr_op, _ = _materialize_csr_op_for_timing(
+        data, indices, indptr, shape, op
+    )
+    timed_prepared = _clone_csr_prepared_for_timed_op(
+        prepared, data_op, indices_op, indptr_op
+    )
+    return spmv_csr_mod._run_spmv_prepared_with_fallback(
+        timed_prepared, x, use_opt=False
+    )
 
 
 def _reference_dtype(dtype):
@@ -301,6 +353,36 @@ def _pytorch_spmv_reference(
     if return_compute:
         return y_ref
     return _cast_reference_output(y_ref, out_dtype)
+
+
+def _build_pytorch_spmv_reference_inputs(data, indices, indptr, x, shape, out_dtype, op):
+    device = data.device
+    ref_dtype = _reference_dtype(out_dtype)
+    data_ref = data.to(ref_dtype)
+    x_ref_2d = x.to(ref_dtype).unsqueeze(1)
+    try:
+        matrix = torch.sparse_csr_tensor(
+            indptr.to(torch.int64),
+            indices.to(torch.int64),
+            data_ref,
+            size=shape,
+            device=device,
+        )
+        _apply_torch_sparse_op(matrix, x_ref_2d, op)
+        return matrix, x_ref_2d
+    except Exception:
+        n_rows = int(shape[0])
+        row_ind = torch.repeat_interleave(
+            torch.arange(n_rows, device=device, dtype=torch.int64),
+            indptr[1:] - indptr[:-1],
+        )
+        matrix = torch.sparse_coo_tensor(
+            torch.stack([row_ind, indices.to(torch.int64)]),
+            data_ref,
+            shape,
+            device=device,
+        ).coalesce()
+        return matrix, x_ref_2d
 
 
 def _cupy_csr_reference(data, indices, indptr, x, shape, out_dtype, op="non"):
@@ -376,7 +458,7 @@ def run_one_mtx(
     triton_ok_pt = False
     pt_error_reason = None
     try:
-        pt_ref_compute_y = _pytorch_spmv_reference(
+        pt_matrix, pt_x_2d = _build_pytorch_spmv_reference_inputs(
             data,
             indices,
             indptr,
@@ -384,21 +466,17 @@ def run_one_mtx(
             shape,
             value_dtype,
             op=op,
-            return_compute=True,
         )
+        pt_ref_compute_y = _apply_torch_sparse_op(pt_matrix, pt_x_2d, op)
         pt_ref_y = _cast_reference_output(pt_ref_compute_y, value_dtype)
         start_ev = torch.cuda.Event(enable_timing=True)
         end_ev = torch.cuda.Event(enable_timing=True)
         for _ in range(warmup):
-            _ = _pytorch_spmv_reference(
-                data, indices, indptr, x, shape, value_dtype, op=op
-            )
+            _ = _apply_torch_sparse_op(pt_matrix, pt_x_2d, op)
         torch.cuda.synchronize()
         start_ev.record()
         for _ in range(iters):
-            _ = _pytorch_spmv_reference(
-                data, indices, indptr, x, shape, value_dtype, op=op
-            )
+            _ = _apply_torch_sparse_op(pt_matrix, pt_x_2d, op)
         end_ev.record()
         torch.cuda.synchronize()
         pytorch_ms = start_ev.elapsed_time(end_ev) / iters
@@ -430,15 +508,14 @@ def run_one_mtx(
             ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
             x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x))
             A_csr = cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
-            A_op = _cupy_sparse_op_matrix(A_csr, op)
             for _ in range(warmup):
-                _ = A_op @ x_cp
+                _ = _apply_cupy_sparse_op(A_csr, x_cp, op)
             torch.cuda.synchronize()
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
             for _ in range(iters):
-                _ = A_op @ x_cp
+                _ = _apply_cupy_sparse_op(A_csr, x_cp, op)
             end.record()
             torch.cuda.synchronize()
             cusparse_ms = start.elapsed_time(end) / iters
@@ -456,13 +533,12 @@ def run_one_mtx(
                     err_cu = float("nan")
 
             A_csc = A_csr.tocsc()
-            A_csc_op = _cupy_sparse_op_matrix(A_csc, op)
             for _ in range(warmup):
-                _ = A_csc_op @ x_cp
+                _ = _apply_cupy_sparse_op(A_csc, x_cp, op)
             torch.cuda.synchronize()
             start.record()
             for _ in range(iters):
-                _ = A_csc_op @ x_cp
+                _ = _apply_cupy_sparse_op(A_csc, x_cp, op)
             end.record()
             torch.cuda.synchronize()
             csc_ms = start.elapsed_time(end) / iters

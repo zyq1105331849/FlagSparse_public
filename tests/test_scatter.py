@@ -13,7 +13,16 @@ DEFAULT_CASES = [
     (524_288, 16_384),
     (1_048_576, 65_536),
 ]
-DEFAULT_VALUE_DTYPES = "float32,float64,complex64,complex128"
+ALL_VALUE_DTYPE_TOKENS = [
+    "float16",
+    "bfloat16",
+    "float32",
+    "float64",
+    "complex32",
+    "complex64",
+    "complex128",
+]
+DEFAULT_VALUE_DTYPES = ",".join(ALL_VALUE_DTYPE_TOKENS)
 DEFAULT_INDEX_DTYPES = "int32,int64"
 WARMUP = 20
 ITERS = 200
@@ -56,21 +65,21 @@ def _parse_bool_token(raw, name):
 
 
 def _parse_value_dtypes(raw):
-    allowed = {
-        "float16",
-        "bfloat16",
-        "float32",
-        "float64",
-        "complex64",
-        "complex128",
-    }
+    allowed = set(ALL_VALUE_DTYPE_TOKENS + ["all"])
     tokens = [tok.strip().lower() for tok in str(raw).split(",") if tok.strip()]
     if not tokens:
         raise ValueError("value dtypes list is empty")
     invalid = [tok for tok in tokens if tok not in allowed]
     if invalid:
         raise ValueError(f"unsupported value dtypes: {invalid}")
-    return tokens
+    expanded = []
+    for tok in tokens:
+        if tok == "all":
+            expanded.extend(ALL_VALUE_DTYPE_TOKENS)
+        else:
+            expanded.append(tok)
+    # Keep order, remove duplicates
+    return list(dict.fromkeys(expanded))
 
 
 def _parse_index_dtypes(raw):
@@ -121,6 +130,25 @@ def _status_from_result(verification):
     cusparse_ok = verification.get("cusparse_match_pytorch")
     overall_ok = bool(triton_ok) and (cusparse_ok is None or bool(cusparse_ok))
     return "PASS" if overall_ok else "FAIL"
+
+
+def _torch_complex32_dtype():
+    dtype = getattr(torch, "complex32", None)
+    if dtype is None:
+        dtype = getattr(torch, "chalf", None)
+    return dtype
+
+
+def _precheck_case_support(value_dtype, dtype_policy):
+    token = str(value_dtype).strip().lower()
+    policy = str(dtype_policy).strip().lower()
+    if token == "bfloat16" and not torch.cuda.is_bf16_supported():
+        return "bfloat16 is not supported on this GPU"
+    if token == "complex32":
+        has_complex32 = _torch_complex32_dtype() is not None
+        if not has_complex32 and policy == "strict":
+            return "complex32 is unavailable in this torch build with dtype_policy=strict"
+    return None
 
 
 def _to_real_imag(value):
@@ -189,7 +217,7 @@ def _print_row(row):
         f"{_fmt_ms(row['pytorch_ms']):>10} {_fmt_ms(row['triton_ms']):>10} {_fmt_ms(row['cusparse_ms']):>10} "
         f"{_fmt_speedup(row['triton_speedup_vs_pytorch']):>8} {_fmt_speedup(row['triton_speedup_vs_cusparse']):>8} "
         f"{row['status']:>6} {_fmt_err(row['triton_max_error']):>12} {_fmt_err(row['cusparse_max_error']):>12} "
-        f"{_fmt_reason(row.get('error_reason')):<32}"
+        f"{_fmt_reason(row.get('status_reason')):<32}"
     )
 
 
@@ -221,6 +249,7 @@ def run_cli(args):
     sample_rows = []
     total_cases = 0
     failed_cases = 0
+    skipped_cases = 0
 
     for value_dtype in value_dtype_tokens:
         for index_name, index_dtype in index_dtype_pairs:
@@ -232,6 +261,41 @@ def run_cli(args):
                         f"reset={str(reset_output).lower()}|unique={str(unique_indices).lower()}|"
                         f"policy={args.dtype_policy}|ifb_policy={args.index_fallback_policy}"
                     )
+                    precheck_reason = _precheck_case_support(value_dtype, args.dtype_policy)
+                    if precheck_reason:
+                        skipped_cases += 1
+                        row = {
+                            "case_id": case_id,
+                            "gpu": torch.cuda.get_device_name(0),
+                            "value_dtype_req": value_dtype,
+                            "value_dtype_compute": "N/A",
+                            "index_dtype": index_name,
+                            "dense_size": dense_size,
+                            "nnz": nnz,
+                            "unique_indices": unique_indices,
+                            "reset_output": reset_output,
+                            "dtype_policy": args.dtype_policy,
+                            "fallback_applied": False,
+                            "index_fallback_applied": False,
+                            "triton_ms": None,
+                            "pytorch_ms": None,
+                            "cusparse_ms": None,
+                            "triton_speedup_vs_pytorch": None,
+                            "triton_speedup_vs_cusparse": None,
+                            "triton_match_pytorch": None,
+                            "cusparse_match_pytorch": None,
+                            "triton_max_error": None,
+                            "cusparse_max_error": None,
+                            "cusparse_unavailable_reason": None,
+                            "fallback_reason": None,
+                            "index_fallback_reason": None,
+                            "status_reason": precheck_reason,
+                            "error_reason": precheck_reason,
+                            "status": "SKIP",
+                        }
+                        summary_rows.append(row)
+                        _print_row(row)
+                        continue
                     try:
                         result = ast.benchmark_scatter_case(
                             dense_size=dense_size,
@@ -253,9 +317,9 @@ def run_cli(args):
                         status = _status_from_result(verify)
                         if status != "PASS":
                             failed_cases += 1
-                        error_reason = None
+                        status_reason = None
                         if status != "PASS":
-                            error_reason = (
+                            status_reason = (
                                 backend.get("index_fallback_reason")
                                 or backend.get("fallback_reason")
                                 or backend.get("cusparse_unavailable_reason")
@@ -288,7 +352,8 @@ def run_cli(args):
                             "cusparse_unavailable_reason": backend.get("cusparse_unavailable_reason"),
                             "fallback_reason": backend.get("fallback_reason"),
                             "index_fallback_reason": backend.get("index_fallback_reason"),
-                            "error_reason": error_reason,
+                            "status_reason": status_reason,
+                            "error_reason": status_reason,
                             "status": status,
                         }
                         summary_rows.append(row)
@@ -305,6 +370,7 @@ def run_cli(args):
                             )
                     except Exception as exc:
                         failed_cases += 1
+                        status_reason = str(exc)
                         row = {
                             "case_id": case_id,
                             "gpu": torch.cuda.get_device_name(0),
@@ -330,7 +396,8 @@ def run_cli(args):
                             "cusparse_unavailable_reason": str(exc),
                             "fallback_reason": None,
                             "index_fallback_reason": str(exc),
-                            "error_reason": str(exc),
+                            "status_reason": status_reason,
+                            "error_reason": status_reason,
                             "status": "ERROR",
                         }
                         summary_rows.append(row)
@@ -339,7 +406,8 @@ def run_cli(args):
     print("-" * 232)
     print(f"Total cases: {total_cases}")
     print(f"Failed cases: {failed_cases}")
-    print(f"Passed cases: {total_cases - failed_cases}")
+    print(f"Skipped cases: {skipped_cases}")
+    print(f"Passed cases: {total_cases - failed_cases - skipped_cases}")
 
     if args.csv_summary:
         summary_fields = [
@@ -367,6 +435,7 @@ def run_cli(args):
             "cusparse_unavailable_reason",
             "fallback_reason",
             "index_fallback_reason",
+            "status_reason",
             "error_reason",
             "status",
         ]
@@ -391,7 +460,11 @@ def build_parser():
     parser = argparse.ArgumentParser(
         description="Scatter benchmark/validation with dtype fallback and CSV export."
     )
-    parser.add_argument("--value-dtypes", default=DEFAULT_VALUE_DTYPES)
+    parser.add_argument(
+        "--value-dtypes",
+        default=DEFAULT_VALUE_DTYPES,
+        help="Comma-separated dtype tokens or 'all' (default: all supported scatter dtypes)",
+    )
     parser.add_argument("--index-dtypes", default=DEFAULT_INDEX_DTYPES)
     parser.add_argument(
         "--cases",
