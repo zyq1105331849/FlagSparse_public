@@ -317,9 +317,14 @@ def run_one_mtx(
     triton_ok_cu = False
     cu_error_reason = None
     csc_ms = None
-    sparse_ref_backend = "torch"
+    sparse_ref_backend = None
     cusparse_unavailable_reason = None
     if run_cusparse:
+        sparse_ref_backend, _ = ast_common._spmv_csr_sparse_ref_backend(
+            data.dtype,
+            indices.dtype,
+            op=op,
+        )
         try:
             sparse_ref = ast_common._benchmark_spmv_csr_sparse_ref(
                 data,

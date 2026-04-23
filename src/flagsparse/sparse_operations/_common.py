@@ -628,7 +628,10 @@ def spmv_csr_ref_hipsparse(
         # alpha/beta must be passed directly, not via ctypes.byref(...).
         alpha = ctypes.c_float(1.0)
         beta = ctypes.c_float(0.0)
-        buffer_size = _hip_check_result(
+        # Current hip-python exposes hipsparseSpMV_bufferSize with an explicit
+        # c_size_t output slot instead of returning the size as a payload.
+        size_out = ctypes.c_size_t()
+        _hip_check_result(
             hipsparse.hipsparseSpMV_bufferSize(
                 handle,
                 op_non,
@@ -639,12 +642,11 @@ def spmv_csr_ref_hipsparse(
                 vecy,
                 value_type,
                 alg,
+                size_out,
             ),
             "hipsparseSpMV_bufferSize",
         )
-        if isinstance(buffer_size, tuple):
-            buffer_size = buffer_size[-1]
-        buffer_size = int(buffer_size or 0)
+        buffer_size = int(size_out.value)
         if buffer_size > 0:
             workspace = _hip_check_result(
                 hip.hipMalloc(buffer_size), "hipMalloc"
@@ -976,13 +978,13 @@ def _benchmark_cuda_op(op, warmup, iters):
         output = op()
 
     torch.cuda.synchronize()
-    if cp is not None:
+    if cp is not None and not _is_rocm_runtime():
         cp.cuda.runtime.deviceSynchronize()
     start_time = time.perf_counter()
     for _ in range(iters):
         output = op()
     torch.cuda.synchronize()
-    if cp is not None:
+    if cp is not None and not _is_rocm_runtime():
         cp.cuda.runtime.deviceSynchronize()
     elapsed_ms = (time.perf_counter() - start_time) * 1000.0 / iters
     return output, elapsed_ms

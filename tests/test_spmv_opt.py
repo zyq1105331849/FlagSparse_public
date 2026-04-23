@@ -226,8 +226,13 @@ def run_one_mtx(path, dtype, index_dtype, warmup, iters):
         pass
 
     cu_ms = None
-    sparse_ref_backend = "torch"
+    sparse_ref_backend = None
     sparse_ref_reason = None
+    sparse_ref_backend, _ = ast_common._spmv_csr_sparse_ref_backend(
+        data.dtype,
+        indices.dtype,
+        op="non",
+    )
     try:
         sparse_ref = ast_common._benchmark_spmv_csr_sparse_ref(
             data,
