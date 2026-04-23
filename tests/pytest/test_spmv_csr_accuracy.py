@@ -8,7 +8,8 @@ from tests.pytest.param_shapes import SPMV_MN_SHAPES
 
 
 spmv_mod = importlib.import_module("flagsparse.sparse_operations.spmv_csr")
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+common_mod = importlib.import_module("flagsparse.sparse_operations._common")
+CUDA_REQUIRED = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 def _value_dtype_cases():
@@ -105,6 +106,7 @@ def _assert_close(actual, expected, dtype):
     assert torch.allclose(actual.to(ref_dtype), expected.to(ref_dtype), rtol=rtol, atol=atol)
 
 
+@CUDA_REQUIRED
 @pytest.mark.spmv_csr
 @pytest.mark.parametrize("M, N", SPMV_MN_SHAPES)
 @pytest.mark.parametrize("name,dtype", _value_dtype_cases(), ids=[c[0] for c in _value_dtype_cases()])
@@ -132,6 +134,7 @@ def test_spmv_csr_matches_dense_reference(M, N, name, dtype, index_dtype, op):
     _assert_close(out, ref, dtype)
 
 
+@CUDA_REQUIRED
 @pytest.mark.spmv_csr
 def test_spmv_csr_prepared_transpose_mismatch_rejected():
     device = torch.device("cuda")
@@ -142,6 +145,7 @@ def test_spmv_csr_prepared_transpose_mismatch_rejected():
         flagsparse_spmv_csr(x=x, prepared=prepared, transpose=False)
 
 
+@CUDA_REQUIRED
 @pytest.mark.spmv_csr
 def test_spmv_csr_prepared_op_mismatch_rejected():
     device = torch.device("cuda")
@@ -152,6 +156,7 @@ def test_spmv_csr_prepared_op_mismatch_rejected():
         flagsparse_spmv_csr(x=x, prepared=prepared, op="trans")
 
 
+@CUDA_REQUIRED
 @pytest.mark.spmv_csr
 def test_spmv_csr_int64_auto_fallback_to_int32(monkeypatch):
     device = torch.device("cuda")
@@ -180,6 +185,7 @@ def test_spmv_csr_int64_auto_fallback_to_int32(monkeypatch):
     assert torch.allclose(out.to(torch.float64), ref, rtol=1e-4, atol=1e-4)
 
 
+@CUDA_REQUIRED
 @pytest.mark.spmv_csr
 def test_spmv_csr_int64_strict_no_fallback(monkeypatch):
     device = torch.device("cuda")
@@ -203,6 +209,7 @@ def test_spmv_csr_int64_strict_no_fallback(monkeypatch):
         )
 
 
+@CUDA_REQUIRED
 @pytest.mark.spmv_csr
 def test_spmv_csr_int64_auto_does_not_fallback_when_index_exceeds_int32(monkeypatch):
     device = torch.device("cuda")
@@ -230,3 +237,82 @@ def test_spmv_csr_int64_auto_does_not_fallback_when_index_exceeds_int32(monkeypa
     x = torch.empty(0, dtype=torch.float32, device=device)
     with pytest.raises(RuntimeError, match="int32 fallback is unsafe"):
         spmv_mod._run_spmv_prepared_with_fallback(prepared, x, use_opt=False)
+
+
+def _hipsparse_minimal_ready():
+    backend, reason = common_mod._spmv_csr_sparse_ref_backend(
+        torch.float32, torch.int32, op="non"
+    )
+    return backend == "hipsparse", reason
+
+
+@CUDA_REQUIRED
+@pytest.mark.spmv_csr
+def test_spmv_csr_hipsparse_minimal_reference_sample():
+    ready, reason = _hipsparse_minimal_ready()
+    if not ready:
+        pytest.skip(reason or "hipSPARSE CSR SpMV reference unavailable")
+
+    device = torch.device("cuda")
+    indptr = torch.tensor([0, 2, 3], dtype=torch.int32, device=device)
+    indices = torch.tensor([0, 1, 1], dtype=torch.int32, device=device)
+    data = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32, device=device)
+    x = torch.tensor([4.0, 5.0], dtype=torch.float32, device=device)
+
+    y, meta = common_mod.spmv_csr_ref_hipsparse(
+        data,
+        indices,
+        indptr,
+        x,
+        (2, 2),
+        return_metadata=True,
+    )
+    expected = torch.tensor([14.0, 15.0], dtype=torch.float32, device=device)
+    assert meta["buffer_size"] == 0
+    assert torch.allclose(y, expected)
+
+
+@pytest.mark.spmv_csr
+def test_spmv_csr_sparse_ref_backend_prefers_hipsparse_on_rocm(monkeypatch):
+    monkeypatch.setattr(common_mod, "_IS_ROCM_RUNTIME", True)
+    monkeypatch.setattr(common_mod, "hip", object())
+    monkeypatch.setattr(common_mod, "hipsparse", object())
+    monkeypatch.setattr(common_mod, "HipPointer", object())
+
+    backend, reason = common_mod._spmv_csr_sparse_ref_backend(
+        torch.float32, torch.int32, op="non"
+    )
+    assert backend == "hipsparse"
+    assert reason is None
+
+
+@pytest.mark.spmv_csr
+def test_spmv_csr_reference_dispatch_falls_back_to_torch(monkeypatch):
+    monkeypatch.setattr(common_mod, "_IS_ROCM_RUNTIME", True)
+    monkeypatch.setattr(common_mod, "hip", object())
+    monkeypatch.setattr(common_mod, "hipsparse", object())
+    monkeypatch.setattr(common_mod, "HipPointer", object())
+
+    expected = torch.tensor([7.0], dtype=torch.float64)
+    state = {"called": False}
+
+    def fake_torch_ref(*args, **kwargs):
+        state["called"] = True
+        return expected
+
+    monkeypatch.setattr(common_mod, "_spmv_csr_ref_pytorch", fake_torch_ref)
+
+    y, meta = common_mod._spmv_csr_reference(
+        torch.tensor([1.0], dtype=torch.float32),
+        torch.tensor([0], dtype=torch.int32),
+        torch.tensor([0, 1], dtype=torch.int32),
+        torch.tensor([1.0], dtype=torch.float32),
+        (1, 1),
+        out_dtype=torch.float64,
+        op="trans",
+        return_metadata=True,
+    )
+    assert state["called"]
+    assert torch.equal(y, expected)
+    assert meta["backend"] == "torch"
+    assert "op=non" in meta["fallback_reason"]

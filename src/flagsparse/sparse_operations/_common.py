@@ -1,5 +1,6 @@
 """Shared imports, dtypes, and helpers for FlagSparse sparse ops."""
 
+import ctypes
 import time
 
 try:
@@ -18,6 +19,16 @@ except ImportError:
     cp = None
     cpx_sparse = None
 
+_HIP_IMPORT_ERROR = None
+try:
+    from hip import hip, hipsparse
+    from hip._util.types import Pointer as HipPointer
+except Exception as exc:
+    hip = None
+    hipsparse = None
+    HipPointer = None
+    _HIP_IMPORT_ERROR = exc
+
 _TORCH_COMPLEX32_DTYPE = getattr(torch, "complex32", None)
 if _TORCH_COMPLEX32_DTYPE is None:
     _TORCH_COMPLEX32_DTYPE = getattr(torch, "chalf", None)
@@ -34,6 +45,13 @@ _SUPPORTED_VALUE_DTYPES.extend([torch.complex64, torch.complex128])
 SUPPORTED_VALUE_DTYPES = tuple(_SUPPORTED_VALUE_DTYPES)
 SUPPORTED_INDEX_DTYPES = (torch.int32, torch.int64)
 _INDEX_LIMIT_INT32 = 2**31 - 1
+_IS_ROCM_RUNTIME = getattr(torch.version, "hip", None) is not None
+_CUPY_SPMV_SUPPORTED_VALUE_DTYPES = (
+    torch.float32,
+    torch.float64,
+    torch.complex64,
+    torch.complex128,
+)
 
 # Star-import exposes only non-underscore names unless listed here.
 __all__ = (
@@ -46,6 +64,8 @@ __all__ = (
     "_resolve_scatter_value_dtype",
     "_component_dtype_for_complex",
     "_tolerance_for_dtype",
+    "_is_rocm_runtime",
+    "_is_hipsparse_available",
     "_require_cupy",
     "_cupy_dtype_from_torch",
     "_cupy_from_torch",
@@ -53,6 +73,15 @@ __all__ = (
     "_to_torch_tensor",
     "_to_backend_like",
     "_cusparse_baseline_skip_reason",
+    "_cupy_spmv_op_matrix",
+    "_apply_cupy_spmv_op",
+    "_spmv_csr_sparse_ref_backend",
+    "_spmv_csr_reference_backend",
+    "_spmv_csr_ref_pytorch",
+    "_spmv_csr_ref_cupy",
+    "spmv_csr_ref_hipsparse",
+    "_spmv_csr_reference",
+    "_benchmark_spmv_csr_sparse_ref",
     "_build_random_dense",
     "_build_indices",
     "_build_random_csr",
@@ -134,6 +163,14 @@ def _tolerance_for_dtype(value_dtype):
     return 1e-6, 1e-5
 
 
+def _is_rocm_runtime():
+    return bool(_IS_ROCM_RUNTIME)
+
+
+def _is_hipsparse_available():
+    return hip is not None and hipsparse is not None and HipPointer is not None
+
+
 def _require_cupy():
     if cp is None or cpx_sparse is None:
         raise RuntimeError(
@@ -198,6 +235,586 @@ def _cusparse_baseline_skip_reason(value_dtype):
     if cp is None and value_dtype == torch.float16:
         return "float16 is not supported by torch sparse fallback when CuPy is unavailable; skipped"
     return None
+
+
+def _normalize_spmv_reference_op(op):
+    if op is None:
+        return "non"
+    if isinstance(op, str):
+        token = op.strip().lower()
+        if token in ("non", "trans", "conj"):
+            return token
+        raise ValueError("op must be one of: non, trans, conj")
+    try:
+        op_code = int(op)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("op must be one of: non, trans, conj") from exc
+    mapping = {0: "non", 1: "trans", 2: "conj"}
+    if op_code not in mapping:
+        raise ValueError("op must be one of: non, trans, conj")
+    return mapping[op_code]
+
+
+def _spmv_reference_compute_dtype(value_dtype):
+    if value_dtype in (torch.float16, torch.bfloat16):
+        return torch.float32
+    if value_dtype == torch.float32:
+        return torch.float64
+    if value_dtype == torch.complex64:
+        return torch.complex128
+    return value_dtype
+
+
+def _cast_spmv_reference_output(y_ref, out_dtype):
+    return y_ref.to(out_dtype) if y_ref.dtype != out_dtype else y_ref
+
+
+def _apply_torch_sparse_spmv_op(matrix, vector_2d, op):
+    op_name = _normalize_spmv_reference_op(op)
+    if op_name == "non":
+        return torch.sparse.mm(matrix, vector_2d).squeeze(1)
+    if op_name == "trans":
+        return torch.sparse.mm(matrix.transpose(0, 1), vector_2d).squeeze(1)
+    return torch.sparse.mm(matrix.conj().transpose(0, 1), vector_2d).squeeze(1)
+
+
+def _cupy_spmv_op_matrix(matrix, op):
+    op_name = _normalize_spmv_reference_op(op)
+    if op_name == "non":
+        return matrix
+    if op_name == "trans":
+        return matrix.T
+    matrix_conj = matrix.conj() if hasattr(matrix, "conj") else matrix.conjugate()
+    return matrix_conj.T
+
+
+def _apply_cupy_spmv_op(matrix, vector, op):
+    return _cupy_spmv_op_matrix(matrix, op) @ vector
+
+
+def _hipsparse_status_success(status):
+    try:
+        return int(status) == 0
+    except Exception:
+        pass
+    value = getattr(status, "value", None)
+    if value is not None:
+        try:
+            return int(value) == 0
+        except Exception:
+            pass
+    name = getattr(status, "name", None)
+    if isinstance(name, str):
+        return name.upper().endswith("SUCCESS")
+    text = str(status).strip()
+    return text == "0" or text.upper().endswith("SUCCESS")
+
+
+def _hip_check_result(result, call_name):
+    payload = None
+    status = result
+    if isinstance(result, tuple):
+        if not result:
+            raise RuntimeError(f"{call_name} returned an empty result")
+        status = result[0]
+        if len(result) == 2:
+            payload = result[1]
+        elif len(result) > 2:
+            payload = result[1:]
+    if not _hipsparse_status_success(status):
+        raise RuntimeError(f"{call_name} failed: {status}")
+    return payload
+
+
+def _hipsparse_lookup(container_name, attr_names):
+    container = getattr(hipsparse, container_name, None) if hipsparse is not None else None
+    search_spaces = [container, hipsparse]
+    for space in search_spaces:
+        if space is None:
+            continue
+        for attr_name in attr_names:
+            if hasattr(space, attr_name):
+                return getattr(space, attr_name)
+    names = ", ".join(attr_names)
+    raise RuntimeError(f"Unable to resolve hipSPARSE attribute {names}")
+
+
+def _hip_lookup(container_name, attr_names):
+    container = getattr(hip, container_name, None) if hip is not None else None
+    search_spaces = [container, hip]
+    for space in search_spaces:
+        if space is None:
+            continue
+        for attr_name in attr_names:
+            if hasattr(space, attr_name):
+                return getattr(space, attr_name)
+    names = ", ".join(attr_names)
+    raise RuntimeError(f"Unable to resolve HIP attribute {names}")
+
+
+def _hipsparse_unavailable_reason():
+    if _is_hipsparse_available():
+        return None
+    reason = "ROCm runtime detected but hip-python/hipSPARSE is unavailable"
+    if _HIP_IMPORT_ERROR is not None:
+        reason += f": {_HIP_IMPORT_ERROR}"
+    return reason
+
+
+def _hipsparse_spmv_csr_skip_reason(value_dtype, index_dtype, op="non"):
+    op_name = _normalize_spmv_reference_op(op)
+    if not _is_rocm_runtime():
+        return "hipSPARSE CSR SpMV reference requires a ROCm runtime"
+    unavailable_reason = _hipsparse_unavailable_reason()
+    if unavailable_reason is not None:
+        return unavailable_reason
+    if value_dtype != torch.float32:
+        return (
+            "hipSPARSE CSR SpMV reference only supports float32 in this first batch; "
+            f"got {value_dtype}"
+        )
+    if index_dtype != torch.int32:
+        return (
+            "hipSPARSE CSR SpMV reference only supports int32 indices in this first batch; "
+            f"got {index_dtype}"
+        )
+    if op_name != "non":
+        return (
+            "hipSPARSE CSR SpMV reference only supports op=non in this first batch; "
+            f"got {op_name}"
+        )
+    return None
+
+
+def _prepare_hipsparse_indptr(indptr):
+    if indptr.dtype == torch.int32:
+        return indptr.contiguous()
+    if indptr.dtype != torch.int64:
+        raise TypeError(
+            "hipSPARSE CSR SpMV reference only supports int32/int64 indptr tensors"
+        )
+    if indptr.numel() > 0:
+        max_offset = int(indptr[-1].item())
+        if max_offset > _INDEX_LIMIT_INT32:
+            raise ValueError(
+                f"hipSPARSE CSR SpMV row offsets exceed int32 range: {max_offset}"
+            )
+    return indptr.to(torch.int32).contiguous()
+
+
+def _spmv_csr_sparse_ref_backend(value_dtype, index_dtype, op="non"):
+    op_name = _normalize_spmv_reference_op(op)
+    if _is_rocm_runtime():
+        skip_reason = _hipsparse_spmv_csr_skip_reason(value_dtype, index_dtype, op=op_name)
+        if skip_reason is None:
+            return "hipsparse", None
+        return None, skip_reason
+    skip_reason = _cusparse_baseline_skip_reason(value_dtype)
+    if skip_reason is not None:
+        return None, skip_reason
+    if cp is None or cpx_sparse is None:
+        return None, "CuPy/cuSPARSE is unavailable"
+    if value_dtype not in _CUPY_SPMV_SUPPORTED_VALUE_DTYPES:
+        return None, f"{value_dtype} is not supported by the CuPy sparse SpMV reference"
+    return "cupy_cusparse", None
+
+
+def _spmv_csr_reference_backend(value_dtype, index_dtype, op="non"):
+    sparse_backend, reason = _spmv_csr_sparse_ref_backend(value_dtype, index_dtype, op=op)
+    if sparse_backend is not None:
+        return sparse_backend, None
+    return "torch", reason
+
+
+def _spmv_csr_ref_pytorch(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    out_dtype=None,
+    op="non",
+    return_compute=False,
+    reference_compute_dtype=False,
+):
+    out_dtype = data.dtype if out_dtype is None else out_dtype
+    if reference_compute_dtype:
+        compute_dtype = _spmv_reference_compute_dtype(out_dtype)
+    elif out_dtype in (torch.float16, torch.bfloat16):
+        compute_dtype = torch.float32
+    else:
+        compute_dtype = out_dtype
+    device = data.device
+    data_ref = data.to(compute_dtype)
+    x_ref = x.to(compute_dtype)
+    op_name = _normalize_spmv_reference_op(op)
+    try:
+        csr_ref = torch.sparse_csr_tensor(
+            indptr.to(torch.int64),
+            indices.to(torch.int64),
+            data_ref,
+            size=shape,
+            device=device,
+        )
+        y_ref = _apply_torch_sparse_spmv_op(csr_ref, x_ref.unsqueeze(1), op_name)
+    except Exception:
+        n_rows = int(shape[0])
+        row_ind = torch.repeat_interleave(
+            torch.arange(n_rows, device=device, dtype=torch.int64),
+            indptr.to(torch.int64)[1:] - indptr.to(torch.int64)[:-1],
+        )
+        coo_ref = torch.sparse_coo_tensor(
+            torch.stack([row_ind, indices.to(torch.int64)]),
+            data_ref,
+            shape,
+            device=device,
+        ).coalesce()
+        y_ref = _apply_torch_sparse_spmv_op(coo_ref, x_ref.unsqueeze(1), op_name)
+    if return_compute:
+        return y_ref
+    return _cast_spmv_reference_output(y_ref, out_dtype)
+
+
+def _spmv_csr_ref_cupy(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    out_dtype=None,
+    op="non",
+    reference_compute_dtype=False,
+):
+    _require_cupy()
+    out_dtype = data.dtype if out_dtype is None else out_dtype
+    compute_dtype = (
+        _spmv_reference_compute_dtype(out_dtype)
+        if reference_compute_dtype
+        else out_dtype
+    )
+    op_name = _normalize_spmv_reference_op(op)
+    data_ref = data.to(compute_dtype)
+    x_ref = x.to(compute_dtype)
+    data_cp = _cupy_from_torch(data_ref)
+    ind_cp = _cupy_from_torch(indices.to(torch.int64))
+    ptr_cp = _cupy_from_torch(indptr.to(torch.int64))
+    x_cp = _cupy_from_torch(x_ref)
+    matrix = cpx_sparse.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
+    y_ref = _apply_cupy_spmv_op(matrix, x_cp, op_name)
+    return _cast_spmv_reference_output(_torch_from_cupy(y_ref), out_dtype)
+
+
+def spmv_csr_ref_hipsparse(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    out=None,
+    op="non",
+    return_metadata=False,
+):
+    op_name = _normalize_spmv_reference_op(op)
+    skip_reason = _hipsparse_spmv_csr_skip_reason(data.dtype, indices.dtype, op=op_name)
+    if skip_reason is not None:
+        raise RuntimeError(skip_reason)
+    if not all(torch.is_tensor(t) for t in (data, indices, indptr, x)):
+        raise TypeError("data, indices, indptr, x must all be torch.Tensor")
+    if not all(t.is_cuda for t in (data, indices, indptr, x)):
+        raise ValueError("data, indices, indptr, x must all be CUDA tensors")
+    if not all(t.device == data.device for t in (indices, indptr, x)):
+        raise ValueError("data, indices, indptr, x must be on the same CUDA device")
+
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1 or x.ndim != 1:
+        raise ValueError("data, indices, indptr, x must all be 1D tensors")
+    if indices.numel() != data.numel():
+        raise ValueError("data and indices must have the same length")
+    if indptr.numel() != n_rows + 1:
+        raise ValueError(f"indptr length must be n_rows+1={n_rows + 1}")
+    if x.numel() != n_cols:
+        raise ValueError(f"x length must be n_cols={n_cols}")
+
+    data = data.contiguous()
+    indices = indices.contiguous()
+    indptr = _prepare_hipsparse_indptr(indptr)
+    x = x.contiguous()
+
+    y = out
+    if y is None:
+        y = torch.zeros(n_rows, dtype=data.dtype, device=data.device)
+    else:
+        if not torch.is_tensor(y):
+            raise TypeError("out must be a torch.Tensor")
+        if not y.is_cuda or y.device != data.device:
+            raise ValueError("out must be a CUDA tensor on the same device as data")
+        if y.dtype != data.dtype or y.shape != (n_rows,):
+            raise ValueError("out must match the result shape and dtype")
+        if not y.is_contiguous():
+            raise ValueError("out must be contiguous")
+        y.zero_()
+
+    if n_rows == 0:
+        metadata = {"backend": "hipsparse", "buffer_size": 0}
+        if return_metadata:
+            return y, metadata
+        return y
+
+    handle = None
+    spmat = None
+    vecx = None
+    vecy = None
+    workspace = 0
+    workspace_allocated = False
+    try:
+        handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        ptr_type = type(handle)
+
+        # hip-python descriptor outputs must be created via createRef().
+        spmat = ptr_type()
+        vecx = ptr_type()
+        vecy = ptr_type()
+        spmat_ref = spmat.createRef()
+        vecx_ref = vecx.createRef()
+        vecy_ref = vecy.createRef()
+
+        # CSR pointers must wrap tensor.data_ptr(), not the tensor object itself.
+        row_ptr = HipPointer.fromObj(indptr.data_ptr())
+        col_ind = HipPointer.fromObj(indices.data_ptr())
+        values_ptr = HipPointer.fromObj(data.data_ptr())
+        x_ptr = HipPointer.fromObj(x.data_ptr())
+        y_ptr = HipPointer.fromObj(y.data_ptr())
+
+        index_type = _hipsparse_lookup(
+            "hipsparseIndexType_t", ("HIPSPARSE_INDEX_32I",)
+        )
+        index_base = _hipsparse_lookup(
+            "hipsparseIndexBase_t", ("HIPSPARSE_INDEX_BASE_ZERO",)
+        )
+        value_type = _hip_lookup("hipDataType", ("HIP_R_32F",))
+        op_non = _hipsparse_lookup(
+            "hipsparseOperation_t", ("HIPSPARSE_OPERATION_NON_TRANSPOSE",)
+        )
+        alg = _hipsparse_lookup(
+            "hipsparseSpMVAlg_t",
+            ("HIPSPARSE_SPMV_ALG_DEFAULT", "HIPSPARSE_MV_ALG_DEFAULT"),
+        )
+
+        _hip_check_result(
+            hipsparse.hipsparseCreateCsr(
+                spmat_ref,
+                n_rows,
+                n_cols,
+                int(data.numel()),
+                row_ptr,
+                col_ind,
+                values_ptr,
+                index_type,
+                index_type,
+                index_base,
+                value_type,
+            ),
+            "hipsparseCreateCsr",
+        )
+        _hip_check_result(
+            hipsparse.hipsparseCreateDnVec(vecx_ref, n_cols, x_ptr, value_type),
+            "hipsparseCreateDnVec(x)",
+        )
+        _hip_check_result(
+            hipsparse.hipsparseCreateDnVec(vecy_ref, n_rows, y_ptr, value_type),
+            "hipsparseCreateDnVec(y)",
+        )
+
+        # alpha/beta must be passed directly, not via ctypes.byref(...).
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        buffer_size = _hip_check_result(
+            hipsparse.hipsparseSpMV_bufferSize(
+                handle,
+                op_non,
+                alpha,
+                spmat,
+                vecx,
+                beta,
+                vecy,
+                value_type,
+                alg,
+            ),
+            "hipsparseSpMV_bufferSize",
+        )
+        if isinstance(buffer_size, tuple):
+            buffer_size = buffer_size[-1]
+        buffer_size = int(buffer_size or 0)
+        if buffer_size > 0:
+            workspace = _hip_check_result(
+                hip.hipMalloc(buffer_size), "hipMalloc"
+            )
+            workspace_allocated = True
+        else:
+            # hipSPARSE may legitimately report buffer_size == 0 for small inputs.
+            workspace = 0
+        _hip_check_result(
+            hipsparse.hipsparseSpMV(
+                handle,
+                op_non,
+                alpha,
+                spmat,
+                vecx,
+                beta,
+                vecy,
+                value_type,
+                alg,
+                workspace,
+            ),
+            "hipsparseSpMV",
+        )
+        metadata = {"backend": "hipsparse", "buffer_size": buffer_size}
+        if return_metadata:
+            return y, metadata
+        return y
+    finally:
+        if vecy is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroyDnVec(vecy), "hipsparseDestroyDnVec(y)"
+                )
+            except Exception:
+                pass
+        if vecx is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroyDnVec(vecx), "hipsparseDestroyDnVec(x)"
+                )
+            except Exception:
+                pass
+        if spmat is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroySpMat(spmat), "hipsparseDestroySpMat"
+                )
+            except Exception:
+                pass
+        if workspace_allocated:
+            try:
+                _hip_check_result(hip.hipFree(workspace), "hipFree")
+            except Exception:
+                pass
+        if handle is not None:
+            try:
+                _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+            except Exception:
+                pass
+
+
+def _spmv_csr_reference(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    out_dtype=None,
+    op="non",
+    reference_compute_dtype=False,
+    return_metadata=False,
+):
+    out_dtype = data.dtype if out_dtype is None else out_dtype
+    op_name = _normalize_spmv_reference_op(op)
+    backend, fallback_reason = _spmv_csr_reference_backend(
+        data.dtype, indices.dtype, op=op_name
+    )
+    if backend == "hipsparse":
+        result = spmv_csr_ref_hipsparse(
+            data,
+            indices,
+            indptr,
+            x,
+            shape,
+            op=op_name,
+        )
+    elif backend == "cupy_cusparse":
+        result = _spmv_csr_ref_cupy(
+            data,
+            indices,
+            indptr,
+            x,
+            shape,
+            out_dtype=out_dtype,
+            op=op_name,
+            reference_compute_dtype=reference_compute_dtype,
+        )
+    else:
+        result = _spmv_csr_ref_pytorch(
+            data,
+            indices,
+            indptr,
+            x,
+            shape,
+            out_dtype=out_dtype,
+            op=op_name,
+            reference_compute_dtype=reference_compute_dtype,
+        )
+    metadata = {"backend": backend, "fallback_reason": fallback_reason}
+    if return_metadata:
+        return result, metadata
+    return result
+
+
+def _benchmark_spmv_csr_sparse_ref(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    warmup,
+    iters,
+    op="non",
+    include_csc=False,
+):
+    op_name = _normalize_spmv_reference_op(op)
+    backend, reason = _spmv_csr_sparse_ref_backend(data.dtype, indices.dtype, op=op_name)
+    result = {
+        "backend": backend,
+        "values": None,
+        "ms": None,
+        "csc_ms": None,
+        "reason": reason,
+    }
+    if backend is None:
+        return result
+    if backend == "hipsparse":
+        values, ms = _benchmark_cuda_op(
+            lambda: spmv_csr_ref_hipsparse(data, indices, indptr, x, shape, op=op_name),
+            warmup=warmup,
+            iters=iters,
+        )
+        result["values"] = values
+        result["ms"] = ms
+        result["reason"] = None
+        return result
+
+    data_cp = _cupy_from_torch(data)
+    ind_cp = _cupy_from_torch(indices.to(torch.int64))
+    ptr_cp = _cupy_from_torch(indptr.to(torch.int64))
+    x_cp = _cupy_from_torch(x)
+    matrix = cpx_sparse.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
+    values_cp, ms = _benchmark_cuda_op(
+        lambda: _apply_cupy_spmv_op(matrix, x_cp, op_name),
+        warmup=warmup,
+        iters=iters,
+    )
+    result["values"] = _torch_from_cupy(values_cp)
+    result["ms"] = ms
+    result["reason"] = None
+    if include_csc:
+        matrix_csc = matrix.tocsc()
+        values_csc, csc_ms = _benchmark_cuda_op(
+            lambda: _apply_cupy_spmv_op(matrix_csc, x_cp, op_name),
+            warmup=warmup,
+            iters=iters,
+        )
+        _ = values_csc
+        result["csc_ms"] = csc_ms
+    return result
 
 
 def _build_random_dense(dense_size, value_dtype, device):

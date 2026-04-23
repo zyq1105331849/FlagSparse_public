@@ -6,6 +6,7 @@ Supports: multi .mtx files, value_dtype / index_dtype, op, --csv-csr export.
 import argparse
 import csv
 import glob
+import importlib
 import math
 import os
 
@@ -29,6 +30,7 @@ TEST_CASES = [
 ]
 WARMUP = 10
 ITERS = 50
+ast_common = importlib.import_module("flagsparse.sparse_operations._common")
 
 
 def _normalize_op(op):
@@ -40,29 +42,6 @@ def _normalize_op(op):
 
 def _op_transposes(op):
     return _normalize_op(op) in ("trans", "conj")
-
-
-def _apply_torch_sparse_op(matrix, x_2d, op):
-    op = _normalize_op(op)
-    if op == "non":
-        return torch.sparse.mm(matrix, x_2d).squeeze(1)
-    if op == "trans":
-        return torch.sparse.mm(matrix.transpose(0, 1), x_2d).squeeze(1)
-    return torch.sparse.mm(matrix.conj().transpose(0, 1), x_2d).squeeze(1)
-
-
-def _cupy_sparse_op_matrix(matrix, op):
-    op = _normalize_op(op)
-    if op == "non":
-        return matrix
-    if op == "trans":
-        return matrix.T
-    matrix_conj = matrix.conj() if hasattr(matrix, "conj") else matrix.conjugate()
-    return matrix_conj.T
-
-
-def _apply_cupy_sparse_op(matrix, x, op):
-    return _cupy_sparse_op_matrix(matrix, op) @ x
 
 
 def _random_vector(size, dtype, device):
@@ -233,78 +212,14 @@ def _benchmark_flagsparse_spmv(
     return y, start_ev.elapsed_time(end_ev) / iters
 
 
-def _reference_dtype(dtype):
-    if dtype in (torch.float16, torch.bfloat16):
-        return torch.float32
-    if dtype == torch.float32:
-        return torch.float64
-    if dtype == torch.complex64:
-        return torch.complex128
-    return dtype
-
-
-def _cast_reference_output(y_ref, out_dtype):
-    return y_ref.to(out_dtype) if y_ref.dtype != out_dtype else y_ref
-
-
-def _pytorch_spmv_reference(
-    data,
-    indices,
-    indptr,
-    x,
-    shape,
-    out_dtype,
-    op="non",
-    return_compute=False,
-):
-    device = data.device
-    op = _normalize_op(op)
-    ref_dtype = _reference_dtype(out_dtype)
-    data_ref = data.to(ref_dtype)
-    x_ref = x.to(ref_dtype)
-    try:
-        csr_ref = torch.sparse_csr_tensor(
-            indptr.to(torch.int64),
-            indices.to(torch.int64),
-            data_ref,
-            size=shape,
-            device=device,
-        )
-        y_ref = _apply_torch_sparse_op(csr_ref, x_ref.unsqueeze(1), op)
-    except Exception:
-        n_rows = int(shape[0])
-        row_ind = torch.repeat_interleave(
-            torch.arange(n_rows, device=device, dtype=torch.int64),
-            indptr[1:] - indptr[:-1],
-        )
-        coo_ref = torch.sparse_coo_tensor(
-            torch.stack([row_ind, indices.to(torch.int64)]),
-            data_ref,
-            shape,
-            device=device,
-        ).coalesce()
-        y_ref = _apply_torch_sparse_op(coo_ref, x_ref.unsqueeze(1), op)
-    if return_compute:
-        return y_ref
-    return _cast_reference_output(y_ref, out_dtype)
-
-
-def _cupy_csr_reference(data, indices, indptr, x, shape, out_dtype, op="non"):
-    import cupy as cp
-    import cupyx.scipy.sparse as cpx
-
-    op = _normalize_op(op)
-    ref_dtype = _reference_dtype(out_dtype)
-    data_ref = data.to(ref_dtype)
-    x_ref = x.to(ref_dtype)
-    data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data_ref))
-    ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
-    ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
-    x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x_ref))
-    A_csr_ref = cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
-    y_ref = _apply_cupy_sparse_op(A_csr_ref, x_cp, op)
-    y_ref_t = torch.utils.dlpack.from_dlpack(y_ref.toDlpack())
-    return _cast_reference_output(y_ref_t, out_dtype)
+def _sparse_ref_backend_label(backend):
+    mapping = {
+        None: "N/A",
+        "hipsparse": "hipSPARSE",
+        "cupy_cusparse": "cuSPARSE",
+        "torch": "PyTorch",
+    }
+    return mapping.get(backend, str(backend))
 
 
 def _tolerance(value_dtype):
@@ -362,29 +277,25 @@ def run_one_mtx(
     triton_ok_pt = False
     pt_error_reason = None
     try:
-        pt_ref_compute_y = _pytorch_spmv_reference(
+        pytorch_op = lambda: ast_common._spmv_csr_ref_pytorch(
             data,
             indices,
             indptr,
             x,
             shape,
-            value_dtype,
+            out_dtype=value_dtype,
             op=op,
-            return_compute=True,
+            reference_compute_dtype=True,
         )
-        pt_ref_y = _cast_reference_output(pt_ref_compute_y, value_dtype)
+        pt_ref_y = pytorch_op()
         start_ev = torch.cuda.Event(enable_timing=True)
         end_ev = torch.cuda.Event(enable_timing=True)
         for _ in range(warmup):
-            _ = _pytorch_spmv_reference(
-                data, indices, indptr, x, shape, value_dtype, op=op
-            )
+            _ = pytorch_op()
         torch.cuda.synchronize()
         start_ev.record()
         for _ in range(iters):
-            _ = _pytorch_spmv_reference(
-                data, indices, indptr, x, shape, value_dtype, op=op
-            )
+            _ = pytorch_op()
         end_ev.record()
         torch.cuda.synchronize()
         pytorch_ms = start_ev.elapsed_time(end_ev) / iters
@@ -406,64 +317,52 @@ def run_one_mtx(
     triton_ok_cu = False
     cu_error_reason = None
     csc_ms = None
-    if run_cusparse and value_dtype not in (torch.bfloat16,):
+    sparse_ref_backend = "torch"
+    cusparse_unavailable_reason = None
+    if run_cusparse:
         try:
-            import cupy as cp
-            import cupyx.scipy.sparse as cpx
-
-            data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-            ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
-            ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
-            x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x))
-            A_csr = cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
-            A_op = _cupy_sparse_op_matrix(A_csr, op)
-            for _ in range(warmup):
-                _ = A_op @ x_cp
-            torch.cuda.synchronize()
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            for _ in range(iters):
-                _ = A_op @ x_cp
-            end.record()
-            torch.cuda.synchronize()
-            cusparse_ms = start.elapsed_time(end) / iters
-            cs_ref_t = _cupy_csr_reference(
-                data, indices, indptr, x, shape, value_dtype, op=op
+            sparse_ref = ast_common._benchmark_spmv_csr_sparse_ref(
+                data,
+                indices,
+                indptr,
+                x,
+                shape,
+                warmup=warmup,
+                iters=iters,
+                op=op,
+                include_csc=True,
             )
-            if y_size:
-                cu_error_reason = _non_finite_error_reason(
-                    triton_y, cs_ref_t, "cuSPARSE reference"
-                )
-                if cu_error_reason is None:
-                    err_cu = _allclose_error_ratio(triton_y, cs_ref_t, atol, rtol)
-                    triton_ok_cu = (not math.isnan(err_cu)) and err_cu <= 1.0
-                else:
-                    err_cu = float("nan")
-
-            A_csc = A_csr.tocsc()
-            A_csc_op = _cupy_sparse_op_matrix(A_csc, op)
-            for _ in range(warmup):
-                _ = A_csc_op @ x_cp
-            torch.cuda.synchronize()
-            start.record()
-            for _ in range(iters):
-                _ = A_csc_op @ x_cp
-            end.record()
-            torch.cuda.synchronize()
-            csc_ms = start.elapsed_time(end) / iters
+            if sparse_ref["backend"] is not None:
+                sparse_ref_backend = sparse_ref["backend"]
+                cusparse_ms = sparse_ref["ms"]
+                csc_ms = sparse_ref["csc_ms"]
+                cs_ref_t = sparse_ref["values"]
+                backend_label = _sparse_ref_backend_label(sparse_ref_backend)
+                if y_size:
+                    cu_error_reason = _non_finite_error_reason(
+                        triton_y, cs_ref_t, f"{backend_label} reference"
+                    )
+                    if cu_error_reason is None:
+                        err_cu = _allclose_error_ratio(triton_y, cs_ref_t, atol, rtol)
+                        triton_ok_cu = (not math.isnan(err_cu)) and err_cu <= 1.0
+                    else:
+                        err_cu = float("nan")
+            else:
+                cusparse_unavailable_reason = sparse_ref["reason"]
+                cu_error_reason = sparse_ref["reason"]
         except Exception as exc:
             cusparse_ms = None
             err_cu = None
             csc_ms = None
-            cu_error_reason = f"cuSPARSE reference error: {exc}"
+            cusparse_unavailable_reason = str(exc)
+            cu_error_reason = f"sparse reference error: {exc}"
 
     if pt_ref_y is None and err_cu is None:
         triton_non_finite = _has_non_finite(triton_y)
         error_reason = "non-finite FlagSparse output" if triton_non_finite else (
             pt_error_reason
             or cu_error_reason
-            or "ref: no PyTorch or cuSPARSE result"
+            or "ref: no PyTorch or sparse reference result"
         )
         return {
             "path": mtx_path,
@@ -481,6 +380,8 @@ def run_one_mtx(
             "err_cu": None,
             "triton_ok_pt": False,
             "triton_ok_cu": False,
+            "sparse_ref_backend": sparse_ref_backend,
+            "cusparse_unavailable_reason": cusparse_unavailable_reason,
             "status": "FAIL" if triton_non_finite else "REF_FAIL",
         }
     if _has_non_finite(triton_y):
@@ -521,6 +422,8 @@ def run_one_mtx(
         "err_cu": err_cu,
         "triton_ok_pt": triton_ok_pt,
         "triton_ok_cu": triton_ok_cu,
+        "sparse_ref_backend": sparse_ref_backend,
+        "cusparse_unavailable_reason": cusparse_unavailable_reason,
         "status": status,
     }
 
@@ -566,6 +469,8 @@ def run_mtx_batch(
                 "err_cu": None,
                 "triton_ok_pt": False,
                 "triton_ok_cu": False,
+                "sparse_ref_backend": None,
+                "cusparse_unavailable_reason": str(exc),
                 "status": "ERROR",
             }
         results.append(r)
@@ -604,14 +509,15 @@ def _print_mtx_header(value_dtype, index_dtype, op="non"):
     print(
         f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}  |  op: {op}  |  transpose: {bool(transpose)}"
     )
-    print("Formats: FlagSparse=CSR, cuSPARSE=CSR/CSC, PyTorch=CSR or COO.")
+    print("Formats: FlagSparse=CSR, sparse ref=hipSPARSE/cuSPARSE/PyTorch fallback, PyTorch=CSR or COO.")
     print("Timing stays in native dtype. For float32, correctness references use float64 compute then cast.")
-    print("PT/CU show per-reference correctness. Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|)).")
+    print("PT/CU show per-reference correctness. Legacy CSR/CSC columns are preserved; Backend shows the actual sparse ref.")
+    print("Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|)).")
     print("-" * 150)
     print(
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
         f"{'FlagSparse(ms)':>10} {'CSR(ms)':>10} {'CSC(ms)':>10} {'PyTorch(ms)':>11} "
-        f"{'FS/CSR':>7} {'FS/PT':>7} {'PT':>6} {'CU':>6} {'Err(PT)':>10} {'Err(CU)':>10}"
+        f"{'FS/CSR':>7} {'FS/PT':>7} {'PT':>6} {'CU':>6} {'Err(PT)':>10} {'Err(CU)':>10} {'Backend':>12}"
     )
     print("-" * 150)
 
@@ -625,7 +531,7 @@ def _print_mtx_row(r):
             f"{name:<28} {n_rows:>7} {n_cols:>7} {r['nnz']:>10} "
             f"{'N/A':>10} {'N/A':>10} {'N/A':>10} {'N/A':>11} "
             f"{'N/A':>7} {'N/A':>7} {'ERROR':>6} {'ERROR':>6} "
-            f"{'N/A':>10} {'N/A':>10}  {r.get('error_reason', r.get('error', ''))}"
+            f"{'N/A':>10} {'N/A':>10} {_sparse_ref_backend_label(r.get('sparse_ref_backend')):>12}  {r.get('error_reason', r.get('error', ''))}"
         )
         return
     triton_ms = r.get("triton_ms")
@@ -636,11 +542,12 @@ def _print_mtx_row(r):
     err_cu_str = _fmt_err(r.get("err_cu"))
     pt_status = _status_str(r.get("triton_ok_pt", False), r.get("err_pt") is not None)
     cu_status = _status_str(r.get("triton_ok_cu", False), r.get("err_cu") is not None)
+    backend_label = _sparse_ref_backend_label(r.get("sparse_ref_backend"))
     print(
         f"{name:<28} {n_rows:>7} {n_cols:>7} {r['nnz']:>10} "
         f"{_fmt_ms(triton_ms):>10} {_fmt_ms(csr_ms):>10} {_fmt_ms(csc_ms):>10} {_fmt_ms(pt_ms):>11} "
         f"{_fmt_speedup(csr_ms, triton_ms):>7} {_fmt_speedup(pt_ms, triton_ms):>7} "
-        f"{pt_status:>6} {cu_status:>6} {err_pt_str:>10} {err_cu_str:>10}"
+        f"{pt_status:>6} {cu_status:>6} {err_pt_str:>10} {err_cu_str:>10} {backend_label:>12}"
     )
 
 
@@ -733,8 +640,7 @@ def run_comprehensive_synthetic(op="non"):
     print("FLAGSPARSE SpMV BENCHMARK (synthetic CSR)")
     print("=" * 110)
     print(f"GPU: {torch.cuda.get_device_name(0)}  |  Warmup: {WARMUP}  Iters: {ITERS}  |  op: {op}  |  transpose: {bool(transpose)}")
-    print("Formats: FlagSparse=CSR, cuSPARSE=CSR (when supported), Reference=CuPy CSR or PyTorch COO")
-    print("When CuPy does not support dtype (e.g. bfloat16/float16), reference = PyTorch (float32 then cast).")
+    print("Formats: FlagSparse=CSR, sparse ref=hipSPARSE/cuSPARSE/PyTorch fallback.")
     print()
     total = 0
     failed = 0
@@ -748,7 +654,7 @@ def run_comprehensive_synthetic(op="non"):
             print(
                 f"{'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
                 f"{'FlagSparse(ms)':>11} {'cuSPARSE(ms)':>12} {'FS/CS':>8} "
-                f"{'Status':>6} {'Err(FS)':>10} {'Err(CS)':>10}"
+                f"{'Status':>6} {'Err(FS)':>10} {'Err(CS)':>10} {'Backend':>12}"
             )
             print("-" * 110)
             for n_rows, n_cols, nnz in TEST_CASES:
@@ -767,6 +673,7 @@ def run_comprehensive_synthetic(op="non"):
                     )
                     perf = result["performance"]
                     verify = result["verification"]
+                    backend = result["backend_status"].get("sparse_ref_backend")
                     ok = verify["triton_match_reference"]
                     cs_ok = verify.get("cusparse_match_reference")
                     status = "PASS" if (ok and (cs_ok is None or cs_ok)) else "FAIL"
@@ -780,14 +687,14 @@ def run_comprehensive_synthetic(op="non"):
                         f"{n_rows:>7} {n_cols:>7} {nnz:>10} "
                         f"{_fmt_ms(triton_ms):>11} {_fmt_ms(cusparse_ms):>12} {speedup_str:>8} "
                         f"{status:>6} {_fmt_err(verify.get('triton_max_error')):>10} "
-                        f"{_fmt_err(verify.get('cusparse_max_error')):>10}"
+                        f"{_fmt_err(verify.get('cusparse_max_error')):>10} {_sparse_ref_backend_label(backend):>12}"
                     )
                 except Exception as exc:
                     failed += 1
                     print(
                         f"{n_rows:>7} {n_cols:>7} {nnz:>10} "
                         f"{'N/A':>11} {'N/A':>12} {'N/A':>8} "
-                        f"{'ERROR':>6} {'N/A':>10} {'N/A':>10}  {exc}"
+                        f"{'ERROR':>6} {'N/A':>10} {'N/A':>10} {'N/A':>12}  {exc}"
                     )
             print("-" * 110)
             print()
