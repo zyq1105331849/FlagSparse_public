@@ -1,6 +1,6 @@
 """
 SpMV optimisation A/B test: compare _impl (baseline) vs _impl_opt (optimised)
-side-by-side, together with PyTorch and the active sparse reference backend.
+side-by-side, together with PyTorch and the active sparse backend baseline.
 
 Usage:
     python tests/test_spmv_opt.py <dir/>                # batch run, default float32
@@ -167,21 +167,11 @@ def _err(v):
     return "N/A" if v is None else f"{v:.2e}"
 
 
-def _sparse_ref_backend_label(backend):
-    mapping = {
-        None: "N/A",
-        "hipsparse": "hipSPARSE",
-        "cupy_cusparse": "cuSPARSE",
-        "torch": "PyTorch",
-    }
-    return mapping.get(backend, str(backend))
-
-
 HEADER = (
     f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10}  "
     f"{'Base(ms)':>9} {'Opt(ms)':>9} {'PT(ms)':>9} {'CU(ms)':>9}  "
     f"{'Opt/Base':>8} {'Opt/PT':>8} {'Opt/CU':>8}  "
-    f"{'Err(Base)':>10} {'Err(Opt)':>10} {'Status':>6} {'Backend':>12}"
+    f"{'Err(Base)':>10} {'Err(Opt)':>10} {'Status':>6}"
 )
 SEP = "-" * 170
 
@@ -300,7 +290,6 @@ def run_one_mtx(path, dtype, index_dtype, warmup, iters):
 def print_row(r):
     name = os.path.basename(r["path"])[:27]
     n_rows, n_cols = r["shape"]
-    backend_label = _sparse_ref_backend_label(r.get("sparse_ref_backend"))
     print(
         f"{name:<28} {n_rows:>7} {n_cols:>7} {r['nnz']:>10}  "
         f"{_fmt(r['base_ms']):>9} {_fmt(r['opt_ms']):>9} "
@@ -308,10 +297,8 @@ def print_row(r):
         f"{_spd(r['base_ms'], r['opt_ms']):>8} "
         f"{_spd(r['pt_ms'], r['opt_ms']):>8} "
         f"{_spd(r['cu_ms'], r['opt_ms']):>8}  "
-        f"{_err(r['err_base']):>10} {_err(r['err_opt']):>10} {r['status']:>6} {backend_label:>12}"
+        f"{_err(r['err_base']):>10} {_err(r['err_opt']):>10} {r['status']:>6}"
     )
-    if r.get("sparse_ref_reason") and r.get("cu_ms") is None:
-        print(f"  sparse-ref: {r['sparse_ref_reason']}")
 
 
 def run_batch(paths, dtype, index_dtype, warmup, iters):

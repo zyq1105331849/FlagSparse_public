@@ -397,28 +397,96 @@ def _hipsparse_unavailable_reason():
     return reason
 
 
-def _hipsparse_spmv_csr_skip_reason(value_dtype, index_dtype, op="non"):
+class _HipFloatComplex(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_float), ("y", ctypes.c_float)]
+
+
+class _HipDoubleComplex(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+
+def _hipsparse_value_type(value_dtype):
+    mapping = {
+        torch.float32: ("HIP_R_32F",),
+        torch.float64: ("HIP_R_64F",),
+        torch.complex64: ("HIP_C_32F", "HIP_C_32FC"),
+        torch.complex128: ("HIP_C_64F", "HIP_C_64FC"),
+    }
+    if value_dtype not in mapping:
+        raise RuntimeError(f"hipSPARSE CSR SpMV has no dtype mapping for {value_dtype}")
+    return _hip_lookup("hipDataType", mapping[value_dtype])
+
+
+def _hipsparse_scalar(value_dtype, real, imag=0.0):
+    if value_dtype == torch.float32:
+        return ctypes.c_float(float(real))
+    if value_dtype == torch.float64:
+        return ctypes.c_double(float(real))
+    if value_dtype == torch.complex64:
+        scalar_type = getattr(hip, "hipComplex", None) or getattr(
+            hip, "hipFloatComplex", None
+        )
+        if scalar_type is not None:
+            return scalar_type(float(real), float(imag))
+        return _HipFloatComplex(float(real), float(imag))
+    if value_dtype == torch.complex128:
+        scalar_type = getattr(hip, "hipDoubleComplex", None) or getattr(
+            hip, "hipComplexDouble", None
+        )
+        if scalar_type is not None:
+            return scalar_type(float(real), float(imag))
+        return _HipDoubleComplex(float(real), float(imag))
+    raise RuntimeError(f"hipSPARSE CSR SpMV does not support {value_dtype}")
+
+
+def _prepare_hipsparse_indices(indices):
+    if indices.dtype == torch.int32:
+        return indices.contiguous()
+    if indices.dtype != torch.int64:
+        raise TypeError(
+            "hipSPARSE CSR SpMV reference only supports int32/int64 index tensors"
+        )
+    if indices.numel() > 0:
+        max_index = int(indices.max().item())
+        min_index = int(indices.min().item())
+        if max_index > _INDEX_LIMIT_INT32 or min_index < 0:
+            raise ValueError(
+                "hipSPARSE CSR SpMV int64 indices exceed the safe int32 conversion range"
+            )
+    return indices.to(torch.int32).contiguous()
+
+
+def _materialize_hipsparse_csr_inputs(data, indices, indptr, shape, op):
     op_name = _normalize_spmv_reference_op(op)
+    if op_name == "non":
+        return data, indices, indptr, shape
+    import flagsparse.sparse_operations.spmv_csr as spmv_csr_mod
+
+    data_op = data
+    if op_name == "conj" and data.is_complex():
+        data_op = data.conj()
+        if hasattr(data_op, "resolve_conj"):
+            data_op = data_op.resolve_conj()
+    return spmv_csr_mod._transpose_csr_for_spmv(data_op, indices, indptr, shape)
+
+
+def _hipsparse_spmv_csr_skip_reason(value_dtype, index_dtype, op="non"):
+    _normalize_spmv_reference_op(op)
     if not _is_rocm_runtime():
         return "hipSPARSE CSR SpMV reference requires a ROCm runtime"
     unavailable_reason = _hipsparse_unavailable_reason()
     if unavailable_reason is not None:
         return unavailable_reason
-    if value_dtype != torch.float32:
-        return (
-            "hipSPARSE CSR SpMV reference only supports float32 in this first batch; "
-            f"got {value_dtype}"
-        )
-    if index_dtype != torch.int32:
-        return (
-            "hipSPARSE CSR SpMV reference only supports int32 indices in this first batch; "
-            f"got {index_dtype}"
-        )
-    if op_name != "non":
-        return (
-            "hipSPARSE CSR SpMV reference only supports op=non in this first batch; "
-            f"got {op_name}"
-        )
+    if value_dtype not in (torch.float32, torch.float64, torch.complex64, torch.complex128):
+        return f"hipSPARSE CSR SpMV has no supported value dtype mapping for {value_dtype}"
+    if index_dtype not in (torch.int32, torch.int64):
+        return f"hipSPARSE CSR SpMV has no supported index dtype mapping for {index_dtype}"
+    try:
+        _ = _hipsparse_value_type(value_dtype)
+        _ = _hipsparse_scalar(value_dtype, 1.0, 0.0)
+        _ = _hipsparse_scalar(value_dtype, 0.0, 0.0)
+    except Exception as exc:
+        return str(exc)
     return None
 
 
@@ -687,20 +755,26 @@ def spmv_csr_ref_hipsparse(
     if not all(t.device == data.device for t in (indices, indptr, x)):
         raise ValueError("data, indices, indptr, x must be on the same CUDA device")
 
-    n_rows, n_cols = int(shape[0]), int(shape[1])
     if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1 or x.ndim != 1:
         raise ValueError("data, indices, indptr, x must all be 1D tensors")
     if indices.numel() != data.numel():
         raise ValueError("data and indices must have the same length")
+    data, indices, indptr, effective_shape = _materialize_hipsparse_csr_inputs(
+        data, indices, indptr, shape, op_name
+    )
+    n_rows, n_cols = int(effective_shape[0]), int(effective_shape[1])
     if indptr.numel() != n_rows + 1:
         raise ValueError(f"indptr length must be n_rows+1={n_rows + 1}")
     if x.numel() != n_cols:
         raise ValueError(f"x length must be n_cols={n_cols}")
 
     data = data.contiguous()
-    indices = indices.contiguous()
+    indices = _prepare_hipsparse_indices(indices)
     indptr = _prepare_hipsparse_indptr(indptr)
     x = x.contiguous()
+    value_type = _hipsparse_value_type(data.dtype)
+    alpha = _hipsparse_scalar(data.dtype, 1.0, 0.0)
+    beta = _hipsparse_scalar(data.dtype, 0.0, 0.0)
 
     y = out
     if y is None:
@@ -753,7 +827,6 @@ def spmv_csr_ref_hipsparse(
         index_base = _hipsparse_lookup(
             "hipsparseIndexBase_t", ("HIPSPARSE_INDEX_BASE_ZERO",)
         )
-        value_type = _hip_lookup("hipDataType", ("HIP_R_32F",))
         op_non = _hipsparse_lookup(
             "hipsparseOperation_t", ("HIPSPARSE_OPERATION_NON_TRANSPOSE",)
         )
@@ -788,8 +861,6 @@ def spmv_csr_ref_hipsparse(
         )
 
         # alpha/beta must be passed directly, not via ctypes.byref(...).
-        alpha = ctypes.c_float(1.0)
-        beta = ctypes.c_float(0.0)
         # Current hip-python exposes hipsparseSpMV_bufferSize with an explicit
         # c_size_t output slot instead of returning the size as a payload.
         size_out = ctypes.c_size_t()

@@ -104,6 +104,11 @@ def test_spmv_coo_reference_dispatch_prefers_hipsparse_on_rocm(monkeypatch):
     monkeypatch.setattr(common_mod, "_IS_ROCM_RUNTIME", True, raising=False)
     monkeypatch.setattr(
         common_mod,
+        "_hipsparse_spmv_csr_skip_reason",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        common_mod,
         "spmv_coo_ref_hipsparse_via_csr",
         fake_hipsparse_ref,
     )
@@ -124,17 +129,22 @@ def test_spmv_coo_reference_dispatch_prefers_hipsparse_on_rocm(monkeypatch):
 
 
 def test_spmv_coo_reference_dispatch_falls_back_to_torch_when_hipsparse_unsupported(monkeypatch):
-    data = torch.tensor([2.0], dtype=torch.float64)
-    row = torch.tensor([0], dtype=torch.int64)
-    col = torch.tensor([0], dtype=torch.int64)
-    x = torch.tensor([3.0], dtype=torch.float64)
+    data = torch.tensor([2.0], dtype=torch.float16)
+    row = torch.tensor([0], dtype=torch.int32)
+    col = torch.tensor([0], dtype=torch.int32)
+    x = torch.tensor([3.0], dtype=torch.float16)
     state = {"called": False}
 
     def fake_torch_ref(*args, **kwargs):
         state["called"] = True
-        return torch.tensor([6.0], dtype=torch.float64)
+        return torch.tensor([6.0], dtype=torch.float16)
 
     monkeypatch.setattr(common_mod, "_IS_ROCM_RUNTIME", True, raising=False)
+    monkeypatch.setattr(
+        common_mod,
+        "_hipsparse_spmv_csr_skip_reason",
+        lambda *args, **kwargs: "hipSPARSE CSR SpMV has no supported value dtype mapping for torch.float16",
+    )
     monkeypatch.setattr(common_mod, "_spmv_coo_ref_pytorch", fake_torch_ref)
 
     out, metadata = common_mod._spmv_coo_reference(
@@ -147,9 +157,10 @@ def test_spmv_coo_reference_dispatch_falls_back_to_torch_when_hipsparse_unsuppor
     )
 
     assert state["called"]
-    assert torch.equal(out, torch.tensor([6.0], dtype=torch.float64))
+    assert torch.equal(out, torch.tensor([6.0], dtype=torch.float16))
     assert metadata["backend"] == "torch"
     assert "hipSPARSE COO sparse reference reuses CSR conversion" in metadata["fallback_reason"]
+    assert "float16" in metadata["fallback_reason"]
 
 
 def test_spmv_coo_reference_dispatch_prefers_cupy_off_rocm(monkeypatch):

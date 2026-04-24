@@ -275,9 +275,7 @@ def test_spmv_csr_hipsparse_minimal_reference_sample():
 @pytest.mark.spmv_csr
 def test_spmv_csr_sparse_ref_backend_prefers_hipsparse_on_rocm(monkeypatch):
     monkeypatch.setattr(common_mod, "_IS_ROCM_RUNTIME", True)
-    monkeypatch.setattr(common_mod, "hip", object())
-    monkeypatch.setattr(common_mod, "hipsparse", object())
-    monkeypatch.setattr(common_mod, "HipPointer", object())
+    monkeypatch.setattr(common_mod, "_hipsparse_spmv_csr_skip_reason", lambda *args, **kwargs: None)
 
     backend, reason = common_mod._spmv_csr_sparse_ref_backend(
         torch.float32, torch.int32, op="non"
@@ -289,9 +287,11 @@ def test_spmv_csr_sparse_ref_backend_prefers_hipsparse_on_rocm(monkeypatch):
 @pytest.mark.spmv_csr
 def test_spmv_csr_reference_dispatch_falls_back_to_torch(monkeypatch):
     monkeypatch.setattr(common_mod, "_IS_ROCM_RUNTIME", True)
-    monkeypatch.setattr(common_mod, "hip", object())
-    monkeypatch.setattr(common_mod, "hipsparse", object())
-    monkeypatch.setattr(common_mod, "HipPointer", object())
+    monkeypatch.setattr(
+        common_mod,
+        "_hipsparse_spmv_csr_skip_reason",
+        lambda *args, **kwargs: "hipSPARSE CSR SpMV has no supported value dtype mapping for torch.float16",
+    )
 
     expected = torch.tensor([7.0], dtype=torch.float64)
     state = {"called": False}
@@ -303,16 +303,16 @@ def test_spmv_csr_reference_dispatch_falls_back_to_torch(monkeypatch):
     monkeypatch.setattr(common_mod, "_spmv_csr_ref_pytorch", fake_torch_ref)
 
     y, meta = common_mod._spmv_csr_reference(
-        torch.tensor([1.0], dtype=torch.float32),
+        torch.tensor([1.0], dtype=torch.float16),
         torch.tensor([0], dtype=torch.int32),
         torch.tensor([0, 1], dtype=torch.int32),
-        torch.tensor([1.0], dtype=torch.float32),
+        torch.tensor([1.0], dtype=torch.float16),
         (1, 1),
         out_dtype=torch.float64,
-        op="trans",
+        op="non",
         return_metadata=True,
     )
     assert state["called"]
     assert torch.equal(y, expected)
     assert meta["backend"] == "torch"
-    assert "op=non" in meta["fallback_reason"]
+    assert "float16" in meta["fallback_reason"]

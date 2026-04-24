@@ -221,22 +221,12 @@ def _dense_to_coo(A):
     return data, rows, cols
 
 
-def _sparse_ref_backend_label(backend):
-    mapping = {
-        None: "N/A",
-        "hipsparse": "hipSPARSE",
-        "cupy_cusparse": "cuSPARSE",
-        "torch": "PyTorch",
-    }
-    return mapping.get(backend, str(backend))
-
-
 COO_SEP = "-" * 208
 COO_HEADER = (
     f"{'Matrix':<28} {'Op':>5} {'Out':>7} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10}  "
     f"{'Base(ms)':>9} {'Opt(ms)':>9} {'PT(ms)':>9} {'CU(ms)':>9}  "
     f"{'Opt/Base':>8} {'Opt/PT':>8} {'Opt/CU':>8}  "
-    f"{'Err(Base)':>10} {'Err(Opt)':>10} {'Status':>6} {'Backend':>12}"
+    f"{'Err(Base)':>10} {'Err(Opt)':>10} {'Status':>6}"
 )
 
 
@@ -540,7 +530,6 @@ def _run_one_coo_case(
         "err_opt": err_opt,
         "err_pt": err_pt,
         "err_cu": err_cu,
-        "sparse_ref_backend": sparse_ref_backend,
         "sparse_ref_reason": sparse_ref_reason,
     }
 
@@ -549,7 +538,6 @@ def _print_coo_result(row_out):
     name = str(row_out["matrix"])[:27]
     if len(str(row_out["matrix"])) > 27:
         name += "..."
-    backend_label = _sparse_ref_backend_label(row_out.get("sparse_ref_backend"))
     print(
         f"{name:<28} {row_out['op']:>5} {row_out['out_size']:>7} "
         f"{row_out['n_rows']:>7} {row_out['n_cols']:>7} {row_out['nnz']:>10}  "
@@ -559,10 +547,8 @@ def _print_coo_result(row_out):
         f"{_spd(row_out['pytorch_ms'], row_out['opt_ms']):>8} "
         f"{_spd(row_out['cusparse_ms'], row_out['opt_ms']):>8}  "
         f"{_fmt_err(row_out['err_base']):>10} {_fmt_err(row_out['err_opt']):>10} "
-        f"{row_out['status']:>6} {backend_label:>12}"
+        f"{row_out['status']:>6}"
     )
-    if row_out.get("sparse_ref_reason") and row_out.get("cusparse_ms") is None:
-        print(f"  sparse-ref: {row_out['sparse_ref_reason']}")
 
 
 def _error_row(path, dtype, index_dtype, op, reason):
@@ -590,7 +576,6 @@ def _error_row(path, dtype, index_dtype, op, reason):
         "err_opt": None,
         "err_pt": None,
         "err_cu": None,
-        "sparse_ref_backend": None,
         "sparse_ref_reason": reason,
     }
 
@@ -601,11 +586,10 @@ def run_synthetic(value_dtypes=None, index_dtypes=None, ops=None):
         return
     device = torch.device("cuda")
     print("=" * 208)
-    print("FLAGSPARSE SpMV COO BENCHMARK (synthetic dense -> COO)")
+    print("FLAGSPARSE SpMV COO BENCHMARK (synthetic dense -> COO). All backends stay COO.")
     print("=" * 208)
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Warmup: {WARMUP} | Iters: {ITERS}")
-    print("Correctness reference stays local PyTorch COO; sparse backend is active cuSPARSE/hipSPARSE.")
     print()
 
     value_dtypes = VALUE_DTYPES if value_dtypes is None else value_dtypes
@@ -665,8 +649,8 @@ def run_all_dtypes_coo_csv(
     ops = OPS if ops is None else ops
 
     print("=" * 208)
-    print("Input: MatrixMarket -> COO. Correctness reference stays local PyTorch COO.")
-    print("Sparse backend column uses active cuSPARSE/hipSPARSE timing where available.")
+    print("Input: MatrixMarket -> COO. FlagSparse: native COO Triton only (seg + atomic), no CSR.")
+    print("PyTorch = COO sparse.mm; CU(ms) = active sparse backend timing on the original compare slot.")
     print("=" * 208)
     for dtype in value_dtypes:
         for index_dtype in index_dtypes:
@@ -728,11 +712,9 @@ def run_all_dtypes_coo_csv(
         "err_opt",
         "err_pt",
         "err_cu",
-        "sparse_ref_backend",
-        "sparse_ref_reason",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row_out in rows_out:
             writer.writerow(row_out)
