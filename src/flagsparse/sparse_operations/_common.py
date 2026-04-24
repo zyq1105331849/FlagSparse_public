@@ -91,6 +91,7 @@ __all__ = (
     "_spmv_coo_reference_backend",
     "_spmv_coo_ref_pytorch",
     "_spmv_coo_ref_cupy",
+    "spmv_coo_ref_hipsparse_via_csr",
     "_spmv_coo_reference",
     "_benchmark_spmv_coo_sparse_ref",
     "_build_random_dense",
@@ -542,9 +543,14 @@ def _spmv_csr_ref_cupy(
 def _spmv_coo_sparse_ref_backend(value_dtype, index_dtype, op="non"):
     op_name = _normalize_sparse_reference_op(op)
     if _is_rocm_runtime():
+        backend, reason = _spmv_csr_sparse_ref_backend(
+            value_dtype, index_dtype, op=op_name
+        )
+        if backend is not None:
+            return backend, None
         return None, (
-            "hipSPARSE COO SpMV direct sparse reference is not implemented in this "
-            f"first batch; fallback to PyTorch for op={op_name}"
+            "hipSPARSE COO sparse reference reuses CSR conversion; "
+            f"{reason}"
         )
     skip_reason = _cusparse_baseline_skip_reason(value_dtype)
     if skip_reason is not None:
@@ -621,6 +627,43 @@ def _spmv_coo_ref_cupy(
     matrix = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
     y_ref = _apply_cupy_sparse_matmul_op(matrix, x_cp, op)
     return _cast_sparse_reference_output(_torch_from_cupy(y_ref), out_dtype)
+
+
+def _spmv_coo_to_csr_reference_inputs(data, row, col, shape):
+    import flagsparse.sparse_operations.spmv_csr as spmv_csr_mod
+
+    return spmv_csr_mod.coo_to_csr_for_spmv(
+        data,
+        row,
+        col,
+        shape,
+        assume_sorted=False,
+    )
+
+
+def spmv_coo_ref_hipsparse_via_csr(
+    data,
+    row,
+    col,
+    x,
+    shape,
+    out=None,
+    op="non",
+    return_metadata=False,
+):
+    data_csr, indices_csr, indptr_csr = _spmv_coo_to_csr_reference_inputs(
+        data, row, col, shape
+    )
+    return spmv_csr_ref_hipsparse(
+        data_csr,
+        indices_csr,
+        indptr_csr,
+        x,
+        shape,
+        out=out,
+        op=op,
+        return_metadata=return_metadata,
+    )
 
 
 def spmv_csr_ref_hipsparse(
@@ -954,7 +997,16 @@ def _spmv_coo_reference(
     backend, fallback_reason = _spmv_coo_reference_backend(
         data.dtype, row.dtype, op=op_name
     )
-    if backend == "cupy_cusparse":
+    if backend == "hipsparse":
+        result = spmv_coo_ref_hipsparse_via_csr(
+            data,
+            row,
+            col,
+            x,
+            shape,
+            op=op_name,
+        )
+    elif backend == "cupy_cusparse":
         result = _spmv_coo_ref_cupy(
             data,
             row,
@@ -1001,6 +1053,23 @@ def _benchmark_spmv_coo_sparse_ref(
         "reason": reason,
     }
     if backend is None:
+        return result
+    if backend == "hipsparse":
+        values, ms = _benchmark_cuda_op(
+            lambda: spmv_coo_ref_hipsparse_via_csr(
+                data,
+                row,
+                col,
+                x,
+                shape,
+                op=op_name,
+            ),
+            warmup=warmup,
+            iters=iters,
+        )
+        result["values"] = values
+        result["ms"] = ms
+        result["reason"] = None
         return result
 
     data_cp = _cupy_from_torch(data)

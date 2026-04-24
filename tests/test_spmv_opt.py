@@ -203,16 +203,30 @@ def run_one_mtx(path, dtype, index_dtype, warmup, iters):
         atol, rtol = 1e-12, 1e-10
 
     try:
-        y_ref = ast_common._spmv_csr_ref_pytorch(
-            data,
-            indices,
-            indptr,
-            x,
-            shape,
-            out_dtype=dtype,
-            op="non",
-            reference_compute_dtype=True,
-        )
+        ref_dtype = torch.float64 if dtype == torch.float32 else dtype
+        data_ref = data.to(ref_dtype)
+        x_ref = x.to(ref_dtype)
+        try:
+            A_ref = torch.sparse_csr_tensor(
+                indptr.to(torch.int64),
+                indices.to(torch.int64),
+                data_ref,
+                size=shape,
+                device=device,
+            )
+            y_ref = torch.sparse.mm(A_ref, x_ref.unsqueeze(1)).squeeze(1).to(dtype)
+        except Exception:
+            row_ind = torch.repeat_interleave(
+                torch.arange(n_rows, device=device, dtype=torch.int64),
+                indptr[1:] - indptr[:-1],
+            )
+            A_ref = torch.sparse_coo_tensor(
+                torch.stack([row_ind, indices.to(torch.int64)]),
+                data_ref,
+                shape,
+                device=device,
+            ).coalesce()
+            y_ref = torch.sparse.mm(A_ref, x_ref.unsqueeze(1)).squeeze(1).to(dtype)
     except Exception:
         y_ref = None
 
@@ -249,8 +263,8 @@ def run_one_mtx(path, dtype, index_dtype, warmup, iters):
             cu_ms = sparse_ref["ms"]
         else:
             sparse_ref_reason = sparse_ref["reason"]
-    except Exception:
-        sparse_ref_reason = "sparse reference timing failed"
+    except Exception as exc:
+        sparse_ref_reason = f"sparse reference timing failed: {exc}"
 
     err_base = None
     err_opt = None
@@ -296,6 +310,8 @@ def print_row(r):
         f"{_spd(r['cu_ms'], r['opt_ms']):>8}  "
         f"{_err(r['err_base']):>10} {_err(r['err_opt']):>10} {r['status']:>6} {backend_label:>12}"
     )
+    if r.get("sparse_ref_reason") and r.get("cu_ms") is None:
+        print(f"  sparse-ref: {r['sparse_ref_reason']}")
 
 
 def run_batch(paths, dtype, index_dtype, warmup, iters):

@@ -12,6 +12,7 @@ import os
 
 import torch
 import flagsparse as ast
+import flagsparse.sparse_operations.spmv_csr as spmv_csr_mod
 
 
 VALUE_DTYPES = [
@@ -42,6 +43,29 @@ def _normalize_op(op):
 
 def _op_transposes(op):
     return _normalize_op(op) in ("trans", "conj")
+
+
+def _apply_torch_sparse_op(matrix, x_2d, op):
+    op = _normalize_op(op)
+    if op == "non":
+        return torch.sparse.mm(matrix, x_2d).squeeze(1)
+    if op == "trans":
+        return torch.sparse.mm(matrix.transpose(0, 1), x_2d).squeeze(1)
+    return torch.sparse.mm(matrix.conj().transpose(0, 1), x_2d).squeeze(1)
+
+
+def _cupy_sparse_op_matrix(matrix, op):
+    op = _normalize_op(op)
+    if op == "non":
+        return matrix
+    if op == "trans":
+        return matrix.T
+    matrix_conj = matrix.conj() if hasattr(matrix, "conj") else matrix.conjugate()
+    return matrix_conj.T
+
+
+def _apply_cupy_sparse_op(matrix, x, op):
+    return _cupy_sparse_op_matrix(matrix, op) @ x
 
 
 def _random_vector(size, dtype, device):
@@ -192,10 +216,14 @@ def _benchmark_flagsparse_spmv(
         max_segments=max_segments,
         op=OP_TO_CODE[op],
     )
-    spmv_op = lambda: ast.flagsparse_spmv_csr(
-        x=x,
-        prepared=prepared,
-        return_time=False,
+    spmv_op = lambda: _run_flagsparse_spmv_timed_op(
+        prepared,
+        data,
+        indices,
+        indptr,
+        x,
+        shape,
+        op,
     )
     y = spmv_op()
     torch.cuda.synchronize()
@@ -212,6 +240,53 @@ def _benchmark_flagsparse_spmv(
     return y, start_ev.elapsed_time(end_ev) / iters
 
 
+def _clone_csr_prepared_for_timed_op(template, data, indices, indptr):
+    return spmv_csr_mod.PreparedCsrSpmv(
+        data=data,
+        kernel_indices=indices,
+        kernel_indptr=indptr,
+        shape=template.shape,
+        n_rows=template.n_rows,
+        n_cols=template.n_cols,
+        block_nnz=template.block_nnz,
+        max_segments=template.max_segments,
+        max_row_nnz=template.max_row_nnz,
+        opt_buckets=template.opt_buckets,
+        transpose=template.transpose,
+        op=template.op,
+        index_fallback_policy=template.index_fallback_policy,
+    )
+
+
+def _materialize_csr_op_for_timing(data, indices, indptr, shape, op):
+    if op == "non":
+        return data, indices, indptr, shape
+    data_op = data
+    if op == "conj" and data.is_complex():
+        data_op = data.conj()
+        if hasattr(data_op, "resolve_conj"):
+            data_op = data_op.resolve_conj()
+    return spmv_csr_mod._transpose_csr_for_spmv(data_op, indices, indptr, shape)
+
+
+def _run_flagsparse_spmv_timed_op(prepared, data, indices, indptr, x, shape, op):
+    if op == "non":
+        return ast.flagsparse_spmv_csr(
+            x=x,
+            prepared=prepared,
+            return_time=False,
+        )
+    data_op, indices_op, indptr_op, _ = _materialize_csr_op_for_timing(
+        data, indices, indptr, shape, op
+    )
+    timed_prepared = _clone_csr_prepared_for_timed_op(
+        prepared, data_op, indices_op, indptr_op
+    )
+    return spmv_csr_mod._run_spmv_prepared_with_fallback(
+        timed_prepared, x, use_opt=False
+    )
+
+
 def _sparse_ref_backend_label(backend):
     mapping = {
         None: "N/A",
@@ -220,6 +295,112 @@ def _sparse_ref_backend_label(backend):
         "torch": "PyTorch",
     }
     return mapping.get(backend, str(backend))
+
+
+def _reference_dtype(dtype):
+    if dtype in (torch.float16, torch.bfloat16):
+        return torch.float32
+    if dtype == torch.float32:
+        return torch.float64
+    if dtype == torch.complex64:
+        return torch.complex128
+    return dtype
+
+
+def _cast_reference_output(y_ref, out_dtype):
+    return y_ref.to(out_dtype) if y_ref.dtype != out_dtype else y_ref
+
+
+def _pytorch_spmv_reference(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    out_dtype,
+    op="non",
+    return_compute=False,
+):
+    device = data.device
+    op = _normalize_op(op)
+    ref_dtype = _reference_dtype(out_dtype)
+    data_ref = data.to(ref_dtype)
+    x_ref = x.to(ref_dtype)
+    try:
+        csr_ref = torch.sparse_csr_tensor(
+            indptr.to(torch.int64),
+            indices.to(torch.int64),
+            data_ref,
+            size=shape,
+            device=device,
+        )
+        y_ref = _apply_torch_sparse_op(csr_ref, x_ref.unsqueeze(1), op)
+    except Exception:
+        n_rows = int(shape[0])
+        row_ind = torch.repeat_interleave(
+            torch.arange(n_rows, device=device, dtype=torch.int64),
+            indptr[1:] - indptr[:-1],
+        )
+        coo_ref = torch.sparse_coo_tensor(
+            torch.stack([row_ind, indices.to(torch.int64)]),
+            data_ref,
+            shape,
+            device=device,
+        ).coalesce()
+        y_ref = _apply_torch_sparse_op(coo_ref, x_ref.unsqueeze(1), op)
+    if return_compute:
+        return y_ref
+    return _cast_reference_output(y_ref, out_dtype)
+
+
+def _build_pytorch_spmv_reference_inputs(
+    data, indices, indptr, x, shape, out_dtype, op
+):
+    device = data.device
+    ref_dtype = _reference_dtype(out_dtype)
+    data_ref = data.to(ref_dtype)
+    x_ref_2d = x.to(ref_dtype).unsqueeze(1)
+    try:
+        matrix = torch.sparse_csr_tensor(
+            indptr.to(torch.int64),
+            indices.to(torch.int64),
+            data_ref,
+            size=shape,
+            device=device,
+        )
+        _apply_torch_sparse_op(matrix, x_ref_2d, op)
+        return matrix, x_ref_2d
+    except Exception:
+        n_rows = int(shape[0])
+        row_ind = torch.repeat_interleave(
+            torch.arange(n_rows, device=device, dtype=torch.int64),
+            indptr[1:] - indptr[:-1],
+        )
+        matrix = torch.sparse_coo_tensor(
+            torch.stack([row_ind, indices.to(torch.int64)]),
+            data_ref,
+            shape,
+            device=device,
+        ).coalesce()
+        return matrix, x_ref_2d
+
+
+def _cupy_csr_reference(data, indices, indptr, x, shape, out_dtype, op="non"):
+    import cupy as cp
+    import cupyx.scipy.sparse as cpx
+
+    op = _normalize_op(op)
+    ref_dtype = _reference_dtype(out_dtype)
+    data_ref = data.to(ref_dtype)
+    x_ref = x.to(ref_dtype)
+    data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data_ref))
+    ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
+    ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
+    x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x_ref))
+    A_csr_ref = cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
+    y_ref = _apply_cupy_sparse_op(A_csr_ref, x_cp, op)
+    y_ref_t = torch.utils.dlpack.from_dlpack(y_ref.toDlpack())
+    return _cast_reference_output(y_ref_t, out_dtype)
 
 
 def _tolerance(value_dtype):
@@ -277,25 +458,25 @@ def run_one_mtx(
     triton_ok_pt = False
     pt_error_reason = None
     try:
-        pytorch_op = lambda: ast_common._spmv_csr_ref_pytorch(
+        pt_matrix, pt_x_2d = _build_pytorch_spmv_reference_inputs(
             data,
             indices,
             indptr,
             x,
             shape,
-            out_dtype=value_dtype,
+            value_dtype,
             op=op,
-            reference_compute_dtype=True,
         )
-        pt_ref_y = pytorch_op()
+        pt_ref_compute_y = _apply_torch_sparse_op(pt_matrix, pt_x_2d, op)
+        pt_ref_y = _cast_reference_output(pt_ref_compute_y, value_dtype)
         start_ev = torch.cuda.Event(enable_timing=True)
         end_ev = torch.cuda.Event(enable_timing=True)
         for _ in range(warmup):
-            _ = pytorch_op()
+            _ = _apply_torch_sparse_op(pt_matrix, pt_x_2d, op)
         torch.cuda.synchronize()
         start_ev.record()
         for _ in range(iters):
-            _ = pytorch_op()
+            _ = _apply_torch_sparse_op(pt_matrix, pt_x_2d, op)
         end_ev.record()
         torch.cuda.synchronize()
         pytorch_ms = start_ev.elapsed_time(end_ev) / iters
@@ -554,6 +735,8 @@ def _print_mtx_row(r):
         f"{_fmt_speedup(csr_ms, triton_ms):>7} {_fmt_speedup(pt_ms, triton_ms):>7} "
         f"{pt_status:>6} {cu_status:>6} {err_pt_str:>10} {err_cu_str:>10} {backend_label:>12}"
     )
+    if r.get("cusparse_unavailable_reason") and csr_ms is None:
+        print(f"  sparse-ref: {r['cusparse_unavailable_reason']}")
 
 
 def print_mtx_results(results, value_dtype, index_dtype):
