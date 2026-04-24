@@ -1200,6 +1200,108 @@ def _torch_sparse_to_csr(tensor):
     raise TypeError(f"Unsupported sparse layout: {tensor.layout}")
 
 
+def _spgemm_csr_reference(
+    a_data,
+    a_indices,
+    a_indptr,
+    a_shape,
+    b_data,
+    b_indices,
+    b_indptr,
+    b_shape,
+    return_metadata=False,
+):
+    a_t = _to_torch_csr(a_data, a_indices, a_indptr, a_shape)
+    b_t = _to_torch_csr(b_data, b_indices, b_indptr, b_shape)
+    fallback_reason = None
+    pytorch_sparse_format = "CSR"
+    try:
+        reference_sparse = torch.sparse.mm(a_t, b_t)
+    except Exception as exc:
+        fallback_reason = f"CSR fallback: {exc}"
+        pytorch_sparse_format = "COO"
+        reference_sparse = torch.sparse.mm(
+            a_t.to_sparse_coo().coalesce(),
+            b_t.to_sparse_coo().coalesce(),
+        )
+    reference = _torch_sparse_to_csr(reference_sparse)
+    metadata = {
+        "backend": "torch",
+        "fallback_reason": fallback_reason,
+        "pytorch_sparse_format": pytorch_sparse_format,
+    }
+    if return_metadata:
+        return reference, metadata
+    return reference
+
+
+def _spgemm_csr_sparse_ref_backend():
+    if _is_rocm_runtime():
+        return None, (
+            "hipSPARSE/rocSPARSE direct SpGEMM sparse reference is not implemented "
+            "in this first batch"
+        )
+    if cp is None or cpx_sparse is None:
+        return None, "CuPy/cuSPARSE is not available"
+    return "cupy_cusparse", None
+
+
+def _benchmark_spgemm_csr_sparse_ref(
+    a_data,
+    a_indices,
+    a_indptr,
+    a_shape,
+    b_data,
+    b_indices,
+    b_indptr,
+    b_shape,
+    warmup,
+    iters,
+    value_dtype,
+):
+    backend, reason = _spgemm_csr_sparse_ref_backend()
+    result = {
+        "backend": backend,
+        "values": None,
+        "ms": None,
+        "reason": reason,
+    }
+    if backend is None:
+        return result
+
+    a_cp = cpx_sparse.csr_matrix(
+        (
+            _cupy_from_torch(a_data),
+            _cupy_from_torch(a_indices.to(torch.int64)),
+            _cupy_from_torch(a_indptr.to(torch.int64)),
+        ),
+        shape=a_shape,
+    )
+    b_cp = cpx_sparse.csr_matrix(
+        (
+            _cupy_from_torch(b_data),
+            _cupy_from_torch(b_indices.to(torch.int64)),
+            _cupy_from_torch(b_indptr.to(torch.int64)),
+        ),
+        shape=b_shape,
+    )
+    c_cp, ms = _benchmark_cuda_op(lambda: a_cp @ b_cp, warmup=warmup, iters=iters)
+    c_coo = c_cp.tocoo()
+    rows = _torch_from_cupy(c_coo.row).to(torch.int64)
+    cols = _torch_from_cupy(c_coo.col).to(torch.int64)
+    vals = _torch_from_cupy(c_coo.data).to(value_dtype)
+    c_t = torch.sparse_coo_tensor(
+        torch.stack([rows, cols]),
+        vals,
+        (int(a_shape[0]), int(b_shape[1])),
+        device=a_data.device,
+    ).coalesce()
+    result["values"] = _torch_sparse_to_csr(c_t)
+    result["ms"] = ms
+    result["reason"] = None
+    return result
+
+
 def benchmark_spgemm_case(
     n_rows=1024,
     n_inner=1024,
@@ -1229,54 +1331,69 @@ def benchmark_spgemm_case(
     op = lambda: flagsparse_spgemm_csr(prepared=prepared, return_time=False)
     triton_result, triton_ms = _benchmark_cuda_op(op, warmup=warmup, iters=iters)
 
+    pytorch_result, ref_meta = _spgemm_csr_reference(
+        a_data,
+        a_indices,
+        a_indptr,
+        (n_rows, n_inner),
+        b_data,
+        b_indices,
+        b_indptr,
+        (n_inner, n_cols),
+        return_metadata=True,
+    )
     a_t = _to_torch_csr(a_data, a_indices, a_indptr, (n_rows, n_inner))
     b_t = _to_torch_csr(b_data, b_indices, b_indptr, (n_inner, n_cols))
 
-    pytorch_reason = None
+    pytorch_reason = ref_meta["fallback_reason"]
     pytorch_ms = None
-    pytorch_result = None
     try:
-        torch_op = lambda: torch.sparse.mm(a_t, b_t)
+        if ref_meta["pytorch_sparse_format"] == "CSR":
+            torch_op = lambda: torch.sparse.mm(a_t, b_t)
+        else:
+            a_coo = a_t.to_sparse_coo().coalesce()
+            b_coo = b_t.to_sparse_coo().coalesce()
+            torch_op = lambda: torch.sparse.mm(a_coo, b_coo)
         pytorch_sparse, pytorch_ms = _benchmark_cuda_op(torch_op, warmup=warmup, iters=iters)
         pytorch_result = _torch_sparse_to_csr(pytorch_sparse)
     except Exception as exc:
-        pytorch_reason = str(exc)
-        a_coo = a_t.to_sparse_coo().coalesce()
-        b_coo = b_t.to_sparse_coo().coalesce()
-        torch_op = lambda: torch.sparse.mm(a_coo, b_coo)
-        pytorch_sparse, pytorch_ms = _benchmark_cuda_op(torch_op, warmup=warmup, iters=iters)
-        pytorch_result = _torch_sparse_to_csr(pytorch_sparse)
+        pytorch_reason = (
+            str(exc) if pytorch_reason is None else f"{pytorch_reason}; timing: {exc}"
+        )
 
     triton_summary = _spgemm_pairwise_summary(triton_result, pytorch_result, value_dtype)
 
     cusparse_ms = None
     cusparse_reason = None
     cusparse_match = None
+    sparse_ref_backend = None
     if run_cusparse:
-        if cp is None or cpx_sparse is None:
-            cusparse_reason = "CuPy/cuSPARSE is not available"
-        else:
-            try:
-                a_cp = cpx_sparse.csr_matrix(
-                    (_cupy_from_torch(a_data), _cupy_from_torch(a_indices.to(torch.int64)), _cupy_from_torch(a_indptr.to(torch.int64))),
-                    shape=(n_rows, n_inner),
-                )
-                b_cp = cpx_sparse.csr_matrix(
-                    (_cupy_from_torch(b_data), _cupy_from_torch(b_indices.to(torch.int64)), _cupy_from_torch(b_indptr.to(torch.int64))),
-                    shape=(n_inner, n_cols),
-                )
-                c_cp, cusparse_ms = _benchmark_cuda_op(lambda: a_cp @ b_cp, warmup=warmup, iters=iters)
-                c_coo = c_cp.tocoo()
-                rows = _torch_from_cupy(c_coo.row).to(torch.int64)
-                cols = _torch_from_cupy(c_coo.col).to(torch.int64)
-                vals = _torch_from_cupy(c_coo.data).to(value_dtype)
-                c_t = torch.sparse_coo_tensor(
-                    torch.stack([rows, cols]), vals, (n_rows, n_cols), device=device
-                ).coalesce()
-                c_ref = _torch_sparse_to_csr(c_t)
-                cusparse_match = _spgemm_pairwise_summary(triton_result, c_ref, value_dtype)["match"]
-            except Exception as exc:
-                cusparse_reason = str(exc)
+        try:
+            sparse_ref = _benchmark_spgemm_csr_sparse_ref(
+                a_data,
+                a_indices,
+                a_indptr,
+                (n_rows, n_inner),
+                b_data,
+                b_indices,
+                b_indptr,
+                (n_inner, n_cols),
+                warmup=warmup,
+                iters=iters,
+                value_dtype=value_dtype,
+            )
+            sparse_ref_backend = sparse_ref["backend"]
+            if sparse_ref_backend is not None:
+                cusparse_ms = sparse_ref["ms"]
+                cusparse_match = _spgemm_pairwise_summary(
+                    triton_result,
+                    sparse_ref["values"],
+                    value_dtype,
+                )["match"]
+            else:
+                cusparse_reason = sparse_ref["reason"]
+        except Exception as exc:
+            cusparse_reason = str(exc)
 
     return {
         "parameters": {
@@ -1304,7 +1421,10 @@ def benchmark_spgemm_case(
         },
         "backend_status": {
             "pytorch_unavailable_reason": pytorch_reason,
+            "pytorch_sparse_format": ref_meta["pytorch_sparse_format"],
             "cusparse_unavailable_reason": cusparse_reason,
+            "sparse_ref_backend": ref_meta["backend"] if sparse_ref_backend is None else sparse_ref_backend,
+            "sparse_ref_fallback_reason": cusparse_reason if sparse_ref_backend is None else None,
         },
         "samples": {
             "triton": triton_result,

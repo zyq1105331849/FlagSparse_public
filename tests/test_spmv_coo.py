@@ -1,24 +1,25 @@
-"""SpMV COO tests: float32/float64 + int32, synthetic + optional .mtx, compare FlagSparse vs PyTorch/CuPy."""
+"""SpMV COO tests: synthetic + optional .mtx, compare FlagSparse vs active sparse references."""
+
 import argparse
-import glob
 import csv
+import glob
+import importlib
 import math
 import os
 
-import torch
 import flagsparse as fs
-try:
-    import cupy as cp
-    import cupyx.scipy.sparse as cpx_sparse
-except Exception:
-    cp = None
-    cpx_sparse = None
+import torch
+
 
 VALUE_DTYPES = [torch.float32, torch.float64]
 INDEX_DTYPE = torch.int32
 TEST_SIZES = [(512, 512), (1024, 1024), (2048, 2048)]
 WARMUP = 10
 ITERS = 50
+COO_ATOMIC_BLOCK = 256
+COO_ATOMIC_WARPS = 4
+COO_SEG_BLOCK_INNER = 128
+ast_common = importlib.import_module("flagsparse.sparse_operations._common")
 
 
 def _dtype_name(dtype):
@@ -39,12 +40,6 @@ def _fmt_err(v):
     return "N/A" if v is None else f"{v:.2e}"
 
 
-def _status_str(ok, available):
-    if not available:
-        return "N/A"
-    return "PASS" if ok else "FAIL"
-
-
 def _allclose_error_ratio(actual, reference, atol, rtol):
     if actual.numel() == 0:
         return 0.0
@@ -53,63 +48,29 @@ def _allclose_error_ratio(actual, reference, atol, rtol):
     return float(torch.max(diff / tol).item())
 
 
-def _reference_dtype(dtype):
-    return torch.float64 if dtype == torch.float32 else dtype
-
-
-def _pytorch_coo_reference(data, row, col, x, shape, out_dtype):
-    ref_dtype = _reference_dtype(out_dtype)
-    data_ref = data.to(ref_dtype)
-    x_ref = x.to(ref_dtype)
-    coo_ref = torch.sparse_coo_tensor(
-        torch.stack([row.to(torch.int64), col.to(torch.int64)]),
-        data_ref,
-        shape,
-        device=data.device,
-    ).coalesce()
-    y_ref = torch.sparse.mm(coo_ref, x_ref.unsqueeze(1)).squeeze(1)
-    return y_ref.to(out_dtype) if ref_dtype != out_dtype else y_ref
-
-
-def _cupy_coo_reference(data, row, col, x, shape, out_dtype):
-    ref_dtype = _reference_dtype(out_dtype)
-    data_ref = data.to(ref_dtype)
-    x_ref = x.to(ref_dtype)
-    data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data_ref))
-    row_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(row.to(torch.int64)))
-    col_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(col.to(torch.int64)))
-    x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x_ref))
-    A_cp_ref = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
-    y_ref = A_cp_ref @ x_cp
-    y_ref_t = torch.utils.dlpack.from_dlpack(y_ref.toDlpack())
-    return y_ref_t.to(out_dtype) if ref_dtype != out_dtype else y_ref_t
-
-
 def _dense_to_coo(A):
     rows, cols = A.nonzero(as_tuple=True)
     data = A[rows, cols]
     return data, rows, cols
 
 
-COO_SEP = "-" * 172
+def _sparse_ref_backend_label(backend):
+    mapping = {
+        None: "N/A",
+        "cupy_cusparse": "cuSPARSE",
+        "torch": "PyTorch",
+    }
+    return mapping.get(backend, str(backend))
+
+
+COO_SEP = "-" * 188
 COO_HEADER = (
     f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10}  "
     f"{'Base(ms)':>9} {'Opt(ms)':>9} {'PT(ms)':>9} {'CU(ms)':>9}  "
     f"{'Opt/Base':>8} {'Opt/PT':>8} {'Opt/CU':>8}  "
-    f"{'Err(Base)':>10} {'Err(Opt)':>10} {'Status':>6}"
+    f"{'Err(Base)':>10} {'Err(Opt)':>10} {'Status':>6} {'Backend':>12}"
 )
 
-
-def _spd(num, den):
-    if num is None or den is None or den <= 0:
-        return "N/A"
-    return f"{num / den:.2f}x"
-
-
-# FlagSparse native COO SpMV: see sparse_operations.spmv_coo
-COO_ATOMIC_BLOCK = 256
-COO_ATOMIC_WARPS = 4
-COO_SEG_BLOCK_INNER = 128
 
 def _timed_flagsparse_coo(prepared, x, warmup, iters):
     op = lambda: fs.flagsparse_spmv_coo(
@@ -120,138 +81,27 @@ def _timed_flagsparse_coo(prepared, x, warmup, iters):
         block_size=COO_ATOMIC_BLOCK,
         num_warps=COO_ATOMIC_WARPS,
     )
-    y = op()
-    torch.cuda.synchronize()
-    for _ in range(warmup):
-        op()
-    torch.cuda.synchronize()
-    e0 = torch.cuda.Event(True)
-    e1 = torch.cuda.Event(True)
-    e0.record()
-    for _ in range(iters):
-        y = op()
-    e1.record()
-    torch.cuda.synchronize()
-    return y, e0.elapsed_time(e1) / iters
+    return ast_common._benchmark_cuda_op(op, warmup=warmup, iters=iters)
 
 
-def run_synthetic():
-    if not torch.cuda.is_available():
-        print("CUDA is not available. Please run on a GPU-enabled system.")
-        return
-    device = torch.device("cuda")
-    print("=" * 172)
-    print("FLAGSPARSE SpMV COO BENCHMARK (synthetic dense -> COO). All backends stay COO.")
-    print("=" * 172)
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"Warmup: {WARMUP} | Iters: {ITERS}")
-    print()
+def _timed_pytorch_coo_reference(data, row, col, x, shape, out_dtype, warmup, iters):
+    op = lambda: ast_common._spmv_coo_ref_pytorch(
+        data,
+        row,
+        col,
+        x,
+        shape,
+        out_dtype=out_dtype,
+        op="non",
+        reference_compute_dtype=True,
+    )
+    return ast_common._benchmark_cuda_op(op, warmup=warmup, iters=iters)
 
-    for dtype in VALUE_DTYPES:
-        atol, rtol = _tol_for_dtype(dtype)
-        print(COO_SEP)
-        print(f"dtype: {_dtype_name(dtype)}  index_dtype: int32")
-        print(COO_SEP)
-        print(
-            "FlagSparse: prepare_spmv_coo + Triton COO SpMV (no CSR). "
-            "Base(ms) = row-run (seg) kernel; Opt(ms) = NNZ atomic kernel."
-        )
-        print(
-            "PyTorch/CuPy: COO sparse.mm / cupyx coo_matrix @ x (no tocsr). "
-            "Err vs PyTorch COO reference in fp64 (fp32 casts back)."
-        )
-        print(COO_SEP)
-        print(
-            f"{'M':>6} {'N':>6} {'NNZ':>10}  "
-            f"{'Base(ms)':>9} {'Opt(ms)':>9} {'PT(ms)':>9} {'CU(ms)':>9}  "
-            f"{'Opt/Base':>8} {'Opt/PT':>8} {'Opt/CU':>8}  "
-            f"{'Err(Base)':>10} {'Err(Opt)':>10} {'Status':>6}"
-        )
-        print(COO_SEP)
-        for m, n in TEST_SIZES:
-            A = torch.randn(m, n, dtype=dtype, device=device)
-            A *= (torch.rand_like(A) < 0.1)
-            data, row, col = _dense_to_coo(A)
-            nnz = int(data.numel())
-            x = torch.randn(n, dtype=dtype, device=device)
-            prepared_seg = fs.prepare_spmv_coo(
-                data, row, col, (m, n), sort_by_row=True
-            )
-            prepared_at = fs.prepare_spmv_coo(
-                data, row, col, (m, n), sort_by_row=False
-            )
-            y_base, base_ms = _timed_flagsparse_coo(
-                prepared_seg, x, WARMUP, ITERS
-            )
-            y_opt, opt_ms = _timed_flagsparse_coo(
-                prepared_at, x, WARMUP, ITERS
-            )
-            y_ref = _pytorch_coo_reference(data, row, col, x, (m, n), dtype)
-            err_base = _allclose_error_ratio(y_base, y_ref, atol, rtol)
-            err_opt = _allclose_error_ratio(y_opt, y_ref, atol, rtol)
-            st = (
-                "PASS"
-                if (
-                    (not math.isnan(err_base))
-                    and (not math.isnan(err_opt))
-                    and err_base <= 1.0
-                    and err_opt <= 1.0
-                )
-                else "FAIL"
-            )
-            if nnz > 0:
-                coo = torch.sparse_coo_tensor(
-                    torch.stack([row.to(torch.int64), col.to(torch.int64)]),
-                    data,
-                    (m, n),
-                    device=device,
-                ).coalesce()
-                torch.cuda.synchronize()
-                for _ in range(WARMUP):
-                    _ = torch.sparse.mm(coo, x.unsqueeze(1)).squeeze(1)
-                torch.cuda.synchronize()
-                e0 = torch.cuda.Event(True)
-                e1 = torch.cuda.Event(True)
-                e0.record()
-                for _ in range(ITERS):
-                    y_pt = torch.sparse.mm(coo, x.unsqueeze(1)).squeeze(1)
-                e1.record()
-                torch.cuda.synchronize()
-                pt_ms = e0.elapsed_time(e1) / ITERS
-            else:
-                y_pt = torch.zeros(m, dtype=dtype, device=device)
-                pt_ms = 0.0
-            cu_ms = None
-            if cp is not None and cpx_sparse is not None:
-                try:
-                    data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-                    row_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(row.to(torch.int64)))
-                    col_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(col.to(torch.int64)))
-                    A_cp = cpx_sparse.coo_matrix(
-                        (data_cp, (row_cp, col_cp)), shape=(m, n)
-                    )
-                    x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x))
-                    for _ in range(WARMUP):
-                        _ = A_cp @ x_cp
-                    cp.cuda.runtime.deviceSynchronize()
-                    c0 = cp.cuda.Event()
-                    c1 = cp.cuda.Event()
-                    c0.record()
-                    for _ in range(ITERS):
-                        y_cu = A_cp @ x_cp
-                    c1.record()
-                    c1.synchronize()
-                    cu_ms = cp.cuda.get_elapsed_time(c0, c1) / ITERS
-                except Exception:
-                    cu_ms = None
-            print(
-                f"{m:>6} {n:>6} {nnz:>10}  "
-                f"{_fmt_ms(base_ms):>9} {_fmt_ms(opt_ms):>9} {_fmt_ms(pt_ms):>9} {_fmt_ms(cu_ms):>9}  "
-                f"{_spd(base_ms, opt_ms):>8} {_spd(pt_ms, opt_ms):>8} {_spd(cu_ms, opt_ms):>8}  "
-                f"{_fmt_err(err_base):>10} {_fmt_err(err_opt):>10} {st:>6}"
-            )
-        print(COO_SEP)
-        print()
+
+def _tol_for_dtype(dtype):
+    if dtype == torch.float32:
+        return 1e-4, 1e-2
+    return 1e-12, 1e-10
 
 
 def _load_mtx_to_coo_torch(file_path, dtype=torch.float32, device=None):
@@ -287,9 +137,9 @@ def _load_mtx_to_coo_torch(file_path, dtype=torch.float32, device=None):
         raise ValueError(f"Cannot parse .mtx header: {file_path}")
     n_rows, n_cols, nnz = header_info
 
-    is_pattern = (mm_field == "pattern")
+    is_pattern = mm_field == "pattern"
     is_symmetric = mm_symmetry in ("symmetric", "hermitian")
-    is_skew = (mm_symmetry == "skew-symmetric")
+    is_skew = mm_symmetry == "skew-symmetric"
 
     rows_host = []
     cols_host = []
@@ -320,21 +170,120 @@ def _load_mtx_to_coo_torch(file_path, dtype=torch.float32, device=None):
     return vals, rows, cols, (n_rows, n_cols)
 
 
-def _tol_for_dtype(dtype):
-    if dtype == torch.float32:
-        return 1e-4, 1e-2
-    return 1e-12, 1e-10
+def _run_one_case(data, row, col, shape, x, dtype, name):
+    atol, rtol = _tol_for_dtype(dtype)
+    prepared_seg = fs.prepare_spmv_coo(data, row, col, shape, sort_by_row=True)
+    prepared_at = fs.prepare_spmv_coo(data, row, col, shape, sort_by_row=False)
+    y_base, base_ms = _timed_flagsparse_coo(prepared_seg, x, WARMUP, ITERS)
+    y_opt, opt_ms = _timed_flagsparse_coo(prepared_at, x, WARMUP, ITERS)
+    y_ref, ref_meta = ast_common._spmv_coo_reference(
+        data,
+        row,
+        col,
+        x,
+        shape,
+        out_dtype=dtype,
+        op="non",
+        reference_compute_dtype=True,
+        return_metadata=True,
+    )
+    _pt_values, pt_ms = _timed_pytorch_coo_reference(data, row, col, x, shape, dtype, WARMUP, ITERS)
+
+    err_base = _allclose_error_ratio(y_base, y_ref, atol, rtol)
+    err_opt = _allclose_error_ratio(y_opt, y_ref, atol, rtol)
+    err_pt = _allclose_error_ratio(y_opt, y_ref, atol, rtol)
+    triton_ok_pt = (not math.isnan(err_pt)) and err_pt <= 1.0
+
+    sparse_ref = ast_common._benchmark_spmv_coo_sparse_ref(
+        data,
+        row,
+        col,
+        x,
+        shape,
+        warmup=WARMUP,
+        iters=ITERS,
+        op="non",
+    )
+    sparse_ref_backend = sparse_ref["backend"]
+    cu_ms = sparse_ref["ms"]
+    err_cu = None
+    triton_ok_cu = False
+    if sparse_ref_backend is not None:
+        err_cu = _allclose_error_ratio(y_opt, sparse_ref["values"], atol, rtol)
+        triton_ok_cu = (not math.isnan(err_cu)) and err_cu <= 1.0
+
+    status = (
+        "PASS"
+        if (
+            (not math.isnan(err_base))
+            and (not math.isnan(err_opt))
+            and err_base <= 1.0
+            and err_opt <= 1.0
+        )
+        else "FAIL"
+    )
+    return {
+        "matrix": name,
+        "n_rows": int(shape[0]),
+        "n_cols": int(shape[1]),
+        "nnz": int(data.numel()),
+        "base_ms": base_ms,
+        "opt_ms": opt_ms,
+        "triton_ms": opt_ms,
+        "cusparse_ms": cu_ms,
+        "pytorch_ms": pt_ms,
+        "csc_ms": None,
+        "pt_status": "PASS" if triton_ok_pt else "FAIL",
+        "cu_status": "PASS" if triton_ok_cu else "N/A",
+        "status": status,
+        "err_base": err_base,
+        "err_opt": err_opt,
+        "err_pt": err_pt,
+        "err_cu": err_cu,
+        "sparse_ref_backend": ref_meta["backend"] if sparse_ref_backend is None else sparse_ref_backend,
+        "sparse_ref_reason": sparse_ref["reason"] if sparse_ref_backend is None else None,
+    }
 
 
-# Dense PyTorch reference for SpSV can OOM on large matrices.
-DENSE_REF_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+def _print_row(row):
+    name = row["matrix"][:27]
+    backend_label = _sparse_ref_backend_label(row.get("sparse_ref_backend"))
+    print(
+        f"{name:<28} {row['n_rows']:>7} {row['n_cols']:>7} {row['nnz']:>10}  "
+        f"{_fmt_ms(row['base_ms']):>9} {_fmt_ms(row['opt_ms']):>9} {_fmt_ms(row['pytorch_ms']):>9} {_fmt_ms(row['cusparse_ms']):>9}  "
+        f"{_fmt_speedup(row['base_ms'], row['opt_ms']):>8} {_fmt_speedup(row['pytorch_ms'], row['opt_ms']):>8} {_fmt_speedup(row['cusparse_ms'], row['opt_ms']):>8}  "
+        f"{_fmt_err(row['err_base']):>10} {_fmt_err(row['err_opt']):>10} {row['status']:>6} {backend_label:>12}"
+    )
 
 
-def _allow_dense_pytorch_ref(shape, dtype):
-    n_rows, n_cols = shape
-    elem_bytes = torch.empty((), dtype=dtype).element_size()
-    dense_bytes = int(n_rows) * int(n_cols) * int(elem_bytes)
-    return dense_bytes <= DENSE_REF_MAX_BYTES
+def run_synthetic():
+    if not torch.cuda.is_available():
+        print("CUDA is not available. Please run on a GPU-enabled system.")
+        return
+    device = torch.device("cuda")
+    print("=" * 188)
+    print("FLAGSPARSE SpMV COO BENCHMARK (synthetic dense -> COO)")
+    print("=" * 188)
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Warmup: {WARMUP} | Iters: {ITERS}")
+    print("References: PyTorch sparse.mm + active sparse reference backend.")
+    print()
+
+    for dtype in VALUE_DTYPES:
+        print(COO_SEP)
+        print(f"dtype: {_dtype_name(dtype)}  index_dtype: int32")
+        print(COO_SEP)
+        print(COO_HEADER)
+        print(COO_SEP)
+        for m, n in TEST_SIZES:
+            A = torch.randn(m, n, dtype=dtype, device=device)
+            A *= torch.rand_like(A) < 0.1
+            data, row, col = _dense_to_coo(A)
+            x = torch.randn(n, dtype=dtype, device=device)
+            row_out = _run_one_case(data, row.to(INDEX_DTYPE), col.to(INDEX_DTYPE), (m, n), x, dtype, f"{m}x{n}")
+            _print_row(row_out)
+        print(COO_SEP)
+        print()
 
 
 def run_all_dtypes_coo_csv(mtx_paths, csv_path):
@@ -344,141 +293,33 @@ def run_all_dtypes_coo_csv(mtx_paths, csv_path):
     device = torch.device("cuda")
     rows_out = []
     for dtype in VALUE_DTYPES:
-        atol, rtol = _tol_for_dtype(dtype)
-        print("=" * 172)
+        print("=" * 188)
         print(f"Value dtype: {_dtype_name(dtype)}  |  Index dtype: int32")
-        print("Input: MatrixMarket → COO. FlagSparse: COO Triton only (seg + atomic), no CSR.")
-        print("PyTorch = COO sparse.mm; CuPy = COO matvec (coo_matrix @ x, no tocsr).")
-        print(
-            "Base(ms) = FlagSparse COO row-run (seg); Opt(ms) = FlagSparse COO NNZ atomic; "
-            "PT/CU = COO baselines."
-        )
-        print(
-            f"prepare_spmv_coo once per variant + {WARMUP} warmup + "
-            f"{ITERS} CUDA-event-averaged SpMV per backend."
-        )
+        print("Input: MatrixMarket -> COO. FlagSparse stays COO; references come from shared sparse-ref helpers.")
         print(COO_SEP)
         print(COO_HEADER)
         print(COO_SEP)
         for path in mtx_paths:
             try:
-                data, row, col, shape = _load_mtx_to_coo_torch(
-                    path, dtype=dtype, device=device
+                data, row, col, shape = _load_mtx_to_coo_torch(path, dtype=dtype, device=device)
+                x = torch.randn(shape[1], dtype=dtype, device=device)
+                row_out = _run_one_case(
+                    data,
+                    row.to(INDEX_DTYPE),
+                    col.to(INDEX_DTYPE),
+                    shape,
+                    x,
+                    dtype,
+                    os.path.basename(path),
                 )
-                m, n = shape
-                x = torch.randn(n, dtype=dtype, device=device)
-                prepared_seg = fs.prepare_spmv_coo(
-                    data, row, col, shape, sort_by_row=True
-                )
-                prepared_at = fs.prepare_spmv_coo(
-                    data, row, col, shape, sort_by_row=False
-                )
-                y_base, base_ms = _timed_flagsparse_coo(
-                    prepared_seg, x, WARMUP, ITERS
-                )
-                y_opt, opt_ms = _timed_flagsparse_coo(
-                    prepared_at, x, WARMUP, ITERS
-                )
-                y_ref = _pytorch_coo_reference(data, row, col, x, shape, dtype)
-                err_base = _allclose_error_ratio(y_base, y_ref, atol, rtol)
-                err_opt = _allclose_error_ratio(y_opt, y_ref, atol, rtol)
-                err_pt = None
-                err_cu = None
-                opt_ok = (
-                    (not math.isnan(err_base))
-                    and (not math.isnan(err_opt))
-                    and err_base <= 1.0
-                    and err_opt <= 1.0
-                )
-                if data.numel() > 0:
-                    coo = torch.sparse_coo_tensor(
-                        torch.stack([row, col]),
-                        data,
-                        shape,
-                        device=device,
-                    ).coalesce()
-                    torch.cuda.synchronize()
-                    for _ in range(WARMUP):
-                        _ = torch.sparse.mm(coo, x.unsqueeze(1)).squeeze(1)
-                    torch.cuda.synchronize()
-                    e0 = torch.cuda.Event(True)
-                    e1 = torch.cuda.Event(True)
-                    e0.record()
-                    for _ in range(ITERS):
-                        y_pt = torch.sparse.mm(coo, x.unsqueeze(1)).squeeze(1)
-                    e1.record()
-                    torch.cuda.synchronize()
-                    pt_ms = e0.elapsed_time(e1) / ITERS
-                    err_pt = _allclose_error_ratio(y_opt, y_pt, atol, rtol)
-                else:
-                    pt_ms = 0.0
-                cu_ms = None
-                triton_ok_pt = False
-                triton_ok_cu = False
-                if cp is not None and cpx_sparse is not None:
-                    try:
-                        data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-                        row_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(row))
-                        col_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(col))
-                        A_cp = cpx_sparse.coo_matrix(
-                            (data_cp, (row_cp, col_cp)), shape=shape
-                        )
-                        x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x))
-                        for _ in range(WARMUP):
-                            _ = A_cp @ x_cp
-                        cp.cuda.runtime.deviceSynchronize()
-                        c0 = cp.cuda.Event()
-                        c1 = cp.cuda.Event()
-                        c0.record()
-                        for _ in range(ITERS):
-                            y_cu = A_cp @ x_cp
-                        c1.record()
-                        c1.synchronize()
-                        cu_ms = cp.cuda.get_elapsed_time(c0, c1) / ITERS
-                        y_cu_t = torch.utils.dlpack.from_dlpack(y_cu.toDlpack())
-                        err_cu = _allclose_error_ratio(y_opt, y_cu_t, atol, rtol)
-                        triton_ok_cu = (not math.isnan(err_cu)) and err_cu <= 1.0
-                    except Exception:
-                        cu_ms = None
-                        err_cu = None
-                if err_pt is not None:
-                    triton_ok_pt = (not math.isnan(err_pt)) and err_pt <= 1.0
-                status = "PASS" if opt_ok else "FAIL"
-                pt_status = _status_str(triton_ok_pt, err_pt is not None)
-                cu_status = _status_str(triton_ok_cu, err_cu is not None)
-                rows_out.append(
-                    {
-                        "matrix": os.path.basename(path),
-                        "value_dtype": _dtype_name(dtype),
-                        "index_dtype": "torch.int32",
-                        "n_rows": m,
-                        "n_cols": n,
-                        "nnz": int(data.numel()),
-                        "base_ms": base_ms,
-                        "opt_ms": opt_ms,
-                        "triton_ms": opt_ms,
-                        "cusparse_ms": cu_ms,
-                        "pytorch_ms": pt_ms,
-                        "csc_ms": None,
-                        "pt_status": pt_status,
-                        "cu_status": cu_status,
-                        "status": status,
-                        "err_base": err_base,
-                        "err_opt": err_opt,
-                        "err_pt": err_pt,
-                        "err_cu": err_cu,
-                    }
-                )
-                name = os.path.basename(path)[:27]
-                if len(os.path.basename(path)) > 27:
-                    name = name + "…"
-                print(
-                    f"{name:<28} {m:>7} {n:>7} {int(data.numel()):>10}  "
-                    f"{_fmt_ms(base_ms):>9} {_fmt_ms(opt_ms):>9} {_fmt_ms(pt_ms):>9} {_fmt_ms(cu_ms):>9}  "
-                    f"{_spd(base_ms, opt_ms):>8} {_spd(pt_ms, opt_ms):>8} {_spd(cu_ms, opt_ms):>8}  "
-                    f"{_fmt_err(err_base):>10} {_fmt_err(err_opt):>10} {status:>6}"
-                )
-            except Exception as e:
+                rows_out.append(row_out)
+                _print_row(row_out)
+            except Exception as exc:
+                print(f"{os.path.basename(path):<28} {'ERR':>7} {'ERR':>7} {'ERR':>10}  "
+                      f"{_fmt_ms(None):>9} {_fmt_ms(None):>9} {_fmt_ms(None):>9} {_fmt_ms(None):>9}  "
+                      f"{'N/A':>8} {'N/A':>8} {'N/A':>8}  "
+                      f"{_fmt_err(None):>10} {_fmt_err(None):>10} {'ERROR':>6} {'N/A':>12}")
+                print(f"  ERROR: {exc}")
                 rows_out.append(
                     {
                         "matrix": os.path.basename(path),
@@ -493,26 +334,19 @@ def run_all_dtypes_coo_csv(mtx_paths, csv_path):
                         "cusparse_ms": None,
                         "pytorch_ms": None,
                         "csc_ms": None,
+                        "pt_status": "N/A",
+                        "cu_status": "N/A",
                         "status": "ERROR",
                         "err_base": None,
                         "err_opt": None,
                         "err_pt": None,
                         "err_cu": None,
-                        "pt_status": "N/A",
-                        "cu_status": "N/A",
+                        "sparse_ref_backend": None,
+                        "sparse_ref_reason": str(exc),
                     }
                 )
-                name = os.path.basename(path)[:27]
-                if len(os.path.basename(path)) > 27:
-                    name = name + "…"
-                print(
-                    f"{name:<28} {'ERR':>7} {'ERR':>7} {'ERR':>10}  "
-                    f"{_fmt_ms(None):>9} {_fmt_ms(None):>9} {_fmt_ms(None):>9} {_fmt_ms(None):>9}  "
-                    f"{'N/A':>8} {'N/A':>8} {'N/A':>8}  "
-                    f"{_fmt_err(None):>10} {_fmt_err(None):>10} {'ERROR':>6}"
-                )
-                print(f"  ERROR: {e}")
         print(COO_SEP)
+
     fieldnames = [
         "matrix",
         "value_dtype",
@@ -533,12 +367,14 @@ def run_all_dtypes_coo_csv(mtx_paths, csv_path):
         "err_opt",
         "err_pt",
         "err_cu",
+        "sparse_ref_backend",
+        "sparse_ref_reason",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows_out:
-            w.writerow(r)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows_out:
+            writer.writerow({k: ("" if v is None else v) for k, v in row.items()})
     print(f"Wrote {len(rows_out)} rows to {csv_path}")
 
 

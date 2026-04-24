@@ -73,6 +73,11 @@ __all__ = (
     "_to_torch_tensor",
     "_to_backend_like",
     "_cusparse_baseline_skip_reason",
+    "_normalize_sparse_reference_op",
+    "_sparse_reference_compute_dtype",
+    "_cast_sparse_reference_output",
+    "_apply_torch_sparse_matmul_op",
+    "_apply_cupy_sparse_matmul_op",
     "_cupy_spmv_op_matrix",
     "_apply_cupy_spmv_op",
     "_spmv_csr_sparse_ref_backend",
@@ -82,6 +87,12 @@ __all__ = (
     "spmv_csr_ref_hipsparse",
     "_spmv_csr_reference",
     "_benchmark_spmv_csr_sparse_ref",
+    "_spmv_coo_sparse_ref_backend",
+    "_spmv_coo_reference_backend",
+    "_spmv_coo_ref_pytorch",
+    "_spmv_coo_ref_cupy",
+    "_spmv_coo_reference",
+    "_benchmark_spmv_coo_sparse_ref",
     "_build_random_dense",
     "_build_indices",
     "_build_random_csr",
@@ -255,6 +266,10 @@ def _normalize_spmv_reference_op(op):
     return mapping[op_code]
 
 
+def _normalize_sparse_reference_op(op):
+    return _normalize_spmv_reference_op(op)
+
+
 def _spmv_reference_compute_dtype(value_dtype):
     if value_dtype in (torch.float16, torch.bfloat16):
         return torch.float32
@@ -265,17 +280,33 @@ def _spmv_reference_compute_dtype(value_dtype):
     return value_dtype
 
 
+def _sparse_reference_compute_dtype(value_dtype):
+    return _spmv_reference_compute_dtype(value_dtype)
+
+
 def _cast_spmv_reference_output(y_ref, out_dtype):
     return y_ref.to(out_dtype) if y_ref.dtype != out_dtype else y_ref
 
 
-def _apply_torch_sparse_spmv_op(matrix, vector_2d, op):
-    op_name = _normalize_spmv_reference_op(op)
+def _cast_sparse_reference_output(y_ref, out_dtype):
+    return _cast_spmv_reference_output(y_ref, out_dtype)
+
+
+def _apply_torch_sparse_matmul_op(matrix, rhs, op):
+    op_name = _normalize_sparse_reference_op(op)
+    rhs_is_vector = rhs.ndim == 1
+    rhs_2d = rhs.unsqueeze(1) if rhs_is_vector else rhs
     if op_name == "non":
-        return torch.sparse.mm(matrix, vector_2d).squeeze(1)
-    if op_name == "trans":
-        return torch.sparse.mm(matrix.transpose(0, 1), vector_2d).squeeze(1)
-    return torch.sparse.mm(matrix.conj().transpose(0, 1), vector_2d).squeeze(1)
+        result = torch.sparse.mm(matrix, rhs_2d)
+    elif op_name == "trans":
+        result = torch.sparse.mm(matrix.transpose(0, 1), rhs_2d)
+    else:
+        result = torch.sparse.mm(matrix.conj().transpose(0, 1), rhs_2d)
+    return result.squeeze(1) if rhs_is_vector else result
+
+
+def _apply_torch_sparse_spmv_op(matrix, vector_2d, op):
+    return _apply_torch_sparse_matmul_op(matrix, vector_2d, op)
 
 
 def _cupy_spmv_op_matrix(matrix, op):
@@ -288,8 +319,12 @@ def _cupy_spmv_op_matrix(matrix, op):
     return matrix_conj.T
 
 
+def _apply_cupy_sparse_matmul_op(matrix, rhs, op):
+    return _cupy_spmv_op_matrix(matrix, op) @ rhs
+
+
 def _apply_cupy_spmv_op(matrix, vector, op):
-    return _cupy_spmv_op_matrix(matrix, op) @ vector
+    return _apply_cupy_sparse_matmul_op(matrix, vector, op)
 
 
 def _hipsparse_status_success(status):
@@ -502,6 +537,90 @@ def _spmv_csr_ref_cupy(
     matrix = cpx_sparse.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
     y_ref = _apply_cupy_spmv_op(matrix, x_cp, op_name)
     return _cast_spmv_reference_output(_torch_from_cupy(y_ref), out_dtype)
+
+
+def _spmv_coo_sparse_ref_backend(value_dtype, index_dtype, op="non"):
+    op_name = _normalize_sparse_reference_op(op)
+    if _is_rocm_runtime():
+        return None, (
+            "hipSPARSE COO SpMV direct sparse reference is not implemented in this "
+            f"first batch; fallback to PyTorch for op={op_name}"
+        )
+    skip_reason = _cusparse_baseline_skip_reason(value_dtype)
+    if skip_reason is not None:
+        return None, skip_reason
+    if cp is None or cpx_sparse is None:
+        return None, "CuPy/cuSPARSE is unavailable"
+    if value_dtype not in _CUPY_SPMV_SUPPORTED_VALUE_DTYPES:
+        return None, f"{value_dtype} is not supported by the CuPy sparse SpMV reference"
+    return "cupy_cusparse", None
+
+
+def _spmv_coo_reference_backend(value_dtype, index_dtype, op="non"):
+    sparse_backend, reason = _spmv_coo_sparse_ref_backend(value_dtype, index_dtype, op=op)
+    if sparse_backend is not None:
+        return sparse_backend, None
+    return "torch", reason
+
+
+def _spmv_coo_ref_pytorch(
+    data,
+    row,
+    col,
+    x,
+    shape,
+    out_dtype=None,
+    op="non",
+    return_compute=False,
+    reference_compute_dtype=False,
+):
+    out_dtype = data.dtype if out_dtype is None else out_dtype
+    if reference_compute_dtype:
+        compute_dtype = _sparse_reference_compute_dtype(out_dtype)
+    elif out_dtype in (torch.float16, torch.bfloat16):
+        compute_dtype = torch.float32
+    else:
+        compute_dtype = out_dtype
+    data_ref = data.to(compute_dtype)
+    x_ref = x.to(compute_dtype)
+    coo_ref = torch.sparse_coo_tensor(
+        torch.stack([row.to(torch.int64), col.to(torch.int64)]),
+        data_ref,
+        shape,
+        device=data.device,
+    ).coalesce()
+    y_ref = _apply_torch_sparse_matmul_op(coo_ref, x_ref, op)
+    if return_compute:
+        return y_ref
+    return _cast_sparse_reference_output(y_ref, out_dtype)
+
+
+def _spmv_coo_ref_cupy(
+    data,
+    row,
+    col,
+    x,
+    shape,
+    out_dtype=None,
+    op="non",
+    reference_compute_dtype=False,
+):
+    _require_cupy()
+    out_dtype = data.dtype if out_dtype is None else out_dtype
+    compute_dtype = (
+        _sparse_reference_compute_dtype(out_dtype)
+        if reference_compute_dtype
+        else out_dtype
+    )
+    data_ref = data.to(compute_dtype)
+    x_ref = x.to(compute_dtype)
+    data_cp = _cupy_from_torch(data_ref)
+    row_cp = _cupy_from_torch(row.to(torch.int64))
+    col_cp = _cupy_from_torch(col.to(torch.int64))
+    x_cp = _cupy_from_torch(x_ref)
+    matrix = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
+    y_ref = _apply_cupy_sparse_matmul_op(matrix, x_cp, op)
+    return _cast_sparse_reference_output(_torch_from_cupy(y_ref), out_dtype)
 
 
 def spmv_csr_ref_hipsparse(
@@ -816,6 +935,87 @@ def _benchmark_spmv_csr_sparse_ref(
         )
         _ = values_csc
         result["csc_ms"] = csc_ms
+    return result
+
+
+def _spmv_coo_reference(
+    data,
+    row,
+    col,
+    x,
+    shape,
+    out_dtype=None,
+    op="non",
+    reference_compute_dtype=False,
+    return_metadata=False,
+):
+    out_dtype = data.dtype if out_dtype is None else out_dtype
+    op_name = _normalize_sparse_reference_op(op)
+    backend, fallback_reason = _spmv_coo_reference_backend(
+        data.dtype, row.dtype, op=op_name
+    )
+    if backend == "cupy_cusparse":
+        result = _spmv_coo_ref_cupy(
+            data,
+            row,
+            col,
+            x,
+            shape,
+            out_dtype=out_dtype,
+            op=op_name,
+            reference_compute_dtype=reference_compute_dtype,
+        )
+    else:
+        result = _spmv_coo_ref_pytorch(
+            data,
+            row,
+            col,
+            x,
+            shape,
+            out_dtype=out_dtype,
+            op=op_name,
+            reference_compute_dtype=reference_compute_dtype,
+        )
+    metadata = {"backend": backend, "fallback_reason": fallback_reason}
+    if return_metadata:
+        return result, metadata
+    return result
+
+
+def _benchmark_spmv_coo_sparse_ref(
+    data,
+    row,
+    col,
+    x,
+    shape,
+    warmup,
+    iters,
+    op="non",
+):
+    op_name = _normalize_sparse_reference_op(op)
+    backend, reason = _spmv_coo_sparse_ref_backend(data.dtype, row.dtype, op=op_name)
+    result = {
+        "backend": backend,
+        "values": None,
+        "ms": None,
+        "reason": reason,
+    }
+    if backend is None:
+        return result
+
+    data_cp = _cupy_from_torch(data)
+    row_cp = _cupy_from_torch(row.to(torch.int64))
+    col_cp = _cupy_from_torch(col.to(torch.int64))
+    x_cp = _cupy_from_torch(x)
+    matrix = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
+    values_cp, ms = _benchmark_cuda_op(
+        lambda: _apply_cupy_sparse_matmul_op(matrix, x_cp, op_name),
+        warmup=warmup,
+        iters=iters,
+    )
+    result["values"] = _torch_from_cupy(values_cp)
+    result["ms"] = ms
+    result["reason"] = None
     return result
 
 

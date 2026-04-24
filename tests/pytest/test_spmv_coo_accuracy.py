@@ -8,6 +8,7 @@ from flagsparse import (
     prepare_spmv_coo_tocsr,
 )
 import flagsparse.sparse_operations.spmv_coo as spmv_coo_mod
+import flagsparse.sparse_operations._common as common_mod
 
 from tests.pytest.param_shapes import (
     SPMV_COO_DTYPES,
@@ -16,7 +17,7 @@ from tests.pytest.param_shapes import (
 )
 
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+CUDA_REQUIRED = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 _TOCSR_DTYPES = (torch.float32, torch.float64)
@@ -89,6 +90,67 @@ def _assert_close(actual, expected, dtype):
     assert torch.allclose(actual.to(ref_dtype), expected.to(ref_dtype), rtol=rtol, atol=atol)
 
 
+def test_spmv_coo_reference_dispatch_falls_back_to_torch_on_rocm(monkeypatch):
+    data = torch.tensor([2.0], dtype=torch.float32)
+    row = torch.tensor([0], dtype=torch.int32)
+    col = torch.tensor([0], dtype=torch.int32)
+    x = torch.tensor([3.0], dtype=torch.float32)
+    state = {"called": False}
+
+    def fake_torch_ref(*args, **kwargs):
+        state["called"] = True
+        return torch.tensor([6.0], dtype=torch.float32)
+
+    monkeypatch.setattr(common_mod, "_IS_ROCM_RUNTIME", True, raising=False)
+    monkeypatch.setattr(common_mod, "_spmv_coo_ref_pytorch", fake_torch_ref)
+
+    out, metadata = common_mod._spmv_coo_reference(
+        data,
+        row,
+        col,
+        x,
+        (1, 1),
+        return_metadata=True,
+    )
+
+    assert state["called"]
+    assert torch.equal(out, torch.tensor([6.0], dtype=torch.float32))
+    assert metadata["backend"] == "torch"
+    assert "hipSPARSE COO SpMV direct sparse reference is not implemented" in metadata["fallback_reason"]
+
+
+def test_spmv_coo_reference_dispatch_prefers_cupy_off_rocm(monkeypatch):
+    data = torch.tensor([2.0], dtype=torch.float32)
+    row = torch.tensor([0], dtype=torch.int32)
+    col = torch.tensor([0], dtype=torch.int32)
+    x = torch.tensor([3.0], dtype=torch.float32)
+    state = {"called": False}
+
+    def fake_cupy_ref(*args, **kwargs):
+        state["called"] = True
+        return torch.tensor([7.0], dtype=torch.float32)
+
+    monkeypatch.setattr(common_mod, "_IS_ROCM_RUNTIME", False, raising=False)
+    monkeypatch.setattr(common_mod, "cp", object(), raising=False)
+    monkeypatch.setattr(common_mod, "cpx_sparse", object(), raising=False)
+    monkeypatch.setattr(common_mod, "_spmv_coo_ref_cupy", fake_cupy_ref)
+
+    out, metadata = common_mod._spmv_coo_reference(
+        data,
+        row,
+        col,
+        x,
+        (1, 1),
+        return_metadata=True,
+    )
+
+    assert state["called"]
+    assert torch.equal(out, torch.tensor([7.0], dtype=torch.float32))
+    assert metadata["backend"] == "cupy_cusparse"
+    assert metadata["fallback_reason"] is None
+
+
+@CUDA_REQUIRED
 @pytest.mark.spmv_coo
 @pytest.mark.parametrize("M, N", SPMV_MN_SHAPES)
 @pytest.mark.parametrize("dtype", SPMV_COO_DTYPES, ids=SPMV_COO_DTYPE_IDS)
@@ -109,6 +171,7 @@ def test_spmv_coo_matches_dense_reference(M, N, dtype, index_dtype, op):
     _assert_close(out, ref, dtype)
 
 
+@CUDA_REQUIRED
 @pytest.mark.spmv_coo
 def test_spmv_coo_prepared_transpose_mismatch_rejected():
     device = torch.device("cuda")
@@ -123,6 +186,7 @@ def test_spmv_coo_prepared_transpose_mismatch_rejected():
         flagsparse_spmv_coo(x=x, prepared=prepared, transpose=False)
 
 
+@CUDA_REQUIRED
 @pytest.mark.spmv_coo
 def test_spmv_coo_prepared_op_mismatch_rejected():
     device = torch.device("cuda")
@@ -137,6 +201,7 @@ def test_spmv_coo_prepared_op_mismatch_rejected():
         flagsparse_spmv_coo(x=x, prepared=prepared, op="trans")
 
 
+@CUDA_REQUIRED
 @pytest.mark.spmv_coo
 def test_spmv_coo_int64_auto_fallback_to_int32(monkeypatch):
     device = torch.device("cuda")
@@ -169,6 +234,7 @@ def test_spmv_coo_int64_auto_fallback_to_int32(monkeypatch):
     assert torch.allclose(out.to(torch.float64), ref, rtol=1e-4, atol=1e-4)
 
 
+@CUDA_REQUIRED
 @pytest.mark.spmv_coo_tocsr
 @pytest.mark.parametrize("M, N", SPMV_MN_SHAPES)
 @pytest.mark.parametrize("dtype", _TOCSR_DTYPES, ids=_TOCSR_DTYPE_IDS)
@@ -187,6 +253,7 @@ def test_spmv_coo_tocsr_matches_torch(M, N, dtype):
     assert torch.allclose(out, ref, rtol=rtol, atol=atol)
 
 
+@CUDA_REQUIRED
 @pytest.mark.spmv_coo_tocsr
 def test_spmv_coo_tocsr_prepared_path_matches_torch():
     device = torch.device("cuda")

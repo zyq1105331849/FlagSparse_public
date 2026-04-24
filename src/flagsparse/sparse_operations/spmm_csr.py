@@ -2348,6 +2348,108 @@ def benchmark_spmm_opt_case(
     }
 
 
+def _spmm_csr_sparse_ref_backend(value_dtype, index_dtype):
+    if _is_rocm_runtime():
+        return None, "hipSPARSE direct SpMM sparse reference is not implemented in this first batch"
+    if cp is None or cpx_sparse is None:
+        return None, "CuPy/cuSPARSE is not available"
+    if value_dtype in (torch.float16, torch.bfloat16):
+        return None, "float16/bfloat16 not supported by CuPy sparse; skipped"
+    return "cupy_cusparse", None
+
+
+def _spmm_csr_reference(
+    data,
+    indices,
+    indptr,
+    B,
+    shape,
+    out_dtype=None,
+    reference_compute_dtype=True,
+    return_metadata=False,
+):
+    out_dtype = data.dtype if out_dtype is None else out_dtype
+    compute_dtype = (
+        _sparse_reference_compute_dtype(out_dtype)
+        if reference_compute_dtype
+        else out_dtype
+    )
+    device = data.device
+    data_ref = data.to(compute_dtype)
+    B_ref = B.to(compute_dtype)
+    indptr64 = indptr.to(torch.int64)
+    indices64 = indices.to(torch.int64)
+    fallback_reason = None
+    pytorch_format = "CSR"
+    try:
+        sparse_ref = torch.sparse_csr_tensor(
+            indptr64,
+            indices64,
+            data_ref,
+            size=shape,
+            device=device,
+        )
+        expected = _apply_torch_sparse_matmul_op(sparse_ref, B_ref, "non")
+    except Exception as exc:
+        pytorch_format = "COO"
+        fallback_reason = f"CSR fallback: {exc}"
+        row_indices = torch.repeat_interleave(
+            torch.arange(int(shape[0]), device=device, dtype=torch.int64),
+            indptr64[1:] - indptr64[:-1],
+        )
+        sparse_ref = torch.sparse_coo_tensor(
+            torch.stack([row_indices, indices64]),
+            data_ref,
+            shape,
+            device=device,
+        ).coalesce()
+        expected = _apply_torch_sparse_matmul_op(sparse_ref, B_ref, "non")
+    expected = _cast_sparse_reference_output(expected, out_dtype)
+    metadata = {
+        "backend": "torch",
+        "fallback_reason": fallback_reason,
+        "pytorch_sparse_format": pytorch_format,
+    }
+    if return_metadata:
+        return expected, metadata
+    return expected
+
+
+def _benchmark_spmm_csr_sparse_ref(
+    data,
+    indices,
+    indptr,
+    B,
+    shape,
+    warmup,
+    iters,
+):
+    backend, reason = _spmm_csr_sparse_ref_backend(data.dtype, indices.dtype)
+    result = {
+        "backend": backend,
+        "values": None,
+        "ms": None,
+        "reason": reason,
+    }
+    if backend is None:
+        return result
+
+    data_cp = _cupy_from_torch(data)
+    indices_cp = _cupy_from_torch(indices.to(torch.int64))
+    indptr_cp = _cupy_from_torch(indptr.to(torch.int64))
+    B_cp = _cupy_from_torch(B)
+    A_csr = cpx_sparse.csr_matrix((data_cp, indices_cp, indptr_cp), shape=shape)
+    values_cp, ms = _benchmark_cuda_op(
+        lambda: A_csr @ B_cp,
+        warmup=warmup,
+        iters=iters,
+    )
+    result["values"] = _torch_from_cupy(values_cp)
+    result["ms"] = ms
+    result["reason"] = None
+    return result
+
+
 def benchmark_spmm_case(
     n_rows=4096,
     n_cols=4096,
@@ -2401,52 +2503,38 @@ def benchmark_spmm_case(
         iters=iters,
     )
 
+    expected, ref_meta = _spmm_csr_reference(
+        data,
+        indices,
+        indptr,
+        B,
+        shape,
+        out_dtype=value_dtype,
+        return_metadata=True,
+    )
     indptr64 = indptr.to(torch.int64)
     indices64 = indices.to(torch.int64)
-    row_indices = torch.repeat_interleave(
-        torch.arange(n_rows, device=device, dtype=torch.int64),
-        indptr64[1:] - indptr64[:-1],
-    )
-
-    pytorch_reason = None
-    pytorch_values = None
-    pytorch_ms = None
-    pytorch_format = "CSR"
-    try:
-        csr_pt = torch.sparse_csr_tensor(indptr64, indices64, data, size=shape, device=device)
-        pytorch_op = lambda: torch.sparse.mm(csr_pt, B)
-        if value_dtype in (torch.float16, torch.bfloat16):
-            csr_ref = torch.sparse_csr_tensor(indptr64, indices64, data.to(torch.float32), size=shape, device=device)
-            expected = torch.sparse.mm(csr_ref, B.to(torch.float32)).to(value_dtype)
-        elif value_dtype == torch.float32:
-            csr_ref = torch.sparse_csr_tensor(indptr64, indices64, data.to(torch.float64), size=shape, device=device)
-            expected = torch.sparse.mm(csr_ref, B.to(torch.float64)).to(value_dtype)
-        elif value_dtype == torch.complex64:
-            csr_ref = torch.sparse_csr_tensor(indptr64, indices64, data.to(torch.complex128), size=shape, device=device)
-            expected = torch.sparse.mm(csr_ref, B.to(torch.complex128)).to(value_dtype)
-        else:
-            expected = torch.sparse.mm(csr_pt, B)
-    except Exception as exc:
-        pytorch_format = "COO"
-        pytorch_reason = f"CSR fallback: {exc}"
-        coo = torch.sparse_coo_tensor(
-            torch.stack([row_indices, indices64]),
-            data,
-            shape,
-            device=device,
-        ).coalesce()
-        pytorch_op = lambda: torch.sparse.mm(coo, B)
-        if value_dtype in (torch.float16, torch.bfloat16):
-            expected = torch.sparse.mm(coo.to(torch.float32), B.to(torch.float32)).to(value_dtype)
-        elif value_dtype == torch.float32:
-            expected = torch.sparse.mm(coo.to(torch.float64), B.to(torch.float64)).to(value_dtype)
-        elif value_dtype == torch.complex64:
-            expected = torch.sparse.mm(coo.to(torch.complex128), B.to(torch.complex128)).to(value_dtype)
-        else:
-            expected = torch.sparse.mm(coo, B)
-
+    pytorch_reason = ref_meta["fallback_reason"]
+    pytorch_format = ref_meta["pytorch_sparse_format"]
     pytorch_values = expected
+    pytorch_ms = None
     try:
+        if pytorch_format == "CSR":
+            sparse_pt = torch.sparse_csr_tensor(
+                indptr64, indices64, data, size=shape, device=device
+            )
+        else:
+            row_indices = torch.repeat_interleave(
+                torch.arange(n_rows, device=device, dtype=torch.int64),
+                indptr64[1:] - indptr64[:-1],
+            )
+            sparse_pt = torch.sparse_coo_tensor(
+                torch.stack([row_indices, indices64]),
+                data,
+                shape,
+                device=device,
+            ).coalesce()
+        pytorch_op = lambda: _apply_torch_sparse_matmul_op(sparse_pt, B, "non")
         pytorch_values, pytorch_ms = _benchmark_cuda_op(
             pytorch_op, warmup=warmup, iters=iters
         )
@@ -2461,34 +2549,28 @@ def benchmark_spmm_case(
     cusparse_reason = None
     cusparse_values = None
     cusparse_metrics = None
-    _cupy_supported_dtypes = (
-        torch.float32,
-        torch.float64,
-        torch.complex64,
-        torch.complex128,
-    )
+    sparse_ref_backend = None
     if run_cusparse:
-        if cp is None or cpx_sparse is None:
-            cusparse_reason = "CuPy/cuSPARSE is not available"
-        elif value_dtype not in _cupy_supported_dtypes:
-            cusparse_reason = "float16/bfloat16 not supported by CuPy sparse; skipped"
-        else:
-            try:
-                data_cp = _cupy_from_torch(data)
-                indices_cp = _cupy_from_torch(indices.to(torch.int64))
-                indptr_cp = _cupy_from_torch(indptr)
-                B_cp = _cupy_from_torch(B)
-                A_csr = cpx_sparse.csr_matrix(
-                    (data_cp, indices_cp, indptr_cp), shape=shape
-                )
-                cusparse_values_cp, cusparse_ms = _benchmark_cuda_op(
-                    lambda: A_csr @ B_cp, warmup=warmup, iters=iters
-                )
-                cusparse_values = _torch_from_cupy(cusparse_values_cp)
+        try:
+            sparse_ref = _benchmark_spmm_csr_sparse_ref(
+                data,
+                indices,
+                indptr,
+                B,
+                shape,
+                warmup=warmup,
+                iters=iters,
+            )
+            sparse_ref_backend = sparse_ref["backend"]
+            if sparse_ref_backend is not None:
+                cusparse_values = sparse_ref["values"]
+                cusparse_ms = sparse_ref["ms"]
                 cusparse_metrics = _spmm_validation_metrics(cusparse_values, expected)
                 cusparse_match = cusparse_metrics["strict_allclose_match"]
-            except Exception as exc:
-                cusparse_reason = str(exc)
+            else:
+                cusparse_reason = sparse_ref["reason"]
+        except Exception as exc:
+            cusparse_reason = str(exc)
 
     triton_speedup_vs_pytorch = (
         pytorch_ms / triton_ms if (pytorch_ms is not None and triton_ms > 0) else None
@@ -2553,6 +2635,8 @@ def benchmark_spmm_case(
             "pytorch_unavailable_reason": pytorch_reason,
             "pytorch_sparse_format": pytorch_format,
             "cusparse_unavailable_reason": cusparse_reason,
+            "sparse_ref_backend": ref_meta["backend"] if sparse_ref_backend is None else sparse_ref_backend,
+            "sparse_ref_fallback_reason": ref_meta["fallback_reason"] if sparse_ref_backend is None else None,
             "flagsparse_internal_route": "csr-alg1",
         },
         "samples": {

@@ -49,6 +49,31 @@ def _resolve_scatter_benchmark_dtype(value_dtype, dtype_policy):
     return requested_name, effective_dtype, bool(fallback_applied), fallback_reason
 
 
+def _build_gather_selector_csr(indices, dense_size, value_dtype):
+    nnz = int(indices.numel())
+    data = torch.ones(nnz, dtype=value_dtype, device=indices.device)
+    selector_indices = indices.contiguous()
+    indptr = torch.arange(nnz + 1, dtype=torch.int64, device=indices.device)
+    return data, selector_indices, indptr, (nnz, dense_size)
+
+
+def _build_scatter_selector_csr(indices, dense_size, value_dtype):
+    nnz = int(indices.numel())
+    data = torch.ones(nnz, dtype=value_dtype, device=indices.device)
+    if nnz == 0:
+        indptr = torch.zeros(dense_size + 1, dtype=torch.int64, device=indices.device)
+        selector_indices = torch.empty(0, dtype=indices.dtype, device=indices.device)
+        return data, selector_indices, indptr, (dense_size, 0)
+
+    order = torch.argsort(indices.to(torch.int64), stable=True)
+    sorted_rows = indices[order]
+    selector_indices = torch.arange(nnz, dtype=indices.dtype, device=indices.device)[order]
+    row_counts = torch.bincount(sorted_rows.to(torch.int64), minlength=dense_size)
+    indptr = torch.zeros(dense_size + 1, dtype=torch.int64, device=indices.device)
+    indptr[1:] = torch.cumsum(row_counts, dim=0)
+    return data, selector_indices.contiguous(), indptr, (dense_size, nnz)
+
+
 def benchmark_gather_case(
     dense_size=65536,
     nnz=4096,
@@ -85,19 +110,26 @@ def benchmark_gather_case(
     cusparse_match = None
     cusparse_max_error = None
     cusparse_reason = None
+    sparse_ref_backend = None
     if run_cusparse:
-        skip_reason = _cusparse_baseline_skip_reason(value_dtype)
-        if skip_reason:
-            cusparse_reason = skip_reason
-        else:
-            try:
-                selector_matrix = _make_gather_selector_matrix(
-                    indices, dense_vector.numel(), dense_vector.dtype
-                )
-                cusparse_op = lambda: _cusparse_spmv(selector_matrix, dense_vector)
-                cusparse_values, cusparse_ms = _benchmark_cuda_op(
-                    cusparse_op, warmup=warmup, iters=iters
-                )
+        selector_data, selector_indices, selector_indptr, selector_shape = (
+            _build_gather_selector_csr(indices, dense_vector.numel(), dense_vector.dtype)
+        )
+        try:
+            sparse_ref = _benchmark_spmv_csr_sparse_ref(
+                selector_data,
+                selector_indices,
+                selector_indptr,
+                dense_vector,
+                selector_shape,
+                warmup=warmup,
+                iters=iters,
+                op="non",
+            )
+            sparse_ref_backend = sparse_ref["backend"]
+            if sparse_ref_backend is not None:
+                cusparse_values = sparse_ref["values"]
+                cusparse_ms = sparse_ref["ms"]
                 cusparse_match = torch.allclose(
                     cusparse_values, expected, atol=atol, rtol=rtol
                 )
@@ -106,8 +138,10 @@ def benchmark_gather_case(
                     if nnz > 0
                     else 0.0
                 )
-            except Exception as exc:
-                cusparse_reason = str(exc)
+            else:
+                cusparse_reason = sparse_ref["reason"]
+        except Exception as exc:
+            cusparse_reason = str(exc)
 
     triton_speedup_vs_pytorch = (
         pytorch_ms / triton_ms if triton_ms > 0 else float("inf")
@@ -142,6 +176,8 @@ def benchmark_gather_case(
         },
         "backend_status": {
             "cusparse_unavailable_reason": cusparse_reason,
+            "sparse_ref_backend": sparse_ref_backend,
+            "sparse_ref_fallback_reason": cusparse_reason,
         },
         "samples": {
             "pytorch": pytorch_values,
@@ -242,30 +278,45 @@ def benchmark_scatter_case(
     cusparse_match = None
     cusparse_max_error = None
     cusparse_reason = None
+    sparse_ref_backend = None
     if run_cusparse:
         if not reset_output:
             skip_reason = "cuSPARSE scatter baseline only matches reset_output=True semantics"
+        elif not unique_indices:
+            skip_reason = "scatter sparse reference only matches unique_indices=True semantics"
         else:
-            skip_reason = _cusparse_baseline_skip_reason(sparse_values.dtype)
+            selector_data, selector_indices, selector_indptr, selector_shape = (
+                _build_scatter_selector_csr(indices, dense_size, sparse_values.dtype)
+            )
+            skip_reason = None
         if skip_reason:
             cusparse_reason = skip_reason
         else:
             try:
-                selector_matrix = _make_scatter_selector_matrix(
-                    indices, dense_size, sparse_values.dtype
+                sparse_ref = _benchmark_spmv_csr_sparse_ref(
+                    selector_data,
+                    selector_indices,
+                    selector_indptr,
+                    sparse_values,
+                    selector_shape,
+                    warmup=warmup,
+                    iters=iters,
+                    op="non",
                 )
-                cusparse_op = lambda: _cusparse_spmv(selector_matrix, sparse_values)
-                cusparse_values, cusparse_ms = _benchmark_cuda_op(
-                    cusparse_op, warmup=warmup, iters=iters
-                )
-                cusparse_match = torch.allclose(
-                    cusparse_values, expected, atol=atol, rtol=rtol
-                )
-                cusparse_max_error = (
-                    float(torch.max(torch.abs(cusparse_values - expected)).item())
-                    if dense_size > 0
-                    else 0.0
-                )
+                sparse_ref_backend = sparse_ref["backend"]
+                if sparse_ref_backend is not None:
+                    cusparse_values = sparse_ref["values"]
+                    cusparse_ms = sparse_ref["ms"]
+                    cusparse_match = torch.allclose(
+                        cusparse_values, expected, atol=atol, rtol=rtol
+                    )
+                    cusparse_max_error = (
+                        float(torch.max(torch.abs(cusparse_values - expected)).item())
+                        if dense_size > 0
+                        else 0.0
+                    )
+                else:
+                    cusparse_reason = sparse_ref["reason"]
             except Exception as exc:
                 cusparse_reason = str(exc)
 
@@ -309,6 +360,8 @@ def benchmark_scatter_case(
         },
         "backend_status": {
             "cusparse_unavailable_reason": cusparse_reason,
+            "sparse_ref_backend": sparse_ref_backend,
+            "sparse_ref_fallback_reason": cusparse_reason,
             "fallback_reason": fallback_reason,
             "index_fallback_applied": bool(triton_index_meta["index_fallback_applied"]),
             "index_fallback_reason": triton_index_meta["index_fallback_reason"],
