@@ -451,6 +451,61 @@ def _hipsparse_create_coo_descriptor(
     raise RuntimeError("hipsparseCreateCoo wrapper signature mismatch")
 
 
+def _hipsparse_spmm_order(order_name, context):
+    mapping = {
+        "row": ("HIPSPARSE_ORDER_ROW",),
+        "col": ("HIPSPARSE_ORDER_COL",),
+    }
+    if order_name not in mapping:
+        raise RuntimeError(f"{context} does not support dense order={order_name}")
+    return _hipsparse_lookup("hipsparseOrder_t", mapping[order_name])
+
+
+def _hipsparse_spmm_algorithm(format_name):
+    format_name = str(format_name).lower()
+    mapping = {
+        "csr": (
+            "HIPSPARSE_SPMM_ALG_DEFAULT",
+            "HIPSPARSE_SPMM_CSR_ALG1",
+        ),
+        "coo": (
+            "HIPSPARSE_SPMM_ALG_DEFAULT",
+            "HIPSPARSE_SPMM_COO_ALG1",
+            "HIPSPARSE_COOMM_ALG1",
+        ),
+    }
+    if format_name not in mapping:
+        raise RuntimeError(f"hipSPARSE SpMM does not support format={format_name}")
+    return _hipsparse_lookup("hipsparseSpMMAlg_t", mapping[format_name])
+
+
+def _hipsparse_create_dnmat_descriptor(
+    mat_ref,
+    rows,
+    cols,
+    ld,
+    values_ptr,
+    value_type,
+    order,
+):
+    attempts = (
+        (mat_ref, rows, cols, ld, values_ptr, value_type, order),
+    )
+    last_error = None
+    for args in attempts:
+        try:
+            return _hip_check_result(
+                hipsparse.hipsparseCreateDnMat(*args), "hipsparseCreateDnMat"
+            )
+        except TypeError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise RuntimeError(
+            f"hipsparseCreateDnMat wrapper signature mismatch: {last_error}"
+        ) from last_error
+    raise RuntimeError("hipsparseCreateDnMat wrapper signature mismatch")
+
+
 class _HipFloatComplex(ctypes.Structure):
     _fields_ = [("x", ctypes.c_float), ("y", ctypes.c_float)]
 

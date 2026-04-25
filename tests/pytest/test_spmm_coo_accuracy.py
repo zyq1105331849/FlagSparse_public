@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from flagsparse import flagsparse_spmm_coo
+import flagsparse.sparse_operations.spmm_coo as ast_ops
 
 from tests.pytest.param_shapes import MNK_SHAPES, SPMM_OPT_DTYPES, SPMM_OPT_DTYPE_IDS
 
@@ -43,3 +44,33 @@ def test_spmm_coo_matches_torch(M, N, K, dtype):
     out = flagsparse_spmm_coo(data, row, col, B, (M, K))
     rtol, atol = _tol(dtype)
     assert torch.allclose(out, ref, rtol=rtol, atol=atol)
+
+
+def test_spmm_coo_sparse_ref_backend_selects_hipsparse_when_direct_supported(monkeypatch):
+    monkeypatch.setattr(ast_ops, "_is_rocm_runtime", lambda: True)
+    monkeypatch.setattr(
+        ast_ops,
+        "_hipsparse_spmm_coo_skip_reason",
+        lambda value_dtype, index_dtype: None,
+    )
+    backend, reason = ast_ops._spmm_coo_sparse_ref_backend(
+        torch.float32,
+        torch.int32,
+    )
+    assert backend == "hipsparse"
+    assert reason is None
+
+
+def test_spmm_coo_sparse_ref_backend_reports_direct_reason_when_unsupported(monkeypatch):
+    monkeypatch.setattr(ast_ops, "_is_rocm_runtime", lambda: True)
+    monkeypatch.setattr(
+        ast_ops,
+        "_hipsparse_spmm_coo_skip_reason",
+        lambda value_dtype, index_dtype: "direct hipSPARSE COO SpMM unsupported",
+    )
+    backend, reason = ast_ops._spmm_coo_sparse_ref_backend(
+        torch.float64,
+        torch.int64,
+    )
+    assert backend is None
+    assert reason == "direct hipSPARSE COO SpMM unsupported"

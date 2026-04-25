@@ -1,6 +1,19 @@
 """CSR SpMM kernels, helpers, and benchmark entry points."""
 
+import ctypes
+
+from . import _common as _common_mod
 from ._common import *
+
+hip = _common_mod.hip
+hipsparse = _common_mod.hipsparse
+HipPointer = _common_mod.HipPointer
+_hip_check_result = _common_mod._hip_check_result
+_hipsparse_lookup = _common_mod._hipsparse_lookup
+_hipsparse_unavailable_reason = _common_mod._hipsparse_unavailable_reason
+_hipsparse_value_type = _common_mod._hipsparse_value_type
+_hipsparse_scalar = _common_mod._hipsparse_scalar
+_hipsparse_index_type = _common_mod._hipsparse_index_type
 
 SUPPORTED_SPMM_VALUE_DTYPES = SUPPORTED_VALUE_DTYPES
 def _spmm_relative_threshold(value_dtype):
@@ -2349,20 +2362,11 @@ def benchmark_spmm_opt_case(
 
 
 def _hipsparse_spmm_order(order_name, context):
-    mapping = {
-        "row": ("HIPSPARSE_ORDER_ROW",),
-        "col": ("HIPSPARSE_ORDER_COL",),
-    }
-    if order_name not in mapping:
-        raise RuntimeError(f"{context} does not support dense order={order_name}")
-    return _hipsparse_lookup("hipsparseOrder_t", mapping[order_name])
+    return _common_mod._hipsparse_spmm_order(order_name, context)
 
 
 def _hipsparse_spmm_alg_default():
-    return _hipsparse_lookup(
-        "hipsparseSpMMAlg_t",
-        ("HIPSPARSE_SPMM_ALG_DEFAULT",),
-    )
+    return _common_mod._hipsparse_spmm_algorithm("csr")
 
 
 def _hipsparse_create_dnmat_descriptor(
@@ -2374,22 +2378,15 @@ def _hipsparse_create_dnmat_descriptor(
     value_type,
     order,
 ):
-    attempts = (
-        (mat_ref, rows, cols, ld, values_ptr, value_type, order),
+    return _common_mod._hipsparse_create_dnmat_descriptor(
+        mat_ref,
+        rows,
+        cols,
+        ld,
+        values_ptr,
+        value_type,
+        order,
     )
-    last_error = None
-    for args in attempts:
-        try:
-            return _hip_check_result(
-                hipsparse.hipsparseCreateDnMat(*args), "hipsparseCreateDnMat"
-            )
-        except TypeError as exc:
-            last_error = exc
-    if last_error is not None:
-        raise RuntimeError(
-            f"hipsparseCreateDnMat wrapper signature mismatch: {last_error}"
-        ) from last_error
-    raise RuntimeError("hipsparseCreateDnMat wrapper signature mismatch")
 
 
 def _hipsparse_spmm_csr_skip_reason(value_dtype, indices_dtype, indptr_dtype):
@@ -2406,6 +2403,7 @@ def _hipsparse_spmm_csr_skip_reason(value_dtype, indices_dtype, indptr_dtype):
         "hipsparseDestroyDnMat",
         "hipsparseDestroySpMat",
         "hipsparseSpMM_bufferSize",
+        "hipsparseSpMM_preprocess",
         "hipsparseSpMM",
     )
     for symbol in required_symbols:
@@ -2603,6 +2601,22 @@ def _spmm_csr_ref_hipsparse(data, indices, indptr, B, shape, out=None, return_me
             workspace_allocated = True
         else:
             workspace = 0
+        _hip_check_result(
+            hipsparse.hipsparseSpMM_preprocess(
+                handle,
+                op_enum,
+                op_enum,
+                alpha,
+                spmat,
+                matb,
+                beta,
+                matc,
+                value_type,
+                alg,
+                workspace,
+            ),
+            "hipsparseSpMM_preprocess",
+        )
         C.zero_()
         _hip_check_result(
             hipsparse.hipsparseSpMM(
