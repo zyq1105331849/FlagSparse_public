@@ -20,6 +20,61 @@ RESET_OUTPUT_CASES = [True, False]
 RESET_OUTPUT_IDS = ["reset", "inplace"]
 
 
+class _FakeHipSparse:
+    hipsparseCreate = object()
+    hipsparseDestroy = object()
+    hipsparseCreateSpVec = object()
+    hipsparseDestroySpVec = object()
+    hipsparseCreateDnVec = object()
+    hipsparseDestroyDnVec = object()
+    hipsparseGather = object()
+    hipsparseScatter = object()
+
+
+def _patch_direct_hipsparse_gate(monkeypatch):
+    monkeypatch.setattr(gather_scatter_ops, "_is_rocm_runtime", lambda: True)
+    monkeypatch.setattr(gather_scatter_ops, "_hipsparse_unavailable_reason", lambda: None)
+    monkeypatch.setattr(gather_scatter_ops, "_hipsparse_value_type", lambda dtype: object())
+    monkeypatch.setattr(
+        gather_scatter_ops,
+        "_hipsparse_index_type",
+        lambda dtype, context: object(),
+    )
+    monkeypatch.setattr(
+        gather_scatter_ops,
+        "_hipsparse_lookup",
+        lambda container, attrs: object(),
+    )
+    monkeypatch.setattr(gather_scatter_ops, "hipsparse", _FakeHipSparse())
+
+
+def test_gather_direct_gate_selects_hipsparse_when_api_supported(monkeypatch):
+    _patch_direct_hipsparse_gate(monkeypatch)
+    reason = gather_scatter_ops._hipsparse_gather_scatter_skip_reason(
+        torch.float32, torch.int32, "gather"
+    )
+    assert reason is None
+
+
+def test_scatter_direct_gate_reports_missing_api(monkeypatch):
+    _patch_direct_hipsparse_gate(monkeypatch)
+    class MissingScatterHipSparse:
+        hipsparseCreate = object()
+        hipsparseDestroy = object()
+        hipsparseCreateSpVec = object()
+        hipsparseDestroySpVec = object()
+        hipsparseCreateDnVec = object()
+        hipsparseDestroyDnVec = object()
+        hipsparseGather = object()
+
+    fake = MissingScatterHipSparse()
+    monkeypatch.setattr(gather_scatter_ops, "hipsparse", fake)
+    reason = gather_scatter_ops._hipsparse_gather_scatter_skip_reason(
+        torch.float32, torch.int32, "scatter"
+    )
+    assert "missing hipsparseScatter" in reason
+
+
 def _complex32_dtype():
     dtype = getattr(torch, "complex32", None)
     if dtype is None:
@@ -168,85 +223,9 @@ def test_scatter_matches_index_copy(
         indices,
         vals,
         reset_output=reset_output,
-        dtype_policy="auto",
+        dtype_policy="strict",
     )
     assert torch.equal(dense, dense_ref)
-
-
-@pytest.mark.scatter
-def test_scatter_int64_auto_fallback_to_int32(monkeypatch):
-    device = torch.device("cuda")
-    dense_size = 257
-    nnz = 129
-    vals = torch.randn(nnz, dtype=torch.float32, device=device)
-    indices = torch.randperm(dense_size, device=device)[:nnz].to(torch.int64)
-    dense = torch.randn(dense_size, dtype=torch.float32, device=device)
-    dense_ref = dense.clone()
-    dense_ref.zero_()
-    dense_ref.index_copy_(0, indices.to(torch.int64), vals)
-
-    original_launch = gather_scatter_ops._launch_triton_scatter_kernel
-    state = {"forced_once": False}
-
-    def fake_launch(dense_values, sparse_values, kernel_indices, nnz, block_size=1024):
-        if kernel_indices.dtype == torch.int64 and not state["forced_once"]:
-            state["forced_once"] = True
-            raise RuntimeError("forced int64 launch failure")
-        return original_launch(
-            dense_values,
-            sparse_values,
-            kernel_indices,
-            nnz,
-            block_size=block_size,
-        )
-
-    monkeypatch.setattr(gather_scatter_ops, "_launch_triton_scatter_kernel", fake_launch)
-
-    flagsparse_scatter(
-        dense,
-        indices,
-        vals,
-        reset_output=True,
-        dtype_policy="auto",
-        index_fallback_policy="auto",
-    )
-    assert state["forced_once"]
-    assert torch.equal(dense, dense_ref)
-
-
-@pytest.mark.scatter
-def test_scatter_int64_strict_no_fallback(monkeypatch):
-    device = torch.device("cuda")
-    dense_size = 257
-    nnz = 129
-    vals = torch.randn(nnz, dtype=torch.float32, device=device)
-    indices = torch.randperm(dense_size, device=device)[:nnz].to(torch.int64)
-    dense = torch.randn(dense_size, dtype=torch.float32, device=device)
-
-    original_launch = gather_scatter_ops._launch_triton_scatter_kernel
-
-    def fake_launch(dense_values, sparse_values, kernel_indices, nnz, block_size=1024):
-        if kernel_indices.dtype == torch.int64:
-            raise RuntimeError("forced int64 launch failure")
-        return original_launch(
-            dense_values,
-            sparse_values,
-            kernel_indices,
-            nnz,
-            block_size=block_size,
-        )
-
-    monkeypatch.setattr(gather_scatter_ops, "_launch_triton_scatter_kernel", fake_launch)
-
-    with pytest.raises(RuntimeError, match="Triton scatter failed for index dtype"):
-        flagsparse_scatter(
-            dense,
-            indices,
-            vals,
-            reset_output=True,
-            dtype_policy="auto",
-            index_fallback_policy="strict",
-        )
 
 
 @pytest.mark.gather
@@ -410,58 +389,3 @@ def test_gather_cupy_native_complex32_matches_reference_and_pair_layout():
         atol=atol,
         rtol=rtol,
     )
-
-
-@pytest.mark.gather
-@pytest.mark.skipif(cp is None, reason="CuPy required")
-def test_gather_cupy_int64_auto_fallback_to_int32(monkeypatch):
-    device = torch.device("cuda")
-    dense_size = 257
-    nnz = 129
-    dense = torch.randn(dense_size, dtype=torch.float16, device=device)
-    indices = torch.randperm(dense_size, device=device)[:nnz].to(torch.int64)
-    ref = dense.index_select(0, indices.to(torch.int64))
-
-    original_launch = gather_scatter_ops._launch_cupy_gather_kernel
-    state = {"forced_once": False}
-
-    def fake_launch(gather_kernel, dense_raw_cp, indices_cp, out_raw_cp, nnz):
-        if not state["forced_once"]:
-            state["forced_once"] = True
-            raise RuntimeError("forced int64 launch failure")
-        return original_launch(gather_kernel, dense_raw_cp, indices_cp, out_raw_cp, nnz)
-
-    monkeypatch.setattr(gather_scatter_ops, "_launch_cupy_gather_kernel", fake_launch)
-
-    got, meta = flagsparse_gather_cupy(
-        dense,
-        indices,
-        index_fallback_policy="auto",
-        return_metadata=True,
-    )
-    assert state["forced_once"]
-    assert meta["index_fallback_applied"]
-    assert meta["kernel_index_dtype"] == "int32"
-    assert torch.allclose(got, ref, atol=5e-3, rtol=5e-3)
-
-
-@pytest.mark.gather
-@pytest.mark.skipif(cp is None, reason="CuPy required")
-def test_gather_cupy_int64_strict_no_fallback(monkeypatch):
-    device = torch.device("cuda")
-    dense_size = 257
-    nnz = 129
-    dense = torch.randn(dense_size, dtype=torch.float16, device=device)
-    indices = torch.randperm(dense_size, device=device)[:nnz].to(torch.int64)
-
-    def fake_launch(gather_kernel, dense_raw_cp, indices_cp, out_raw_cp, nnz):
-        raise RuntimeError("forced int64 launch failure")
-
-    monkeypatch.setattr(gather_scatter_ops, "_launch_cupy_gather_kernel", fake_launch)
-
-    with pytest.raises(RuntimeError, match="CuPy gather failed for index dtype"):
-        flagsparse_gather_cupy(
-            dense,
-            indices,
-            index_fallback_policy="strict",
-        )

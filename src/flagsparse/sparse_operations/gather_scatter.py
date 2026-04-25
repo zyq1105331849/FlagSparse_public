@@ -1,9 +1,19 @@
 """Gather and scatter (Triton kernels + cuSPARSE-style baselines)."""
 
+from . import _common as _common_mod
 from ._common import *
 
 import triton
 import triton.language as tl
+
+hip = _common_mod.hip
+hipsparse = _common_mod.hipsparse
+HipPointer = _common_mod.HipPointer
+_hip_check_result = _common_mod._hip_check_result
+_hipsparse_lookup = _common_mod._hipsparse_lookup
+_hipsparse_unavailable_reason = _common_mod._hipsparse_unavailable_reason
+_hipsparse_value_type = _common_mod._hipsparse_value_type
+_hipsparse_index_type = _common_mod._hipsparse_index_type
 
 SUPPORTED_SCATTER_VALUE_DTYPES = (
     torch.float16,
@@ -246,6 +256,261 @@ def _launch_triton_scatter_kernel(
         nnz,
         BLOCK_SIZE=block_size,
     )
+
+
+def _hipsparse_gather_scatter_skip_reason(value_dtype, index_dtype, op_name):
+    op_label = "Gather" if op_name == "gather" else "Scatter"
+    if not _is_rocm_runtime():
+        return f"hipSPARSE {op_label} reference requires a ROCm runtime"
+    unavailable_reason = _hipsparse_unavailable_reason()
+    if unavailable_reason is not None:
+        return unavailable_reason
+    required_symbols = (
+        "hipsparseCreate",
+        "hipsparseDestroy",
+        "hipsparseCreateSpVec",
+        "hipsparseDestroySpVec",
+        "hipsparseCreateDnVec",
+        "hipsparseDestroyDnVec",
+        "hipsparseGather" if op_name == "gather" else "hipsparseScatter",
+    )
+    for symbol in required_symbols:
+        if not hasattr(hipsparse, symbol):
+            return f"hipSPARSE {op_label} direct API is unavailable: missing {symbol}"
+    try:
+        _ = _hipsparse_value_type(value_dtype)
+        _ = _hipsparse_index_type(index_dtype, f"hipSPARSE {op_label} SpVec indices")
+        _ = _hipsparse_lookup(
+            "hipsparseIndexBase_t", ("HIPSPARSE_INDEX_BASE_ZERO",)
+        )
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _prepare_hipsparse_gather_inputs(dense_vector, indices):
+    _validate_common_inputs(dense_vector, indices)
+    dense_vector = dense_vector.contiguous()
+    indices = indices.contiguous()
+
+    if indices.numel() > 0:
+        if torch.any(indices < 0).item():
+            raise IndexError("indices must be non-negative")
+        max_index = int(indices.max().item())
+        if max_index >= dense_vector.numel():
+            raise IndexError(
+                f"indices out of range: max index {max_index}, dense size {dense_vector.numel()}"
+            )
+
+    return dense_vector, indices
+
+
+def _hipsparse_create_spvec_descriptor(
+    spvec_ref,
+    dense_size,
+    nnz,
+    indices,
+    values,
+    index_type,
+    index_base,
+    value_type,
+):
+    _hip_check_result(
+        hipsparse.hipsparseCreateSpVec(
+            spvec_ref,
+            dense_size,
+            nnz,
+            HipPointer.fromObj(indices.data_ptr()),
+            HipPointer.fromObj(values.data_ptr()),
+            index_type,
+            index_base,
+            value_type,
+        ),
+        "hipsparseCreateSpVec",
+    )
+
+
+def _hipsparse_create_dnvec_descriptor(dnvec_ref, size, values, value_type):
+    _hip_check_result(
+        hipsparse.hipsparseCreateDnVec(
+            dnvec_ref,
+            size,
+            HipPointer.fromObj(values.data_ptr()),
+            value_type,
+        ),
+        "hipsparseCreateDnVec",
+    )
+
+
+def hipsparse_gather(dense_vector, indices, out=None, return_metadata=False):
+    dense_vector, indices = _prepare_hipsparse_gather_inputs(dense_vector, indices)
+    skip_reason = _hipsparse_gather_scatter_skip_reason(
+        dense_vector.dtype, indices.dtype, "gather"
+    )
+    if skip_reason is not None:
+        raise RuntimeError(skip_reason)
+
+    dense_vector = dense_vector.contiguous()
+    indices = indices.contiguous()
+    nnz = int(indices.numel())
+    sparse_values = out
+    if sparse_values is None:
+        sparse_values = torch.empty(nnz, dtype=dense_vector.dtype, device=dense_vector.device)
+    else:
+        if not torch.is_tensor(sparse_values):
+            raise TypeError("out must be a torch.Tensor")
+        if not sparse_values.is_cuda or sparse_values.device != dense_vector.device:
+            raise ValueError("out must be a CUDA tensor on the same device as dense_vector")
+        if sparse_values.dtype != dense_vector.dtype or sparse_values.shape != (nnz,):
+            raise ValueError("out shape/dtype must match gather output")
+        if not sparse_values.is_contiguous():
+            raise ValueError("out must be contiguous")
+
+    value_type = _hipsparse_value_type(dense_vector.dtype)
+    index_type = _hipsparse_index_type(indices.dtype, "hipSPARSE Gather SpVec indices")
+    index_base = _hipsparse_lookup(
+        "hipsparseIndexBase_t", ("HIPSPARSE_INDEX_BASE_ZERO",)
+    )
+
+    handle = None
+    spvec = None
+    dnvec = None
+    try:
+        handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        ptr_type = type(handle)
+        spvec = ptr_type()
+        dnvec = ptr_type()
+        _hipsparse_create_spvec_descriptor(
+            spvec.createRef(),
+            int(dense_vector.numel()),
+            nnz,
+            indices,
+            sparse_values,
+            index_type,
+            index_base,
+            value_type,
+        )
+        _hipsparse_create_dnvec_descriptor(
+            dnvec.createRef(),
+            int(dense_vector.numel()),
+            dense_vector,
+            value_type,
+        )
+        _hip_check_result(
+            hipsparse.hipsparseGather(handle, dnvec, spvec),
+            "hipsparseGather",
+        )
+        if return_metadata:
+            return sparse_values, {"backend": "hipsparse"}
+        return sparse_values
+    finally:
+        if dnvec is not None:
+            try:
+                _hip_check_result(hipsparse.hipsparseDestroyDnVec(dnvec), "hipsparseDestroyDnVec")
+            except Exception:
+                pass
+        if spvec is not None:
+            try:
+                _hip_check_result(hipsparse.hipsparseDestroySpVec(spvec), "hipsparseDestroySpVec")
+            except Exception:
+                pass
+        if handle is not None:
+            try:
+                _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+            except Exception:
+                pass
+
+
+def hipsparse_scatter(
+    sparse_values,
+    indices,
+    dense_size=None,
+    out=None,
+    reset_output=True,
+    return_metadata=False,
+):
+    sparse_values, indices, _, dense_size, _ = _prepare_scatter_inputs(
+        sparse_values,
+        indices,
+        dense_size=dense_size,
+        out=out,
+        dtype_policy="strict",
+        return_metadata=True,
+    )
+    _validate_scatter_value_dtype(sparse_values)
+    skip_reason = _hipsparse_gather_scatter_skip_reason(
+        sparse_values.dtype, indices.dtype, "scatter"
+    )
+    if skip_reason is not None:
+        raise RuntimeError(skip_reason)
+
+    sparse_values = sparse_values.contiguous()
+    indices = indices.contiguous()
+    nnz = int(indices.numel())
+    if out is None:
+        dense_values = torch.zeros(
+            dense_size, dtype=sparse_values.dtype, device=sparse_values.device
+        )
+    else:
+        dense_values = out
+        if reset_output:
+            dense_values.zero_()
+    if not dense_values.is_contiguous():
+        raise ValueError("out must be contiguous")
+
+    value_type = _hipsparse_value_type(sparse_values.dtype)
+    index_type = _hipsparse_index_type(indices.dtype, "hipSPARSE Scatter SpVec indices")
+    index_base = _hipsparse_lookup(
+        "hipsparseIndexBase_t", ("HIPSPARSE_INDEX_BASE_ZERO",)
+    )
+
+    handle = None
+    spvec = None
+    dnvec = None
+    try:
+        handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        ptr_type = type(handle)
+        spvec = ptr_type()
+        dnvec = ptr_type()
+        _hipsparse_create_spvec_descriptor(
+            spvec.createRef(),
+            int(dense_size),
+            nnz,
+            indices,
+            sparse_values,
+            index_type,
+            index_base,
+            value_type,
+        )
+        _hipsparse_create_dnvec_descriptor(
+            dnvec.createRef(),
+            int(dense_size),
+            dense_values,
+            value_type,
+        )
+        _hip_check_result(
+            hipsparse.hipsparseScatter(handle, spvec, dnvec),
+            "hipsparseScatter",
+        )
+        if return_metadata:
+            return dense_values, {"backend": "hipsparse"}
+        return dense_values
+    finally:
+        if dnvec is not None:
+            try:
+                _hip_check_result(hipsparse.hipsparseDestroyDnVec(dnvec), "hipsparseDestroyDnVec")
+            except Exception:
+                pass
+        if spvec is not None:
+            try:
+                _hip_check_result(hipsparse.hipsparseDestroySpVec(spvec), "hipsparseDestroySpVec")
+            except Exception:
+                pass
+        if handle is not None:
+            try:
+                _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+            except Exception:
+                pass
 
 
 def _cusparse_spmv(selector_matrix, dense_vector):
@@ -501,8 +766,16 @@ def pytorch_index_scatter(
 
 
 def cusparse_spmv_gather(dense_vector, indices, selector_matrix=None):
-    """Equivalent gather baseline via cuSPARSE-backed COO SpMV."""
+    """Sparse reference gather via direct hipSPARSE on ROCm or cuSPARSE-backed COO SpMV."""
     dense_vector, indices, _ = _prepare_inputs(dense_vector, indices)
+    if _is_rocm_runtime():
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        sparse_values = hipsparse_gather(dense_vector, indices)
+        torch.cuda.synchronize()
+        execution_time_ms = (time.perf_counter() - start_time) * 1000.0
+        return sparse_values, execution_time_ms, None
+
     skip_reason = _cusparse_baseline_skip_reason(dense_vector.dtype)
     if skip_reason:
         raise RuntimeError(skip_reason)
@@ -529,7 +802,7 @@ def cusparse_spmv_gather(dense_vector, indices, selector_matrix=None):
 def cusparse_spmv_scatter(
     sparse_values, indices, dense_size=None, selector_matrix=None, dtype_policy="auto"
 ):
-    """Equivalent scatter baseline via cuSPARSE-backed COO SpMV."""
+    """Sparse reference scatter via direct hipSPARSE on ROCm or cuSPARSE-backed COO SpMV."""
     sparse_values, indices, _, dense_size, _ = _prepare_scatter_inputs(
         sparse_values,
         indices,
@@ -539,6 +812,19 @@ def cusparse_spmv_scatter(
         return_metadata=True,
     )
     _validate_scatter_value_dtype(sparse_values)
+    if _is_rocm_runtime():
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        dense_values = hipsparse_scatter(
+            sparse_values,
+            indices,
+            dense_size=dense_size,
+            reset_output=True,
+        )
+        torch.cuda.synchronize()
+        execution_time_ms = (time.perf_counter() - start_time) * 1000.0
+        return dense_values, execution_time_ms, None
+
     skip_reason = _cusparse_baseline_skip_reason(sparse_values.dtype)
     if skip_reason:
         raise RuntimeError(skip_reason)
@@ -885,13 +1171,21 @@ def flagsparse_gather_cupy(
 
 
 def cusparse_spmv_gather_cupy(dense_vector, indices, selector_matrix=None):
-    """Equivalent gather baseline via cuSPARSE-backed COO SpMV for cupy gather path."""
-    _require_cupy()
+    """Sparse reference gather for the extra gather path."""
     dense_t, _ = _to_torch_tensor(dense_vector, "dense_vector")
     indices_t, _ = _to_torch_tensor(indices, "indices")
 
     dense_t = dense_t.contiguous()
     indices_t = indices_t.contiguous()
+    if _is_rocm_runtime():
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        gathered_t = hipsparse_gather(dense_t, indices_t)
+        torch.cuda.synchronize()
+        execution_time_ms = (time.perf_counter() - start_time) * 1000.0
+        return _to_backend_like(gathered_t, dense_vector), execution_time_ms, None
+
+    _require_cupy()
     runtime_dense_t, layout, dense_size, restore_mode = _cupy_gather_prepare_dense(
         dense_t, indices_t
     )

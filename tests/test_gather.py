@@ -251,7 +251,6 @@ def _benchmark_gather_case(
     warmup,
     iters,
     run_cusparse,
-    index_fallback_policy,
 ):
     device = torch.device("cuda")
     _check_dtype_supported(value_dtype_req)
@@ -261,25 +260,13 @@ def _benchmark_gather_case(
 
     mode = _select_mode(value_dtype_req, index_dtype)
     if mode == "gather_cupy":
-        preview_output, gather_meta = ast.flagsparse_gather_cupy(
-            dense_vector,
-            indices,
-            index_fallback_policy=index_fallback_policy,
-            return_metadata=True,
-        )
-        _ = preview_output
         flagsparse_op = lambda: ast.flagsparse_gather_cupy(
             dense_vector,
             indices,
-            index_fallback_policy=index_fallback_policy,
+            index_fallback_policy="strict",
         )
         cusparse_op = lambda: ast.cusparse_spmv_gather_cupy(dense_vector, indices)[0]
     else:
-        gather_meta = {
-            "index_fallback_applied": False,
-            "index_fallback_reason": None,
-            "kernel_index_dtype": str(index_dtype).replace("torch.", ""),
-        }
         flagsparse_op = lambda: ast.flagsparse_gather(dense_vector, indices)
         cusparse_op = lambda: ast.cusparse_spmv_gather(dense_vector, indices)[0]
 
@@ -343,8 +330,6 @@ def _benchmark_gather_case(
         },
         "backend_status": {
             "cusparse_unavailable_reason": cusparse_reason,
-            "index_fallback_applied": bool(gather_meta.get("index_fallback_applied")),
-            "index_fallback_reason": gather_meta.get("index_fallback_reason"),
         },
         "samples": {
             "pytorch": pytorch_values,
@@ -364,7 +349,7 @@ def _print_header():
     print("-" * 196)
     print(
         f"{'ValueReq':>14} {'ValueEff':>18} {'Index':>6} {'Dense':>10} {'NNZ':>10} "
-        f"{'IFB':>4} {'PT(ms)':>10} {'FS(ms)':>10} {'CS(ms)':>10} "
+        f"{'PT(ms)':>10} {'FS(ms)':>10} {'CS(ms)':>10} "
         f"{'FS/PT':>8} {'FS/CS':>8} {'Status':>6} {'Err(FS)':>12} {'Err(CS)':>12}"
     )
     print("-" * 196)
@@ -373,7 +358,7 @@ def _print_header():
 def _print_row(row):
     print(
         f"{row['value_dtype_req']:>14} {row['value_dtype_compute']:>18} {row['index_dtype']:>6} "
-        f"{row['dense_size']:>10,d} {row['nnz']:>10,d} {str(row['index_fallback_applied']):>4} "
+        f"{row['dense_size']:>10,d} {row['nnz']:>10,d} "
         f"{_fmt_ms(row['pytorch_ms']):>10} {_fmt_ms(row['triton_ms']):>10} {_fmt_ms(row['cusparse_ms']):>10} "
         f"{_fmt_speedup(row['triton_speedup_vs_pytorch']):>8} {_fmt_speedup(row['triton_speedup_vs_cusparse']):>8} "
         f"{row['status']:>6} {_fmt_err(row['triton_max_error']):>12} {_fmt_err(row['cusparse_max_error']):>12}"
@@ -395,8 +380,7 @@ def run_cli(args):
     print("=" * 180)
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(
-        f"Warmup: {args.warmup} | Iterations: {args.iters} | "
-        f"index_fallback_policy: {args.index_fallback_policy}"
+        f"Warmup: {args.warmup} | Iterations: {args.iters}"
     )
     print()
     _print_header()
@@ -414,8 +398,7 @@ def run_cli(args):
                 dense_size = int(dense_size)
                 nnz = int(nnz)
                 case_id = (
-                    f"{value_dtype}|{index_name}|dense={dense_size}|nnz={nnz}|"
-                    f"ifb_policy={args.index_fallback_policy}"
+                    f"{value_dtype}|{index_name}|dense={dense_size}|nnz={nnz}"
                 )
                 total_cases += 1
                 try:
@@ -427,7 +410,6 @@ def run_cli(args):
                         warmup=args.warmup,
                         iters=args.iters,
                         run_cusparse=run_cusparse,
-                        index_fallback_policy=args.index_fallback_policy,
                     )
                     perf = result["performance"]
                     verify = result["verification"]
@@ -445,10 +427,6 @@ def run_cli(args):
                         "dense_size": int(params.get("dense_size")),
                         "nnz": int(params.get("nnz")),
                         "mode": params.get("mode"),
-                        "index_fallback_policy": args.index_fallback_policy,
-                        "index_fallback_applied": bool(
-                            backend.get("index_fallback_applied")
-                        ),
                         "triton_ms": perf.get("triton_ms"),
                         "pytorch_ms": perf.get("pytorch_ms"),
                         "cusparse_ms": perf.get("cusparse_ms"),
@@ -459,7 +437,6 @@ def run_cli(args):
                         "triton_max_error": verify.get("triton_max_error"),
                         "cusparse_max_error": verify.get("cusparse_max_error"),
                         "cusparse_unavailable_reason": backend.get("cusparse_unavailable_reason"),
-                        "index_fallback_reason": backend.get("index_fallback_reason"),
                         "status": status,
                     }
                     summary_rows.append(row)
@@ -485,8 +462,6 @@ def run_cli(args):
                         "dense_size": dense_size,
                         "nnz": nnz,
                         "mode": _dtype_mode(value_dtype),
-                        "index_fallback_policy": args.index_fallback_policy,
-                        "index_fallback_applied": False,
                         "triton_ms": None,
                         "pytorch_ms": None,
                         "cusparse_ms": None,
@@ -497,7 +472,6 @@ def run_cli(args):
                         "triton_max_error": None,
                         "cusparse_max_error": None,
                         "cusparse_unavailable_reason": str(exc),
-                        "index_fallback_reason": str(exc),
                         "status": "ERROR",
                     }
                     summary_rows.append(row)
@@ -518,8 +492,6 @@ def run_cli(args):
             "dense_size",
             "nnz",
             "mode",
-            "index_fallback_policy",
-            "index_fallback_applied",
             "triton_ms",
             "pytorch_ms",
             "cusparse_ms",
@@ -530,7 +502,6 @@ def run_cli(args):
             "triton_max_error",
             "cusparse_max_error",
             "cusparse_unavailable_reason",
-            "index_fallback_reason",
             "status",
         ]
         _write_csv(args.csv_summary, summary_rows, summary_fields)
@@ -564,7 +535,6 @@ def build_parser():
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument("--no-cusparse", action="store_true")
-    parser.add_argument("--index-fallback-policy", choices=["auto", "strict"], default="auto")
     parser.add_argument("--csv-summary", default=None)
     parser.add_argument("--csv-samples", default=None)
     parser.add_argument("--sample-limit", type=int, default=32)

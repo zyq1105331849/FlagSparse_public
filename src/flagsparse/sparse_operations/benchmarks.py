@@ -5,12 +5,11 @@ from ._common import *
 from .gather_scatter import (
     SUPPORTED_SCATTER_VALUE_DTYPES,
     _scatter_dtype_error_message,
-    _cusparse_spmv,
-    _make_gather_selector_matrix,
-    _make_scatter_selector_matrix,
     _pytorch_scatter_impl,
     _triton_gather_impl,
     _triton_scatter_impl,
+    hipsparse_gather,
+    hipsparse_scatter,
 )
 from .spmv_csr import (
     SPMV_OP_NON,
@@ -84,7 +83,7 @@ def benchmark_gather_case(
     block_size=1024,
     run_cusparse=True,
 ):
-    """Benchmark Triton vs PyTorch indexing vs cuSPARSE-backed COO SpMV."""
+    """Benchmark Triton vs PyTorch indexing vs the active sparse reference backend."""
     device = torch.device("cuda")
     dense_vector = _build_random_dense(dense_size, value_dtype, device)
     indices = _build_indices(nnz, dense_size, index_dtype, device, unique=False)
@@ -112,24 +111,14 @@ def benchmark_gather_case(
     cusparse_reason = None
     sparse_ref_backend = None
     if run_cusparse:
-        selector_data, selector_indices, selector_indptr, selector_shape = (
-            _build_gather_selector_csr(indices, dense_vector.numel(), dense_vector.dtype)
-        )
-        try:
-            sparse_ref = _benchmark_spmv_csr_sparse_ref(
-                selector_data,
-                selector_indices,
-                selector_indptr,
-                dense_vector,
-                selector_shape,
-                warmup=warmup,
-                iters=iters,
-                op="non",
-            )
-            sparse_ref_backend = sparse_ref["backend"]
-            if sparse_ref_backend is not None:
-                cusparse_values = sparse_ref["values"]
-                cusparse_ms = sparse_ref["ms"]
+        if _is_rocm_runtime():
+            try:
+                cusparse_values, cusparse_ms = _benchmark_cuda_op(
+                    lambda: hipsparse_gather(dense_vector, indices),
+                    warmup=warmup,
+                    iters=iters,
+                )
+                sparse_ref_backend = "hipsparse"
                 cusparse_match = torch.allclose(
                     cusparse_values, expected, atol=atol, rtol=rtol
                 )
@@ -138,10 +127,39 @@ def benchmark_gather_case(
                     if nnz > 0
                     else 0.0
                 )
-            else:
-                cusparse_reason = sparse_ref["reason"]
-        except Exception as exc:
-            cusparse_reason = str(exc)
+            except Exception as exc:
+                cusparse_reason = str(exc)
+        else:
+            selector_data, selector_indices, selector_indptr, selector_shape = (
+                _build_gather_selector_csr(indices, dense_vector.numel(), dense_vector.dtype)
+            )
+            try:
+                sparse_ref = _benchmark_spmv_csr_sparse_ref(
+                    selector_data,
+                    selector_indices,
+                    selector_indptr,
+                    dense_vector,
+                    selector_shape,
+                    warmup=warmup,
+                    iters=iters,
+                    op="non",
+                )
+                sparse_ref_backend = sparse_ref["backend"]
+                if sparse_ref_backend is not None:
+                    cusparse_values = sparse_ref["values"]
+                    cusparse_ms = sparse_ref["ms"]
+                    cusparse_match = torch.allclose(
+                        cusparse_values, expected, atol=atol, rtol=rtol
+                    )
+                    cusparse_max_error = (
+                        float(torch.max(torch.abs(cusparse_values - expected)).item())
+                        if nnz > 0
+                        else 0.0
+                    )
+                else:
+                    cusparse_reason = sparse_ref["reason"]
+            except Exception as exc:
+                cusparse_reason = str(exc)
 
     triton_speedup_vs_pytorch = (
         pytorch_ms / triton_ms if triton_ms > 0 else float("inf")
@@ -177,7 +195,6 @@ def benchmark_gather_case(
         "backend_status": {
             "cusparse_unavailable_reason": cusparse_reason,
             "sparse_ref_backend": sparse_ref_backend,
-            "sparse_ref_fallback_reason": cusparse_reason,
         },
         "samples": {
             "pytorch": pytorch_values,
@@ -200,9 +217,9 @@ def benchmark_scatter_case(
     dtype_policy="auto",
     index_fallback_policy="auto",
 ):
-    """Benchmark Triton scatter vs PyTorch index_copy vs cuSPARSE-backed COO SpMV."""
+    """Benchmark Triton scatter vs PyTorch index_copy vs the active sparse reference backend."""
     device = torch.device("cuda")
-    requested_value_dtype, requested_effective_dtype, fallback_applied, fallback_reason = (
+    requested_value_dtype, requested_effective_dtype, _, _ = (
         _resolve_scatter_benchmark_dtype(value_dtype, dtype_policy)
     )
     sparse_values = _build_random_dense(nnz, requested_effective_dtype, device)
@@ -217,8 +234,6 @@ def benchmark_scatter_case(
         return_metadata=True,
     )
     effective_value_dtype = prep_meta["effective_value_dtype"]
-    fallback_applied = fallback_applied or prep_meta["fallback_applied"]
-    fallback_reason = fallback_reason or prep_meta["fallback_reason"]
 
     base_out = _build_random_dense(dense_size, sparse_values.dtype, device)
     expected = _pytorch_scatter_impl(
@@ -280,10 +295,36 @@ def benchmark_scatter_case(
     cusparse_reason = None
     sparse_ref_backend = None
     if run_cusparse:
-        if not reset_output:
-            skip_reason = "cuSPARSE scatter baseline only matches reset_output=True semantics"
-        elif not unique_indices:
+        if not unique_indices:
             skip_reason = "scatter sparse reference only matches unique_indices=True semantics"
+        elif _is_rocm_runtime():
+            skip_reason = None
+            try:
+                cusparse_out = base_out.clone()
+                cusparse_values, cusparse_ms = _benchmark_cuda_op(
+                    lambda: hipsparse_scatter(
+                        sparse_values,
+                        indices,
+                        dense_size=dense_size,
+                        out=cusparse_out,
+                        reset_output=reset_output,
+                    ),
+                    warmup=warmup,
+                    iters=iters,
+                )
+                sparse_ref_backend = "hipsparse"
+                cusparse_match = torch.allclose(
+                    cusparse_values, expected, atol=atol, rtol=rtol
+                )
+                cusparse_max_error = (
+                    float(torch.max(torch.abs(cusparse_values - expected)).item())
+                    if dense_size > 0
+                    else 0.0
+                )
+            except Exception as exc:
+                cusparse_reason = str(exc)
+        elif not reset_output:
+            skip_reason = "cuSPARSE scatter baseline only matches reset_output=True semantics"
         else:
             selector_data, selector_indices, selector_indptr, selector_shape = (
                 _build_scatter_selector_csr(indices, dense_size, sparse_values.dtype)
@@ -291,7 +332,7 @@ def benchmark_scatter_case(
             skip_reason = None
         if skip_reason:
             cusparse_reason = skip_reason
-        else:
+        elif not _is_rocm_runtime():
             try:
                 sparse_ref = _benchmark_spmv_csr_sparse_ref(
                     selector_data,
@@ -340,10 +381,6 @@ def benchmark_scatter_case(
             "iters": iters,
             "unique_indices": unique_indices,
             "reset_output": bool(reset_output),
-            "dtype_policy": str(dtype_policy).lower(),
-            "fallback_applied": bool(fallback_applied),
-            "index_fallback_policy": str(index_fallback_policy).lower(),
-            "kernel_index_dtype": triton_index_meta["kernel_index_dtype"],
         },
         "performance": {
             "pytorch_ms": pytorch_ms,
@@ -361,10 +398,6 @@ def benchmark_scatter_case(
         "backend_status": {
             "cusparse_unavailable_reason": cusparse_reason,
             "sparse_ref_backend": sparse_ref_backend,
-            "sparse_ref_fallback_reason": cusparse_reason,
-            "fallback_reason": fallback_reason,
-            "index_fallback_applied": bool(triton_index_meta["index_fallback_applied"]),
-            "index_fallback_reason": triton_index_meta["index_fallback_reason"],
         },
         "samples": {
             "pytorch": pytorch_values,

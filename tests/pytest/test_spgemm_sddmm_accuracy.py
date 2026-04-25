@@ -46,11 +46,40 @@ def _tol(dtype):
     return 1e-10, 1e-8
 
 
-def test_spgemm_csr_sparse_ref_backend_reports_rocm_unavailable(monkeypatch):
+def test_spgemm_csr_sparse_ref_backend_selects_hipsparse_when_direct_supported(monkeypatch):
     monkeypatch.setattr(common_mod, "_IS_ROCM_RUNTIME", True, raising=False)
-    backend, reason = spgemm_mod._spgemm_csr_sparse_ref_backend()
+    monkeypatch.setattr(
+        spgemm_mod,
+        "_hipsparse_spgemm_csr_skip_reason",
+        lambda *args, **kwargs: None,
+    )
+    backend, reason = spgemm_mod._spgemm_csr_sparse_ref_backend(
+        torch.float32,
+        torch.int32,
+        torch.int32,
+        torch.int32,
+        torch.int32,
+    )
+    assert backend == "hipsparse"
+    assert reason is None
+
+
+def test_spgemm_csr_sparse_ref_backend_reports_direct_reason_when_unsupported(monkeypatch):
+    monkeypatch.setattr(common_mod, "_IS_ROCM_RUNTIME", True, raising=False)
+    monkeypatch.setattr(
+        spgemm_mod,
+        "_hipsparse_spgemm_csr_skip_reason",
+        lambda *args, **kwargs: "direct hipSPARSE CSR SpGEMM unsupported",
+    )
+    backend, reason = spgemm_mod._spgemm_csr_sparse_ref_backend(
+        torch.float32,
+        torch.int32,
+        torch.int32,
+        torch.int32,
+        torch.int32,
+    )
     assert backend is None
-    assert "direct SpGEMM sparse reference is not implemented" in reason
+    assert reason == "direct hipSPARSE CSR SpGEMM unsupported"
 
 
 def test_spgemm_csr_sparse_ref_backend_reports_cupy_unavailable(monkeypatch):
