@@ -36,8 +36,8 @@ VALUE_DTYPES = [
     torch.complex128,
 ]
 INDEX_DTYPES = [torch.int32, torch.int64]
-CSV_VALUE_DTYPES = [torch.float32, torch.float64]
-CSV_INDEX_DTYPES = [torch.int32]
+CSV_VALUE_DTYPES = [torch.float32, torch.float64, torch.complex64, torch.complex128]
+CSV_INDEX_DTYPES = [torch.int32, torch.int64]
 TEST_CASES = [
     (512, 512, 4096, 16),
     (1024, 1024, 16384, 32),

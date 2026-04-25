@@ -549,6 +549,8 @@ def _print_coo_result(row_out):
         f"{_fmt_err(row_out['err_base']):>10} {_fmt_err(row_out['err_opt']):>10} "
         f"{row_out['status']:>6}"
     )
+    if row_out.get("cusparse_ms") is None and row_out.get("sparse_ref_reason"):
+        print(f"  hipSPARSE/cuSPARSE: {row_out['sparse_ref_reason']}")
 
 
 def _error_row(path, dtype, index_dtype, op, reason):
@@ -586,7 +588,7 @@ def run_synthetic(value_dtypes=None, index_dtypes=None, ops=None):
         return
     device = torch.device("cuda")
     print("=" * 208)
-    print("FLAGSPARSE SpMV COO BENCHMARK (synthetic dense -> COO). All backends stay COO.")
+    print("FLAGSPARSE SpMV COO BENCHMARK (synthetic dense -> COO)")
     print("=" * 208)
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Warmup: {WARMUP} | Iters: {ITERS}")
@@ -650,7 +652,7 @@ def run_all_dtypes_coo_csv(
 
     print("=" * 208)
     print("Input: MatrixMarket -> COO. FlagSparse: native COO Triton only (seg + atomic), no CSR.")
-    print("PyTorch = COO sparse.mm; CU(ms) = active sparse backend timing on the original compare slot.")
+    print("PyTorch = COO sparse.mm; CU(ms) = cuSPARSE/hipSPARSE timing on the original compare slot.")
     print("=" * 208)
     for dtype in value_dtypes:
         for index_dtype in index_dtypes:
@@ -712,6 +714,7 @@ def run_all_dtypes_coo_csv(
         "err_opt",
         "err_pt",
         "err_cu",
+        "sparse_ref_reason",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")

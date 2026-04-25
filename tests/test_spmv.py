@@ -684,7 +684,7 @@ def _print_mtx_header(value_dtype, index_dtype, op="non"):
     print(
         f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}  |  op: {op}  |  transpose: {bool(transpose)}"
     )
-    print("Formats: FlagSparse=CSR, CU(ms)=active sparse backend, PyTorch=CSR or COO.")
+    print("Formats: FlagSparse=CSR, cuSPARSE/hipSPARSE=CSR/CSC, PyTorch=CSR or COO.")
     print("Timing stays in native dtype. For float32, correctness references use float64 compute then cast.")
     print("PT/CU show per-reference correctness. Legacy CSR/CSC columns are preserved.")
     print("Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|)).")
@@ -723,6 +723,8 @@ def _print_mtx_row(r):
         f"{_fmt_speedup(csr_ms, triton_ms):>7} {_fmt_speedup(pt_ms, triton_ms):>7} "
         f"{pt_status:>6} {cu_status:>6} {err_pt_str:>10} {err_cu_str:>10}"
     )
+    if csr_ms is None and r.get("cusparse_unavailable_reason"):
+        print(f"  hipSPARSE/cuSPARSE: {r['cusparse_unavailable_reason']}")
 
 
 def print_mtx_results(results, value_dtype, index_dtype):
@@ -787,13 +789,14 @@ def run_all_dtypes_export_csv(
                     "cu_status": _status_str(r.get("triton_ok_cu", False), r.get("err_cu") is not None),
                     "status": r.get("status", r.get("error", "")),
                     "error_reason": r.get("error_reason", r.get("error")),
+                    "cusparse_unavailable_reason": r.get("cusparse_unavailable_reason"),
                     "err_pt": r.get("err_pt"),
                     "err_cu": r.get("err_cu"),
                 })
     fieldnames = [
         "matrix", "value_dtype", "index_dtype", "op", "transpose", "n_rows", "n_cols", "nnz",
         "triton_ms", "cusparse_ms", "pytorch_ms", "csc_ms",
-        "pt_status", "cu_status", "status", "error_reason", "err_pt", "err_cu",
+        "pt_status", "cu_status", "status", "error_reason", "cusparse_unavailable_reason", "err_pt", "err_cu",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -814,7 +817,7 @@ def run_comprehensive_synthetic(op="non"):
     print("FLAGSPARSE SpMV BENCHMARK (synthetic CSR)")
     print("=" * 110)
     print(f"GPU: {torch.cuda.get_device_name(0)}  |  Warmup: {WARMUP}  Iters: {ITERS}  |  op: {op}  |  transpose: {bool(transpose)}")
-    print("Formats: FlagSparse=CSR, CU(ms)=active sparse backend.")
+    print("Formats: FlagSparse=CSR, CU(ms)=cuSPARSE/hipSPARSE sparse backend.")
     print()
     total = 0
     failed = 0

@@ -36,8 +36,8 @@ VALUE_DTYPES = [
     torch.complex128,
 ]
 INDEX_DTYPES = [torch.int32, torch.int64]
-CSV_VALUE_DTYPES = [torch.float32, torch.float64]
-CSV_INDEX_DTYPES = [torch.int32]
+CSV_VALUE_DTYPES = [torch.float32, torch.float64, torch.complex64, torch.complex128]
+CSV_INDEX_DTYPES = [torch.int32, torch.int64]
 TEST_CASES = [
     (512, 512, 4096, 16),
     (1024, 1024, 16384, 32),
@@ -486,54 +486,40 @@ def run_one_mtx(
     except Exception as exc:
         result["pytorch_reason"] = str(exc)
 
-    _cupy_supported_dtypes = (
-        torch.float32,
-        torch.float64,
-        torch.complex64,
-        torch.complex128,
-    )
     if run_cusparse:
-        if value_dtype not in _cupy_supported_dtypes:
-            result["cusparse_reason"] = "float16/bfloat16 not supported by CuPy sparse; skipped"
-        else:
-            try:
-                import cupy as cp
-                import cupyx.scipy.sparse as cpx
-
-                data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-                ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
-                ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
-                B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
-                A_csr = cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
-
-                torch.cuda.synchronize()
-                for _ in range(warmup):
-                    _ = A_csr @ B_cp
-                torch.cuda.synchronize()
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                start.record()
-                for _ in range(iters):
-                    _ = A_csr @ B_cp
-                end.record()
-                torch.cuda.synchronize()
-                result["cusparse_ms"] = start.elapsed_time(end) / iters
-
-                cs_C = A_csr @ B_cp
-                cs_C_t = torch.utils.dlpack.from_dlpack(cs_C.toDlpack())
+        try:
+            sparse_ref = ast_ops._benchmark_spmm_csr_sparse_ref(
+                data,
+                indices,
+                indptr,
+                B,
+                shape,
+                warmup=warmup,
+                iters=iters,
+            )
+            if sparse_ref["backend"] is None:
+                result["cusparse_reason"] = sparse_ref["reason"]
+            else:
+                cs_C_t = sparse_ref["values"]
+                result["cusparse_ms"] = sparse_ref["ms"]
                 cusparse_metrics = ast_ops._spmm_validation_metrics(cs_C_t, ref_C)
                 result["cusparse_abs_err"] = cusparse_metrics["max_abs_error"]
                 result["cusparse_relative_error_diag"] = cusparse_metrics["max_relative_error"]
                 if triton_C is not None:
                     result["err_cu"] = _scaled_allclose_error(triton_C, cs_C_t, value_dtype)
-                    result["triton_ok_cu"] = torch.allclose(triton_C, cs_C_t, atol=atol, rtol=rtol)
-            except Exception as exc:
-                result["cusparse_ms"] = None
-                result["err_cu"] = None
-                result["cusparse_abs_err"] = None
-                result["cusparse_relative_error_diag"] = None
-                result["triton_ok_cu"] = None
-                result["cusparse_reason"] = str(exc)
+                    result["triton_ok_cu"] = torch.allclose(
+                        triton_C,
+                        cs_C_t,
+                        atol=atol,
+                        rtol=rtol,
+                    )
+        except Exception as exc:
+            result["cusparse_ms"] = None
+            result["err_cu"] = None
+            result["cusparse_abs_err"] = None
+            result["cusparse_relative_error_diag"] = None
+            result["triton_ok_cu"] = None
+            result["cusparse_reason"] = str(exc)
 
     result["status"] = "PASS" if (result["triton_ok_pt"] or result["triton_ok_cu"]) else "FAIL"
     return result

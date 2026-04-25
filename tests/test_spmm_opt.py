@@ -21,6 +21,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
+import flagsparse.sparse_operations.spmm_csr as ast_ops
 
 VALUE_DTYPES = [torch.float32, torch.float64]
 INDEX_DTYPES = [torch.int32]
@@ -175,29 +176,19 @@ def _timed_pytorch(data, indices, indptr, B, shape, warmup, iters):
     return out, start.elapsed_time(end) / iters
 
 
-def _timed_cusparse(data, indices, indptr, B, shape, warmup, iters):
-    import cupy as cp
-    import cupyx.scipy.sparse as cpx
-
-    data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-    ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
-    ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
-    B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
-    sparse = cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
-    torch.cuda.synchronize()
-    for _ in range(warmup):
-        _ = sparse @ B_cp
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        _ = sparse @ B_cp
-    end.record()
-    torch.cuda.synchronize()
-    out_cp = sparse @ B_cp
-    out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
-    return out, start.elapsed_time(end) / iters
+def _timed_sparse_backend(data, indices, indptr, B, shape, warmup, iters):
+    result = ast_ops._benchmark_spmm_csr_sparse_ref(
+        data,
+        indices,
+        indptr,
+        B,
+        shape,
+        warmup=warmup,
+        iters=iters,
+    )
+    if result["backend"] is None:
+        raise RuntimeError(result["reason"])
+    return result["values"], result["ms"]
 
 
 def _build_reference(data, indices, indptr, B, shape, dtype):
@@ -277,7 +268,7 @@ def run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
 
     cu_ms = None
     try:
-        _, cu_ms = _timed_cusparse(data, indices, indptr, B, shape, warmup, iters)
+        _, cu_ms = _timed_sparse_backend(data, indices, indptr, B, shape, warmup, iters)
     except Exception:
         pass
 

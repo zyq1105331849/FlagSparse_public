@@ -1,6 +1,6 @@
 """
 SpMV optimisation A/B test: compare _impl (baseline) vs _impl_opt (optimised)
-side-by-side, together with PyTorch and the active sparse backend baseline.
+side-by-side, together with PyTorch and the cuSPARSE/hipSPARSE compare baseline.
 
 Usage:
     python tests/test_spmv_opt.py <dir/>                # batch run, default float32
@@ -299,6 +299,8 @@ def print_row(r):
         f"{_spd(r['cu_ms'], r['opt_ms']):>8}  "
         f"{_err(r['err_base']):>10} {_err(r['err_opt']):>10} {r['status']:>6}"
     )
+    if r.get("cu_ms") is None and r.get("sparse_ref_reason"):
+        print(f"  hipSPARSE/cuSPARSE: {r['sparse_ref_reason']}")
 
 
 def run_batch(paths, dtype, index_dtype, warmup, iters):
@@ -363,6 +365,7 @@ def run_all_csv(paths, csv_path, warmup, iters):
                         ),
                         "err_base": r["err_base"],
                         "err_opt": r["err_opt"],
+                        "sparse_ref_reason": r["sparse_ref_reason"],
                         "status": r["status"],
                     }
                 )
@@ -382,6 +385,7 @@ def run_all_csv(paths, csv_path, warmup, iters):
         "opt_vs_cu",
         "err_base",
         "err_opt",
+        "sparse_ref_reason",
         "status",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -394,7 +398,7 @@ def run_all_csv(paths, csv_path, warmup, iters):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="SpMV opt A/B: baseline vs optimised, with PyTorch and sparse-ref timing."
+        description="SpMV opt A/B: baseline vs optimised, with PyTorch and cuSPARSE/hipSPARSE timing."
     )
     parser.add_argument("mtx", nargs="*", help=".mtx files or directories")
     parser.add_argument(

@@ -2350,12 +2350,41 @@ def benchmark_spmm_opt_case(
 
 def _spmm_csr_sparse_ref_backend(value_dtype, index_dtype):
     if _is_rocm_runtime():
-        return None, "hipSPARSE direct SpMM sparse reference is not implemented in this first batch"
+        backend, reason = _spmv_csr_sparse_ref_backend(
+            value_dtype,
+            index_dtype,
+            op="non",
+        )
+        if backend == "hipsparse":
+            return "hipsparse", None
+        return None, reason
     if cp is None or cpx_sparse is None:
         return None, "CuPy/cuSPARSE is not available"
     if value_dtype in (torch.float16, torch.bfloat16):
         return None, "float16/bfloat16 not supported by CuPy sparse; skipped"
     return "cupy_cusparse", None
+
+
+def _spmm_csr_ref_hipsparse(data, indices, indptr, B, shape):
+    if B.ndim != 2:
+        raise ValueError("hipSPARSE CSR SpMM reference expects a 2D dense RHS")
+    n_rows = int(shape[0])
+    n_dense_cols = int(B.shape[1])
+    if n_dense_cols == 0:
+        return torch.empty((n_rows, 0), dtype=data.dtype, device=data.device)
+
+    columns = []
+    for dense_col in range(n_dense_cols):
+        values = spmv_csr_ref_hipsparse(
+            data,
+            indices,
+            indptr,
+            B[:, dense_col].contiguous(),
+            shape,
+            op="non",
+        )
+        columns.append(values.unsqueeze(1))
+    return torch.cat(columns, dim=1)
 
 
 def _spmm_csr_reference(
@@ -2432,6 +2461,16 @@ def _benchmark_spmm_csr_sparse_ref(
         "reason": reason,
     }
     if backend is None:
+        return result
+    if backend == "hipsparse":
+        values, ms = _benchmark_cuda_op(
+            lambda: _spmm_csr_ref_hipsparse(data, indices, indptr, B, shape),
+            warmup=warmup,
+            iters=iters,
+        )
+        result["values"] = values
+        result["ms"] = ms
+        result["reason"] = None
         return result
 
     data_cp = _cupy_from_torch(data)

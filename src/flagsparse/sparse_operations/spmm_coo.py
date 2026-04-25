@@ -118,6 +118,19 @@ def _prepare_spmm_coo_canonical_inputs(data, row, col, B, shape):
         n_cols,
         n_dense_cols,
     )
+
+
+def _spmm_coo_sparse_ref_backend(value_dtype, index_dtype):
+    if _is_rocm_runtime():
+        return None, (
+            "hipSPARSE direct COO SpMM sparse reference is not implemented "
+            "until the hip-python COO SpMM API is validated on DCU"
+        )
+    if cp is None or cpx_sparse is None:
+        return None, "CuPy/cuSPARSE is not available"
+    if value_dtype in (torch.float16, torch.bfloat16):
+        return None, "float16/bfloat16 not supported by CuPy sparse; skipped"
+    return "cupy_cusparse", None
 def _seg_starts_from_sorted_rows(row_i32, nnz, device):
     if nnz == 0:
         return None
@@ -951,8 +964,12 @@ def benchmark_spmm_coo_case(
         torch.complex128,
     )
     if run_cusparse:
-        if cp is None or cpx_sparse is None:
-            cusparse_reason = "CuPy/cuSPARSE is not available"
+        sparse_backend, sparse_reason = _spmm_coo_sparse_ref_backend(
+            value_dtype,
+            index_dtype,
+        )
+        if sparse_backend is None:
+            cusparse_reason = sparse_reason
         elif value_dtype not in _cupy_supported_dtypes:
             cusparse_reason = "float16/bfloat16 not supported by CuPy sparse; skipped"
         else:
@@ -968,7 +985,9 @@ def benchmark_spmm_coo_case(
                     lambda: A_coo @ B_cp, warmup=warmup, iters=iters
                 )
                 cusparse_values = _torch_from_cupy(cusparse_values_cp)
-                cusparse_summary = _spmm_coo_pairwise_summary(cusparse_values, expected, value_dtype)
+                cusparse_summary = _spmm_coo_pairwise_summary(
+                    cusparse_values, expected, value_dtype
+                )
                 cusparse_match = cusparse_summary["match"]
             except Exception as exc:
                 cusparse_reason = str(exc)

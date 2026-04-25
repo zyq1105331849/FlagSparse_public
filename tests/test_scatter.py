@@ -13,7 +13,16 @@ DEFAULT_CASES = [
     (524_288, 16_384),
     (1_048_576, 65_536),
 ]
-DEFAULT_VALUE_DTYPES = "float32,float64,complex64,complex128"
+ALL_VALUE_DTYPE_TOKENS = [
+    "float16",
+    "bfloat16",
+    "float32",
+    "float64",
+    "complex32",
+    "complex64",
+    "complex128",
+]
+DEFAULT_VALUE_DTYPES = ",".join(ALL_VALUE_DTYPE_TOKENS)
 DEFAULT_INDEX_DTYPES = "int32,int64"
 WARMUP = 20
 ITERS = 200
@@ -56,21 +65,39 @@ def _parse_bool_token(raw, name):
 
 
 def _parse_value_dtypes(raw):
-    allowed = {
-        "float16",
-        "bfloat16",
-        "float32",
-        "float64",
-        "complex64",
-        "complex128",
-    }
+    allowed = set(ALL_VALUE_DTYPE_TOKENS + ["all"])
     tokens = [tok.strip().lower() for tok in str(raw).split(",") if tok.strip()]
     if not tokens:
         raise ValueError("value dtypes list is empty")
     invalid = [tok for tok in tokens if tok not in allowed]
     if invalid:
         raise ValueError(f"unsupported value dtypes: {invalid}")
-    return tokens
+    expanded = []
+    for tok in tokens:
+        if tok == "all":
+            expanded.extend(ALL_VALUE_DTYPE_TOKENS)
+        else:
+            expanded.append(tok)
+    return list(dict.fromkeys(expanded))
+
+
+def _torch_complex32_dtype():
+    dtype = getattr(torch, "complex32", None)
+    if dtype is None:
+        dtype = getattr(torch, "chalf", None)
+    return dtype
+
+
+def _precheck_case_support(value_dtype, dtype_policy):
+    token = str(value_dtype).strip().lower()
+    policy = str(dtype_policy).strip().lower()
+    if token == "bfloat16" and not torch.cuda.is_bf16_supported():
+        return "bfloat16 is not supported on this GPU"
+    if token == "complex32":
+        has_complex32 = _torch_complex32_dtype() is not None
+        if not has_complex32 and policy == "strict":
+            return "complex32 is unavailable in this torch build with dtype_policy=strict"
+    return None
 
 
 def _parse_index_dtypes(raw):
@@ -221,6 +248,7 @@ def run_cli(args):
     sample_rows = []
     total_cases = 0
     failed_cases = 0
+    skipped_cases = 0
 
     for value_dtype in value_dtype_tokens:
         for index_name, index_dtype in index_dtype_pairs:
@@ -232,6 +260,41 @@ def run_cli(args):
                         f"reset={str(reset_output).lower()}|unique={str(unique_indices).lower()}|"
                         f"policy={args.dtype_policy}|ifb_policy={args.index_fallback_policy}"
                     )
+                    precheck_reason = _precheck_case_support(value_dtype, args.dtype_policy)
+                    if precheck_reason:
+                        skipped_cases += 1
+                        row = {
+                            "case_id": case_id,
+                            "gpu": torch.cuda.get_device_name(0),
+                            "value_dtype_req": value_dtype,
+                            "value_dtype_compute": "N/A",
+                            "index_dtype": index_name,
+                            "dense_size": dense_size,
+                            "nnz": nnz,
+                            "unique_indices": unique_indices,
+                            "reset_output": reset_output,
+                            "dtype_policy": args.dtype_policy,
+                            "fallback_applied": False,
+                            "index_fallback_applied": False,
+                            "triton_ms": None,
+                            "pytorch_ms": None,
+                            "cusparse_ms": None,
+                            "triton_speedup_vs_pytorch": None,
+                            "triton_speedup_vs_cusparse": None,
+                            "triton_match_pytorch": None,
+                            "cusparse_match_pytorch": None,
+                            "triton_max_error": None,
+                            "cusparse_max_error": None,
+                            "cusparse_unavailable_reason": None,
+                            "fallback_reason": None,
+                            "index_fallback_reason": None,
+                            "status_reason": precheck_reason,
+                            "error_reason": precheck_reason,
+                            "status": "SKIP",
+                        }
+                        summary_rows.append(row)
+                        _print_row(row)
+                        continue
                     try:
                         result = ast.benchmark_scatter_case(
                             dense_size=dense_size,
@@ -339,6 +402,7 @@ def run_cli(args):
     print("-" * 232)
     print(f"Total cases: {total_cases}")
     print(f"Failed cases: {failed_cases}")
+    print(f"Skipped cases: {skipped_cases}")
     print(f"Passed cases: {total_cases - failed_cases}")
 
     if args.csv_summary:
