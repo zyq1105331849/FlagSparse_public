@@ -560,14 +560,14 @@ def _print_spmm_csr_mtx_header(value_dtype, index_dtype):
     print(
         f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}"
     )
-    print("Formats: FlagSparse=CSR ALG1, cuSPARSE=CSR dense-mm, PyTorch=CSR or COO.")
+    print("Formats: FlagSparse=CSR ALG1, sparse ref=hipSPARSE/cuSPARSE direct CSR SpMM, PyTorch=CSR or COO.")
     print("Timing stays in native dtype. For float32, correctness references use float64 compute then cast.")
     print("PT/CU show per-reference correctness. Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|)).")
-    print("For float32, PT checks the float64-based correctness reference while CU checks consistency with native cuSPARSE float32, so PT and CU may differ.")
+    print("For float32, PT checks the float64-based correctness reference while CU checks consistency with the native sparse backend in float32, so PT and CU may differ.")
     print("-" * 186)
     print(
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} "
-        f"{'FlagSparse(ms)':>14} {'cuSPARSE(ms)':>13} {'PyTorch(ms)':>11} "
+        f"{'FlagSparse(ms)':>14} {'CU(ms)':>13} {'PyTorch(ms)':>11} "
         f"{'FS/CU':>7} {'FS/PT':>7} {'PT':>6} {'CU':>6} {'Err(PT)':>10} {'Err(CU)':>10}"
     )
     print("-" * 186)
@@ -592,6 +592,11 @@ def _print_spmm_csr_mtx_row(entry):
         if len(msg) > 200:
             msg = msg[:197] + "..."
         print(f"  NOTE: {msg}")
+    if entry.get("cusparse_ms") is None and entry.get("cusparse_reason"):
+        reason = str(entry["cusparse_reason"]).replace("\n", " ")
+        if len(reason) > 240:
+            reason = reason[:237] + "..."
+        print(f"  CU: {reason}")
 
 
 def print_mtx_results(results, value_dtype, index_dtype):
@@ -654,12 +659,13 @@ def run_all_dtypes_export_csv(
                     ),
                     "err_pt": entry.get("err_pt"),
                     "err_cu": entry.get("err_cu"),
+                    "cusparse_reason": entry.get("cusparse_reason"),
                     "error": entry.get("error"),
                 })
     fieldnames = [
         "matrix", "value_dtype", "index_dtype", "n_rows", "n_cols", "nnz",
         "triton_ms", "cusparse_ms", "pytorch_ms",
-        "pt_status", "cu_status", "status", "err_pt", "err_cu", "error",
+        "pt_status", "cu_status", "status", "err_pt", "err_cu", "cusparse_reason", "error",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")

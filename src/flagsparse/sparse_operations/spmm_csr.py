@@ -2348,14 +2348,95 @@ def benchmark_spmm_opt_case(
     }
 
 
-def _spmm_csr_sparse_ref_backend(value_dtype, index_dtype):
+def _hipsparse_spmm_order(order_name, context):
+    mapping = {
+        "row": ("HIPSPARSE_ORDER_ROW",),
+        "col": ("HIPSPARSE_ORDER_COL",),
+    }
+    if order_name not in mapping:
+        raise RuntimeError(f"{context} does not support dense order={order_name}")
+    return _hipsparse_lookup("hipsparseOrder_t", mapping[order_name])
+
+
+def _hipsparse_spmm_alg_default():
+    return _hipsparse_lookup(
+        "hipsparseSpMMAlg_t",
+        ("HIPSPARSE_SPMM_ALG_DEFAULT",),
+    )
+
+
+def _hipsparse_create_dnmat_descriptor(
+    mat_ref,
+    rows,
+    cols,
+    ld,
+    values_ptr,
+    value_type,
+    order,
+):
+    attempts = (
+        (mat_ref, rows, cols, ld, values_ptr, value_type, order),
+    )
+    last_error = None
+    for args in attempts:
+        try:
+            return _hip_check_result(
+                hipsparse.hipsparseCreateDnMat(*args), "hipsparseCreateDnMat"
+            )
+        except TypeError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise RuntimeError(
+            f"hipsparseCreateDnMat wrapper signature mismatch: {last_error}"
+        ) from last_error
+    raise RuntimeError("hipsparseCreateDnMat wrapper signature mismatch")
+
+
+def _hipsparse_spmm_csr_skip_reason(value_dtype, indices_dtype, indptr_dtype):
+    if not _is_rocm_runtime():
+        return "hipSPARSE CSR SpMM reference requires a ROCm runtime"
+    unavailable_reason = _hipsparse_unavailable_reason()
+    if unavailable_reason is not None:
+        return unavailable_reason
+    required_symbols = (
+        "hipsparseCreate",
+        "hipsparseDestroy",
+        "hipsparseCreateCsr",
+        "hipsparseCreateDnMat",
+        "hipsparseDestroyDnMat",
+        "hipsparseDestroySpMat",
+        "hipsparseSpMM_bufferSize",
+        "hipsparseSpMM",
+    )
+    for symbol in required_symbols:
+        if not hasattr(hipsparse, symbol):
+            return f"hipSPARSE CSR SpMM direct API is unavailable: missing {symbol}"
+    try:
+        _ = _hipsparse_value_type(value_dtype)
+        _ = _hipsparse_scalar(value_dtype, 1.0, 0.0)
+        _ = _hipsparse_scalar(value_dtype, 0.0, 0.0)
+        _ = _hipsparse_index_type(
+            indptr_dtype, "hipSPARSE CSR SpMM row offsets"
+        )
+        _ = _hipsparse_index_type(
+            indices_dtype, "hipSPARSE CSR SpMM column indices"
+        )
+        _ = _hipsparse_spmm_order("row", "hipSPARSE CSR SpMM")
+        _ = _hipsparse_spmm_alg_default()
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _spmm_csr_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None):
+    indptr_dtype = index_dtype if indptr_dtype is None else indptr_dtype
     if _is_rocm_runtime():
-        backend, reason = _spmv_csr_sparse_ref_backend(
+        reason = _hipsparse_spmm_csr_skip_reason(
             value_dtype,
             index_dtype,
-            op="non",
+            indptr_dtype,
         )
-        if backend == "hipsparse":
+        if reason is None:
             return "hipsparse", None
         return None, reason
     if cp is None or cpx_sparse is None:
@@ -2365,26 +2446,220 @@ def _spmm_csr_sparse_ref_backend(value_dtype, index_dtype):
     return "cupy_cusparse", None
 
 
-def _spmm_csr_ref_hipsparse(data, indices, indptr, B, shape):
+def _spmm_csr_ref_hipsparse(data, indices, indptr, B, shape, out=None, return_metadata=False):
+    skip_reason = _hipsparse_spmm_csr_skip_reason(
+        data.dtype,
+        indices.dtype,
+        indptr.dtype,
+    )
+    if skip_reason is not None:
+        raise RuntimeError(skip_reason)
+    if not all(torch.is_tensor(t) for t in (data, indices, indptr, B)):
+        raise TypeError("data, indices, indptr, B must all be torch.Tensor")
+    if not all(t.is_cuda for t in (data, indices, indptr, B)):
+        raise ValueError("data, indices, indptr, B must all be CUDA tensors")
+    if not all(t.device == data.device for t in (indices, indptr, B)):
+        raise ValueError("data, indices, indptr, B must be on the same CUDA device")
+    if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1:
+        raise ValueError("data, indices, indptr must all be 1D tensors")
     if B.ndim != 2:
         raise ValueError("hipSPARSE CSR SpMM reference expects a 2D dense RHS")
+    if indices.numel() != data.numel():
+        raise ValueError("data and indices must have the same length")
+
     n_rows = int(shape[0])
+    n_cols = int(shape[1])
+    if indptr.numel() != n_rows + 1:
+        raise ValueError(f"indptr length must be n_rows+1={n_rows + 1}")
+    if int(B.shape[0]) != n_cols:
+        raise ValueError(f"B.shape[0] must equal n_cols={n_cols}")
+    if B.dtype != data.dtype:
+        raise TypeError("B dtype must match sparse value dtype for direct hipSPARSE SpMM")
+    if not B.is_contiguous():
+        raise ValueError("hipSPARSE CSR SpMM direct reference expects contiguous row-major B")
+
     n_dense_cols = int(B.shape[1])
     if n_dense_cols == 0:
-        return torch.empty((n_rows, 0), dtype=data.dtype, device=data.device)
+        result = torch.empty((n_rows, 0), dtype=data.dtype, device=data.device)
+        metadata = {"backend": "hipsparse", "buffer_size": 0, "format": "csr"}
+        if return_metadata:
+            return result, metadata
+        return result
 
-    columns = []
-    for dense_col in range(n_dense_cols):
-        values = spmv_csr_ref_hipsparse(
-            data,
-            indices,
-            indptr,
-            B[:, dense_col].contiguous(),
-            shape,
-            op="non",
+    data = data.contiguous()
+    indices = indices.contiguous()
+    indptr = indptr.contiguous()
+    B = B.contiguous()
+    value_type = _hipsparse_value_type(data.dtype)
+    alpha = _hipsparse_scalar(data.dtype, 1.0, 0.0)
+    beta = _hipsparse_scalar(data.dtype, 0.0, 0.0)
+    row_index_type = _hipsparse_index_type(
+        indptr.dtype, "hipSPARSE CSR SpMM row offsets"
+    )
+    col_index_type = _hipsparse_index_type(
+        indices.dtype, "hipSPARSE CSR SpMM column indices"
+    )
+    op_enum = _hipsparse_lookup(
+        "hipsparseOperation_t", ("HIPSPARSE_OPERATION_NON_TRANSPOSE",)
+    )
+    order = _hipsparse_spmm_order("row", "hipSPARSE CSR SpMM")
+    alg = _hipsparse_spmm_alg_default()
+
+    C = out
+    if C is None:
+        C = torch.empty((n_rows, n_dense_cols), dtype=data.dtype, device=data.device)
+    else:
+        if not torch.is_tensor(C):
+            raise TypeError("out must be a torch.Tensor")
+        if not C.is_cuda or C.device != data.device:
+            raise ValueError("out must be a CUDA tensor on the same device as data")
+        if C.dtype != data.dtype or C.shape != (n_rows, n_dense_cols):
+            raise ValueError("out must match the result shape and dtype")
+        if not C.is_contiguous():
+            raise ValueError("out must be contiguous row-major")
+
+    handle = None
+    spmat = None
+    matb = None
+    matc = None
+    workspace = 0
+    workspace_allocated = False
+    try:
+        handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        ptr_type = type(handle)
+
+        spmat = ptr_type()
+        matb = ptr_type()
+        matc = ptr_type()
+        spmat_ref = spmat.createRef()
+        matb_ref = matb.createRef()
+        matc_ref = matc.createRef()
+
+        row_ptr = HipPointer.fromObj(indptr.data_ptr())
+        col_ptr = HipPointer.fromObj(indices.data_ptr())
+        values_ptr = HipPointer.fromObj(data.data_ptr())
+        b_ptr = HipPointer.fromObj(B.data_ptr())
+        c_ptr = HipPointer.fromObj(C.data_ptr())
+
+        index_base = _hipsparse_lookup(
+            "hipsparseIndexBase_t", ("HIPSPARSE_INDEX_BASE_ZERO",)
         )
-        columns.append(values.unsqueeze(1))
-    return torch.cat(columns, dim=1)
+
+        _hip_check_result(
+            hipsparse.hipsparseCreateCsr(
+                spmat_ref,
+                n_rows,
+                n_cols,
+                int(data.numel()),
+                row_ptr,
+                col_ptr,
+                values_ptr,
+                row_index_type,
+                col_index_type,
+                index_base,
+                value_type,
+            ),
+            "hipsparseCreateCsr",
+        )
+        _hipsparse_create_dnmat_descriptor(
+            matb_ref,
+            n_cols,
+            n_dense_cols,
+            int(B.stride(0)),
+            b_ptr,
+            value_type,
+            order,
+        )
+        _hipsparse_create_dnmat_descriptor(
+            matc_ref,
+            n_rows,
+            n_dense_cols,
+            int(C.stride(0)),
+            c_ptr,
+            value_type,
+            order,
+        )
+
+        size_out = ctypes.c_size_t()
+        _hip_check_result(
+            hipsparse.hipsparseSpMM_bufferSize(
+                handle,
+                op_enum,
+                op_enum,
+                alpha,
+                spmat,
+                matb,
+                beta,
+                matc,
+                value_type,
+                alg,
+                size_out,
+            ),
+            "hipsparseSpMM_bufferSize",
+        )
+        buffer_size = int(size_out.value)
+        if buffer_size > 0:
+            workspace = _hip_check_result(hip.hipMalloc(buffer_size), "hipMalloc")
+            workspace_allocated = True
+        else:
+            workspace = 0
+        C.zero_()
+        _hip_check_result(
+            hipsparse.hipsparseSpMM(
+                handle,
+                op_enum,
+                op_enum,
+                alpha,
+                spmat,
+                matb,
+                beta,
+                matc,
+                value_type,
+                alg,
+                workspace,
+            ),
+            "hipsparseSpMM",
+        )
+        metadata = {
+            "backend": "hipsparse",
+            "buffer_size": buffer_size,
+            "format": "csr",
+        }
+        if return_metadata:
+            return C, metadata
+        return C
+    finally:
+        if matc is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroyDnMat(matc), "hipsparseDestroyDnMat(C)"
+                )
+            except Exception:
+                pass
+        if matb is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroyDnMat(matb), "hipsparseDestroyDnMat(B)"
+                )
+            except Exception:
+                pass
+        if spmat is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroySpMat(spmat), "hipsparseDestroySpMat"
+                )
+            except Exception:
+                pass
+        if workspace_allocated:
+            try:
+                _hip_check_result(hip.hipFree(workspace), "hipFree")
+            except Exception:
+                pass
+        if handle is not None:
+            try:
+                _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+            except Exception:
+                pass
 
 
 def _spmm_csr_reference(
@@ -2453,7 +2728,9 @@ def _benchmark_spmm_csr_sparse_ref(
     warmup,
     iters,
 ):
-    backend, reason = _spmm_csr_sparse_ref_backend(data.dtype, indices.dtype)
+    backend, reason = _spmm_csr_sparse_ref_backend(
+        data.dtype, indices.dtype, indptr.dtype
+    )
     result = {
         "backend": backend,
         "values": None,
@@ -2674,8 +2951,8 @@ def benchmark_spmm_case(
             "pytorch_unavailable_reason": pytorch_reason,
             "pytorch_sparse_format": pytorch_format,
             "cusparse_unavailable_reason": cusparse_reason,
-            "sparse_ref_backend": ref_meta["backend"] if sparse_ref_backend is None else sparse_ref_backend,
-            "sparse_ref_fallback_reason": ref_meta["fallback_reason"] if sparse_ref_backend is None else None,
+            "sparse_ref_backend": sparse_ref_backend,
+            "sparse_ref_fallback_reason": None,
             "flagsparse_internal_route": "csr-alg1",
         },
         "samples": {

@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from flagsparse import flagsparse_spmm_csr, flagsparse_spmm_csr_opt, prepare_spmm_csr_opt
+import flagsparse.sparse_operations.spmm_csr as ast_ops
 
 from tests.pytest.param_shapes import (
     MNK_SHAPES,
@@ -90,3 +91,35 @@ def test_spmm_csr_opt_matches_torch(M, N, K, dtype):
     out = flagsparse_spmm_csr_opt(B=B, prepared=prepared)
     rtol, atol = _tol(dtype)
     assert torch.allclose(out, ref, rtol=rtol, atol=atol)
+
+
+def test_spmm_csr_sparse_ref_backend_selects_hipsparse_when_direct_supported(monkeypatch):
+    monkeypatch.setattr(ast_ops, "_is_rocm_runtime", lambda: True)
+    monkeypatch.setattr(
+        ast_ops,
+        "_hipsparse_spmm_csr_skip_reason",
+        lambda value_dtype, indices_dtype, indptr_dtype: None,
+    )
+    backend, reason = ast_ops._spmm_csr_sparse_ref_backend(
+        torch.float32,
+        torch.int32,
+        torch.int64,
+    )
+    assert backend == "hipsparse"
+    assert reason is None
+
+
+def test_spmm_csr_sparse_ref_backend_reports_direct_reason_when_unsupported(monkeypatch):
+    monkeypatch.setattr(ast_ops, "_is_rocm_runtime", lambda: True)
+    monkeypatch.setattr(
+        ast_ops,
+        "_hipsparse_spmm_csr_skip_reason",
+        lambda value_dtype, indices_dtype, indptr_dtype: "direct hipSPARSE CSR SpMM unsupported",
+    )
+    backend, reason = ast_ops._spmm_csr_sparse_ref_backend(
+        torch.float64,
+        torch.int32,
+        torch.int64,
+    )
+    assert backend is None
+    assert reason == "direct hipSPARSE CSR SpMM unsupported"

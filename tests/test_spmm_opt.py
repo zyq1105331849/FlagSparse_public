@@ -187,8 +187,8 @@ def _timed_sparse_backend(data, indices, indptr, B, shape, warmup, iters):
         iters=iters,
     )
     if result["backend"] is None:
-        raise RuntimeError(result["reason"])
-    return result["values"], result["ms"]
+        return None, None, result["reason"]
+    return result["values"], result["ms"], None
 
 
 def _build_reference(data, indices, indptr, B, shape, dtype):
@@ -267,10 +267,13 @@ def run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
         pass
 
     cu_ms = None
+    sparse_ref_reason = None
     try:
-        _, cu_ms = _timed_sparse_backend(data, indices, indptr, B, shape, warmup, iters)
-    except Exception:
-        pass
+        _, cu_ms, sparse_ref_reason = _timed_sparse_backend(
+            data, indices, indptr, B, shape, warmup, iters
+        )
+    except Exception as exc:
+        sparse_ref_reason = str(exc)
 
     err_base = _error_ratio(y_base, ref, dtype)
     err_opt = _error_ratio(y_opt, ref, dtype)
@@ -291,6 +294,7 @@ def run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
         "base_ok": base_ok,
         "opt_ok": opt_ok,
         "seed": seed,
+        "sparse_ref_reason": sparse_ref_reason,
         "status": status,
     }
 
@@ -307,6 +311,11 @@ def print_row(row):
         f"{_spd(row['cu_ms'], row['opt_ms']):>8}  "
         f"{_err(row['err_base']):>10} {_err(row['err_opt']):>10} {row['status']:>6}"
     )
+    if row.get("cu_ms") is None and row.get("sparse_ref_reason"):
+        reason = str(row["sparse_ref_reason"]).replace("\n", " ")
+        if len(reason) > 240:
+            reason = reason[:237] + "..."
+        print(f"  CU: {reason}")
 
 
 def run_batch(paths, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
@@ -360,6 +369,7 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None):
                     "opt_vs_cu": (row["cu_ms"] / row["opt_ms"] if row["cu_ms"] and row["opt_ms"] and row["opt_ms"] > 0 else None),
                     "err_base": row["err_base"],
                     "err_opt": row["err_opt"],
+                    "sparse_ref_reason": row.get("sparse_ref_reason"),
                     "status": row["status"],
                 })
     fields = [
@@ -380,6 +390,7 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None):
         "opt_vs_cu",
         "err_base",
         "err_opt",
+        "sparse_ref_reason",
         "status",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
