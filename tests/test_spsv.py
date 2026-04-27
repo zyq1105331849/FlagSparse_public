@@ -37,7 +37,6 @@ TEST_SIZES = [256, 512, 1024, 2048]
 WARMUP = 5
 ITERS = 20
 
-DENSE_REF_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 SPSV_TRIANGULAR_DIAG_DOMINANCE = 4.0
 # CSR 完整组合覆盖（在原 csv-csr 逻辑外新增，不影响原入口）
 CSR_FULL_VALUE_DTYPES = [
@@ -229,13 +228,6 @@ def _triton_alg_name(fmt, op_mode=None, coo_mode=None):
 
 def _cusparse_alg_name():
     return "CUPY_SPSOLVE_TRIANGULAR"
-
-
-def _allow_dense_pytorch_ref(shape, dtype):
-    n_rows, n_cols = int(shape[0]), int(shape[1])
-    elem_bytes = torch.empty((), dtype=dtype).element_size()
-    dense_bytes = n_rows * n_cols * elem_bytes
-    return dense_bytes <= DENSE_REF_MAX_BYTES
 
 
 def _build_random_triangular_csr(n, value_dtype, index_dtype, device, lower=True):
@@ -986,41 +978,36 @@ def _finalize_csv_row(
     err_pt = None
     ok_pt = False
     pt_skip_reason = None
-    if _allow_dense_pytorch_ref(shape, value_dtype):
-        try:
-            A_dense = _csr_to_dense(
-                data, indices.to(torch.int64), indptr, shape
-            )
-            ref_dtype = _dense_ref_dtype(value_dtype)
-            A_ref = A_dense.to(ref_dtype)
-            b_ref = b.to(ref_dtype)
-            e0 = torch.cuda.Event(True)
-            e1 = torch.cuda.Event(True)
-            torch.cuda.synchronize()
-            e0.record()
-            x_ref = _triangular_solve_reference(
-                A_ref, b_ref, lower=lower, op_mode="NON"
-            )
-            x_cmp = _compare_view(x, value_dtype)
-            x_ref_cmp = _compare_view(x_ref, value_dtype)
-            e1.record()
-            torch.cuda.synchronize()
-            pytorch_ms = e0.elapsed_time(e1)
-            err_pt = (
-                float(torch.max(torch.abs(x_cmp - x_ref_cmp)).item())
-                if n_rows > 0
-                else 0.0
-            )
-            ok_pt = torch.allclose(x_cmp, x_ref_cmp, atol=atol, rtol=rtol)
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                pt_skip_reason = "PyTorch dense ref OOM; skipped"
-            else:
-                raise
-    else:
-        pt_skip_reason = (
-            f"PyTorch dense ref skipped (> {DENSE_REF_MAX_BYTES // (1024**3)} GiB dense matrix)"
+    try:
+        A_dense = _csr_to_dense(
+            data, indices.to(torch.int64), indptr, shape
         )
+        ref_dtype = _dense_ref_dtype(value_dtype)
+        A_ref = A_dense.to(ref_dtype)
+        b_ref = b.to(ref_dtype)
+        e0 = torch.cuda.Event(True)
+        e1 = torch.cuda.Event(True)
+        torch.cuda.synchronize()
+        e0.record()
+        x_ref = _triangular_solve_reference(
+            A_ref, b_ref, lower=lower, op_mode="NON"
+        )
+        x_cmp = _compare_view(x, value_dtype)
+        x_ref_cmp = _compare_view(x_ref, value_dtype)
+        e1.record()
+        torch.cuda.synchronize()
+        pytorch_ms = e0.elapsed_time(e1)
+        err_pt = (
+            float(torch.max(torch.abs(x_cmp - x_ref_cmp)).item())
+            if n_rows > 0
+            else 0.0
+        )
+        ok_pt = torch.allclose(x_cmp, x_ref_cmp, atol=atol, rtol=rtol)
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            pt_skip_reason = "PyTorch dense ref OOM; skipped"
+        else:
+            raise
 
     cupy_ms = None
     err_cu = None
@@ -1212,38 +1199,33 @@ def _finalize_csv_row_csr_full(
     err_pt = None
     ok_pt = False
     pt_skip_reason = None
-    if _allow_dense_pytorch_ref(shape, value_dtype):
-        try:
-            A_dense = _csr_to_dense(
-                data, indices.to(torch.int64), indptr.to(torch.int64), shape
-            ).to(_dense_ref_dtype(value_dtype))
-            e0 = torch.cuda.Event(True)
-            e1 = torch.cuda.Event(True)
-            torch.cuda.synchronize()
-            e0.record()
-            x_ref = _triangular_solve_reference(
-                A_dense, b.to(A_dense.dtype), lower=lower, op_mode=op_mode
-            )
-            x_cmp = _compare_view(x, value_dtype)
-            x_ref_cmp = _compare_view(x_ref, value_dtype)
-            e1.record()
-            torch.cuda.synchronize()
-            pytorch_ms = e0.elapsed_time(e1)
-            err_pt = (
-                float(torch.max(torch.abs(x_cmp - x_ref_cmp)).item())
-                if n_rows > 0
-                else 0.0
-            )
-            ok_pt = torch.allclose(x_cmp, x_ref_cmp, atol=atol, rtol=rtol)
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                pt_skip_reason = "PyTorch dense ref OOM; skipped"
-            else:
-                raise
-    else:
-        pt_skip_reason = (
-            f"PyTorch dense ref skipped (> {DENSE_REF_MAX_BYTES // (1024**3)} GiB dense matrix)"
+    try:
+        A_dense = _csr_to_dense(
+            data, indices.to(torch.int64), indptr.to(torch.int64), shape
+        ).to(_dense_ref_dtype(value_dtype))
+        e0 = torch.cuda.Event(True)
+        e1 = torch.cuda.Event(True)
+        torch.cuda.synchronize()
+        e0.record()
+        x_ref = _triangular_solve_reference(
+            A_dense, b.to(A_dense.dtype), lower=lower, op_mode=op_mode
         )
+        x_cmp = _compare_view(x, value_dtype)
+        x_ref_cmp = _compare_view(x_ref, value_dtype)
+        e1.record()
+        torch.cuda.synchronize()
+        pytorch_ms = e0.elapsed_time(e1)
+        err_pt = (
+            float(torch.max(torch.abs(x_cmp - x_ref_cmp)).item())
+            if n_rows > 0
+            else 0.0
+        )
+        ok_pt = torch.allclose(x_cmp, x_ref_cmp, atol=atol, rtol=rtol)
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            pt_skip_reason = "PyTorch dense ref OOM; skipped"
+        else:
+            raise
 
     cupy_ms = None
     err_cu = None
@@ -1666,7 +1648,7 @@ def _check_one_csr_transpose_case(path, value_dtype, index_dtype, op_mode, devic
 
     ref_err = None
     ref_ok = None
-    if _allow_dense_pytorch_ref(shape, value_dtype):
+    try:
         A_dense = _csr_to_dense(
             data, indices.to(torch.int64), indptr.to(torch.int64), shape
         ).to(_dense_ref_dtype(value_dtype))
@@ -1677,6 +1659,9 @@ def _check_one_csr_transpose_case(path, value_dtype, index_dtype, op_mode, devic
             float(torch.max(torch.abs(x_op - x_ref)).item()) if x_op.numel() > 0 else 0.0
         )
         ref_ok = torch.allclose(x_op, x_ref, atol=atol, rtol=rtol)
+    except RuntimeError as e:
+        if "out of memory" not in str(e).lower():
+            raise
 
     status = "PASS" if action_ok and solve_ok and (ref_ok is not False) else "FAIL"
     return {
