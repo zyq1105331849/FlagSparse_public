@@ -35,7 +35,7 @@ CSV_INDEX_DTYPES = [torch.int32]
 WARMUP = 5
 ITERS = 20
 SPSM_PYTORCH_DENSE_GPU_SAFETY_FACTOR = 3.0
-SPSM_OP_MODES = ["NON"]
+SPSM_OP_MODES = ["NON", "NON_TRANS"]
 
 
 def _dtype_name(dtype):
@@ -79,7 +79,10 @@ def _parse_ops_filter(raw):
         raise ValueError(
             f"unsupported spsm ops: {invalid}; current SpSM test only supports NON/NON_TRANS"
         )
-    return tokens
+    normalized = []
+    for tok in tokens:
+        normalized.append("NON" if tok == "NON_TRANS" else tok)
+    return normalized
 
 
 def _build_triangular_case(n=512, n_rhs=32, value_dtype=torch.float32):
@@ -560,6 +563,11 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=32):
                     "index_dtype": _dtype_name(index_dtype),
                 }
                 try:
+                    print(
+                        f"RUNNING: {base['matrix']} | dtype={base['value_dtype']} | "
+                        f"index={base['index_dtype']} | fmt={fmt}",
+                        flush=True,
+                    )
                     data, indices, indptr, shape = _load_mtx_to_csr_torch(
                         path,
                         dtype=value_dtype,
@@ -595,6 +603,8 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=32):
                         if row["cusparse_reason"]:
                             print(f"  NOTE: {row['cusparse_reason']}")
                 except Exception as exc:
+                    err_msg = str(exc)
+                    status = "SKIP" if "SpSM requires square matrices" in err_msg else "ERROR"
                     row = {
                         **base,
                         "format": fmt,
@@ -610,14 +620,14 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=32):
                         "pytorch_backend": None,
                         "cusparse/triton": None,
                         "pytorch/triton": None,
-                        "status": "ERROR",
+                        "status": status,
                         "err_ref": None,
                         "err_res": None,
                         "err_pt": None,
                         "err_cu": None,
                         "pytorch_reason": None,
                         "cusparse_reason": None,
-                        "error": str(exc),
+                        "error": err_msg,
                     }
                     rows_out.append(row)
                     short = base["matrix"][:27] + ("…" if len(base["matrix"]) > 27 else "")
@@ -626,10 +636,10 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=32):
                         f"{'ERR':>7} {int(n_rhs):>6} {'ERR':>10} "
                         f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} "
                         f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} "
-                        f"{'N/A':>10} {'N/A':>10} {'ERROR':>10} "
+                        f"{'N/A':>10} {'N/A':>10} {status:>10} "
                         f"{_fmt_err(None):>12} {_fmt_err(None):>12} {_fmt_err(None):>12} {_fmt_err(None):>12}"
                     )
-                    print(f"  ERROR: {exc}")
+                    print(f"  {status}: {exc}")
 
     print("-" * 176)
     fieldnames = [
@@ -690,7 +700,7 @@ def main():
 
     ops = _parse_ops_filter(args.ops)
     if any(op != "NON" for op in ops):
-        raise ValueError("SpSM test currently supports only --ops NON")
+        raise ValueError("SpSM test currently supports only --ops NON/NON_TRANS")
 
     if args.synthetic:
         run_spsm_synthetic_all(n=args.n, n_rhs=args.rhs)
