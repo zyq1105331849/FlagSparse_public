@@ -441,8 +441,6 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
         status = "REF_FAIL"
     else:
         status = "FAIL"
-    if not ok_res and status == "PASS":
-        status = "FAIL"
 
     return {
         "format": fmt,

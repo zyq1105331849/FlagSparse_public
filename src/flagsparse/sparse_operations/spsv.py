@@ -46,6 +46,10 @@ SPSV_PROMOTE_TRANSPOSE_FP32_TO_FP64 = _spsv_env_flag(
 SPSV_PROMOTE_TRANSPOSE_COMPLEX64_TO_COMPLEX128 = _spsv_env_flag(
     "FLAGSPARSE_SPSV_PROMOTE_TRANSPOSE_COMPLEX64_TO_COMPLEX128", "0"
 )
+SPSV_ENABLE_CSR_CW = _spsv_env_flag("FLAGSPARSE_SPSV_ENABLE_CSR_CW", "0")
+SPSV_ENABLE_TRANSPOSE_CW = _spsv_env_flag("FLAGSPARSE_SPSV_ENABLE_TRANSPOSE_CW", "0")
+SPSV_ENABLE_LEVEL_FRONTIERS = _spsv_env_flag("FLAGSPARSE_SPSV_ENABLE_LEVEL_FRONTIERS", "0")
+SPSV_ENABLE_REVERSE_FRONTIERS = _spsv_env_flag("FLAGSPARSE_SPSV_ENABLE_REVERSE_FRONTIERS", "0")
 _SPSV_CSR_PREPROCESS_CACHE = OrderedDict()
 _SPSV_CSR_PREPROCESS_CACHE_SIZE = 8
 
@@ -528,8 +532,10 @@ def _prepare_spsv_csr_system(data, indices64, indptr64, n_rows, n_cols, lower, t
             "kernel_indices32": indices64.to(torch.int32),
             "kernel_indptr64": indptr64,
             "lower_eff": lower,
-            "launch_groups": _build_spsv_frontiers(
-                indptr64, indices64, levels, lower=lower
+            "launch_groups": (
+                _build_spsv_frontiers(indptr64, indices64, levels, lower=lower)
+                if SPSV_ENABLE_LEVEL_FRONTIERS
+                else levels
             ),
             "default_block_nnz": default_block_nnz,
             "default_max_segments": default_max_segments,
@@ -539,6 +545,8 @@ def _prepare_spsv_csr_system(data, indices64, indptr64, n_rows, n_cols, lower, t
             "route_name": "csr_levels",
             "alt_plan": None,
         }
+        if not SPSV_ENABLE_CSR_CW:
+            return levels_plan
         data_sorted, indices_sorted64, indptr_sorted64 = _sort_csr_rows(
             data, indices64, indptr64, n_rows, n_cols, lower=lower
         )
@@ -583,8 +591,10 @@ def _prepare_spsv_csr_system(data, indices64, indptr64, n_rows, n_cols, lower, t
         "kernel_indices32": indices64.to(torch.int32),
         "kernel_indptr64": indptr64,
         "lower_eff": lower,
-        "launch_groups": _build_spsv_reverse_frontiers(
-            indptr64, indices64, levels, lower=lower
+        "launch_groups": (
+            _build_spsv_reverse_frontiers(indptr64, indices64, levels, lower=lower)
+            if SPSV_ENABLE_REVERSE_FRONTIERS
+            else list(reversed(levels))
         ),
         "default_block_nnz": default_block_nnz,
         "default_max_segments": default_max_segments,
@@ -594,6 +604,8 @@ def _prepare_spsv_csr_system(data, indices64, indptr64, n_rows, n_cols, lower, t
         "route_name": "transpose_push",
         "alt_plan": None,
     }
+    if not SPSV_ENABLE_TRANSPOSE_CW:
+        return push_plan
 
     diag, indegree_init = _prepare_spsv_transpose_cw_metadata(
         data, indices64, indptr64, n_rows, lower, unit_diagonal=unit_diagonal
