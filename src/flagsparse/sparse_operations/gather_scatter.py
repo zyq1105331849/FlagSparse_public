@@ -14,6 +14,7 @@ _hipsparse_lookup = _common_mod._hipsparse_lookup
 _hipsparse_unavailable_reason = _common_mod._hipsparse_unavailable_reason
 _hipsparse_value_type = _common_mod._hipsparse_value_type
 _hipsparse_index_type = _common_mod._hipsparse_index_type
+_benchmark_prepared_cuda_op = _common_mod._benchmark_prepared_cuda_op
 
 SUPPORTED_SCATTER_VALUE_DTYPES = (
     torch.float16,
@@ -342,7 +343,7 @@ def _hipsparse_create_dnvec_descriptor(dnvec_ref, size, values, value_type):
     )
 
 
-def hipsparse_gather(dense_vector, indices, out=None, return_metadata=False):
+def _prepare_hipsparse_gather(dense_vector, indices, out=None):
     dense_vector, indices = _prepare_hipsparse_gather_inputs(dense_vector, indices)
     skip_reason = _hipsparse_gather_scatter_skip_reason(
         dense_vector.dtype, indices.dtype, "gather"
@@ -396,45 +397,90 @@ def hipsparse_gather(dense_vector, indices, out=None, return_metadata=False):
             dense_vector,
             value_type,
         )
-        _hip_check_result(
-            hipsparse.hipsparseGather(handle, dnvec, spvec),
-            "hipsparseGather",
-        )
-        if return_metadata:
-            return sparse_values, {"backend": "hipsparse"}
-        return sparse_values
+        return {
+            "backend": "hipsparse",
+            "handle": handle,
+            "spvec": spvec,
+            "dnvec": dnvec,
+            "values": sparse_values,
+        }
     finally:
-        if dnvec is not None:
+        if handle is None and dnvec is not None:
             try:
                 _hip_check_result(hipsparse.hipsparseDestroyDnVec(dnvec), "hipsparseDestroyDnVec")
             except Exception:
                 pass
-        if spvec is not None:
+        if handle is None and spvec is not None:
             try:
                 _hip_check_result(hipsparse.hipsparseDestroySpVec(spvec), "hipsparseDestroySpVec")
             except Exception:
                 pass
-        if handle is not None:
-            try:
-                _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
-            except Exception:
-                pass
+ 
+
+def _run_hipsparse_gather_prepared(state):
+    _hip_check_result(
+        hipsparse.hipsparseGather(state["handle"], state["dnvec"], state["spvec"]),
+        "hipsparseGather",
+    )
+    return state["values"]
 
 
-def hipsparse_scatter(
+def _destroy_hipsparse_gather_prepared(state):
+    dnvec = state.get("dnvec")
+    spvec = state.get("spvec")
+    handle = state.get("handle")
+    if dnvec is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroyDnVec(dnvec), "hipsparseDestroyDnVec")
+        except Exception:
+            pass
+    if spvec is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroySpVec(spvec), "hipsparseDestroySpVec")
+        except Exception:
+            pass
+    if handle is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+        except Exception:
+            pass
+
+
+def hipsparse_gather(dense_vector, indices, out=None, return_metadata=False):
+    state = _prepare_hipsparse_gather(dense_vector, indices, out=out)
+    try:
+        values = _run_hipsparse_gather_prepared(state)
+        if return_metadata:
+            return values, {"backend": "hipsparse"}
+        return values
+    finally:
+        _destroy_hipsparse_gather_prepared(state)
+
+
+def benchmark_hipsparse_gather(dense_vector, indices, warmup, iters, out=None):
+    return _benchmark_prepared_cuda_op(
+        lambda: _prepare_hipsparse_gather(dense_vector, indices, out=out),
+        _run_hipsparse_gather_prepared,
+        _destroy_hipsparse_gather_prepared,
+        warmup=warmup,
+        iters=iters,
+    )
+
+
+def _prepare_hipsparse_scatter(
     sparse_values,
     indices,
     dense_size=None,
     out=None,
     reset_output=True,
-    return_metadata=False,
+    dtype_policy="strict",
 ):
     sparse_values, indices, _, dense_size, _ = _prepare_scatter_inputs(
         sparse_values,
         indices,
         dense_size=dense_size,
         out=out,
-        dtype_policy="strict",
+        dtype_policy=dtype_policy,
         return_metadata=True,
     )
     _validate_scatter_value_dtype(sparse_values)
@@ -488,29 +534,105 @@ def hipsparse_scatter(
             dense_values,
             value_type,
         )
-        _hip_check_result(
-            hipsparse.hipsparseScatter(handle, spvec, dnvec),
-            "hipsparseScatter",
-        )
-        if return_metadata:
-            return dense_values, {"backend": "hipsparse"}
-        return dense_values
+        return {
+            "backend": "hipsparse",
+            "handle": handle,
+            "spvec": spvec,
+            "dnvec": dnvec,
+            "values": dense_values,
+        }
     finally:
-        if dnvec is not None:
+        if handle is None and dnvec is not None:
             try:
                 _hip_check_result(hipsparse.hipsparseDestroyDnVec(dnvec), "hipsparseDestroyDnVec")
             except Exception:
                 pass
-        if spvec is not None:
+        if handle is None and spvec is not None:
             try:
                 _hip_check_result(hipsparse.hipsparseDestroySpVec(spvec), "hipsparseDestroySpVec")
             except Exception:
                 pass
-        if handle is not None:
-            try:
-                _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
-            except Exception:
-                pass
+ 
+
+def _run_hipsparse_scatter_prepared(state):
+    _hip_check_result(
+        hipsparse.hipsparseScatter(state["handle"], state["spvec"], state["dnvec"]),
+        "hipsparseScatter",
+    )
+    return state["values"]
+
+
+def _destroy_hipsparse_scatter_prepared(state):
+    dnvec = state.get("dnvec")
+    spvec = state.get("spvec")
+    handle = state.get("handle")
+    if dnvec is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroyDnVec(dnvec), "hipsparseDestroyDnVec")
+        except Exception:
+            pass
+    if spvec is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroySpVec(spvec), "hipsparseDestroySpVec")
+        except Exception:
+            pass
+    if handle is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+        except Exception:
+            pass
+
+
+def hipsparse_scatter(
+    sparse_values,
+    indices,
+    dense_size=None,
+    out=None,
+    reset_output=True,
+    dtype_policy="strict",
+    return_metadata=False,
+):
+    state = _prepare_hipsparse_scatter(
+        sparse_values,
+        indices,
+        dense_size=dense_size,
+        out=out,
+        reset_output=reset_output,
+        dtype_policy=dtype_policy,
+    )
+    try:
+        values = _run_hipsparse_scatter_prepared(state)
+        if return_metadata:
+            return values, {"backend": "hipsparse"}
+        return values
+    finally:
+        _destroy_hipsparse_scatter_prepared(state)
+
+
+def benchmark_hipsparse_scatter(
+    sparse_values,
+    indices,
+    dense_size=None,
+    out=None,
+    reset_output=True,
+    dtype_policy="strict",
+    warmup=20,
+    iters=200,
+):
+    return _benchmark_prepared_cuda_op(
+        lambda: _prepare_hipsparse_scatter(
+            sparse_values,
+            indices,
+            dense_size=dense_size,
+            out=out,
+            reset_output=reset_output,
+            dtype_policy=dtype_policy,
+        ),
+        _run_hipsparse_scatter_prepared,
+        _destroy_hipsparse_scatter_prepared,
+        warmup=warmup,
+        iters=iters,
+    )
 
 
 def _cusparse_spmv(selector_matrix, dense_vector):
@@ -769,11 +891,12 @@ def cusparse_spmv_gather(dense_vector, indices, selector_matrix=None):
     """Sparse reference gather via direct hipSPARSE on ROCm or cuSPARSE-backed COO SpMV."""
     dense_vector, indices, _ = _prepare_inputs(dense_vector, indices)
     if _is_rocm_runtime():
-        torch.cuda.synchronize()
-        start_time = time.perf_counter()
-        sparse_values = hipsparse_gather(dense_vector, indices)
-        torch.cuda.synchronize()
-        execution_time_ms = (time.perf_counter() - start_time) * 1000.0
+        sparse_values, execution_time_ms = benchmark_hipsparse_gather(
+            dense_vector,
+            indices,
+            warmup=20,
+            iters=200,
+        )
         return sparse_values, execution_time_ms, None
 
     skip_reason = _cusparse_baseline_skip_reason(dense_vector.dtype)
@@ -813,16 +936,14 @@ def cusparse_spmv_scatter(
     )
     _validate_scatter_value_dtype(sparse_values)
     if _is_rocm_runtime():
-        torch.cuda.synchronize()
-        start_time = time.perf_counter()
-        dense_values = hipsparse_scatter(
+        dense_values, execution_time_ms = benchmark_hipsparse_scatter(
             sparse_values,
             indices,
             dense_size=dense_size,
             reset_output=True,
+            warmup=20,
+            iters=200,
         )
-        torch.cuda.synchronize()
-        execution_time_ms = (time.perf_counter() - start_time) * 1000.0
         return dense_values, execution_time_ms, None
 
     skip_reason = _cusparse_baseline_skip_reason(sparse_values.dtype)

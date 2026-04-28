@@ -756,6 +756,7 @@ def _print_spmm_coo_mtx_header(value_dtype, index_dtype, route):
     print(f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}")
     print(f"Formats: FlagSparse={_route_label(route)}, sparse ref=hipSPARSE/cuSPARSE direct COO SpMM, PyTorch=COO.")
     print("Timing stays in native dtype. For float32, correctness references use float64 compute then cast.")
+    print("CU(ms) reports steady-state direct sparse backend time only; setup, preprocess, and workspace management are excluded.")
     print("PT/CU show per-reference correctness. Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|)).")
     print("PyTorch uses COO sparse.mm as the only correctness reference path.")
     if route == "compare":

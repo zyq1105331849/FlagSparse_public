@@ -562,6 +562,7 @@ def _print_spmm_csr_mtx_header(value_dtype, index_dtype):
     )
     print("Formats: FlagSparse=CSR ALG1, sparse ref=hipSPARSE/cuSPARSE direct CSR SpMM, PyTorch=CSR or COO.")
     print("Timing stays in native dtype. For float32, correctness references use float64 compute then cast.")
+    print("CU(ms) reports steady-state direct sparse backend time only; setup, preprocess, and workspace management are excluded.")
     print("PT/CU show per-reference correctness. Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|)).")
     print("For float32, PT checks the float64-based correctness reference while CU checks consistency with the native sparse backend in float32, so PT and CU may differ.")
     print("-" * 186)
@@ -874,7 +875,7 @@ def run_comprehensive_synthetic(
         f"BLOCK_N: {_fmt_launch_value(block_n)}  BLOCK_NNZ: {_fmt_launch_value(block_nnz)}  "
         f"MAX_SEGMENTS: {_fmt_launch_value(max_segments)}"
     )
-    print("Formats: FlagSparse=CSR ALG1, cuSPARSE=CSR dense-mm (when supported), PyTorch=CSR or COO.")
+    print("Formats: FlagSparse=CSR ALG1, cuSPARSE/hipSPARSE=CSR dense-mm steady-state direct backend (when supported), PyTorch=CSR or COO.")
     print("For float32, PT checks the float64-based correctness reference while CU reflects native cuSPARSE float32 consistency.")
     print()
 

@@ -289,7 +289,18 @@ def _benchmark_gather_case(
     cusparse_reason = None
     if run_cusparse:
         try:
-            cusparse_values, cusparse_ms = _bench_cuda_op(cusparse_op, warmup=warmup, iters=iters)
+            if getattr(torch.version, "hip", None) is not None:
+                cusparse_values, cusparse_ms = ast.benchmark_hipsparse_gather(
+                    dense_vector, indices, warmup=warmup, iters=iters
+                )
+            elif mode == "gather_cupy":
+                cusparse_values, cusparse_ms = _bench_cuda_op(
+                    cusparse_op, warmup=warmup, iters=iters
+                )
+            else:
+                cusparse_values, cusparse_ms = _bench_cuda_op(
+                    cusparse_op, warmup=warmup, iters=iters
+                )
             cusparse_match = torch.allclose(cusparse_values, expected, atol=atol, rtol=rtol)
             cusparse_max_error = (
                 float(torch.max(torch.abs(cusparse_values - expected)).item())
@@ -380,7 +391,7 @@ def run_cli(args):
     print("=" * 180)
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(
-        f"Warmup: {args.warmup} | Iterations: {args.iters}"
+        f"Warmup: {args.warmup} | Iterations: {args.iters} | CU(ms): direct sparse backend steady-state time"
     )
     print()
     _print_header()

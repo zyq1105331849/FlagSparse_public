@@ -17,6 +17,8 @@ from .benchmarks import (
     comprehensive_spsm_test,
 )
 from .gather_scatter import (
+    benchmark_hipsparse_gather,
+    benchmark_hipsparse_scatter,
     cusparse_spmv_gather,
     cusparse_spmv_gather_cupy,
     cusparse_spmv_scatter,
@@ -62,6 +64,8 @@ __all__ = [
     "SUPPORTED_INDEX_DTYPES",
     "SUPPORTED_VALUE_DTYPES",
     "benchmark_gather_case",
+    "benchmark_hipsparse_gather",
+    "benchmark_hipsparse_scatter",
     "benchmark_performance",
     "benchmark_scatter_case",
     "benchmark_sddmm_case",

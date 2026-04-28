@@ -1,5 +1,5 @@
 """
-SpMM opt A/B test: compare base vs opt side-by-side with PyTorch and cuSPARSE timings.
+SpMM opt A/B test: compare base vs opt side-by-side with PyTorch and cuSPARSE/hipSPARSE steady-state timings.
 
 Usage:
     python tests/test_spmm_opt.py <dir/> --dense-cols 32
@@ -402,7 +402,7 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SpMM opt A/B: baseline vs optimised, with PyTorch/cuSPARSE timings.")
+    parser = argparse.ArgumentParser(description="SpMM opt A/B: baseline vs optimised, with PyTorch/cuSPARSE/hipSPARSE steady-state timings.")
     parser.add_argument("mtx", nargs="*", help=".mtx files or directories")
     parser.add_argument("--csv", type=str, default=None, metavar="FILE", help="Export all dtypes to CSV")
     parser.add_argument("--dtype", default="float32", choices=["float32", "float64"])

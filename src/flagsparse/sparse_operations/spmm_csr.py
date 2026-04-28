@@ -2444,7 +2444,7 @@ def _spmm_csr_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None):
     return "cupy_cusparse", None
 
 
-def _spmm_csr_ref_hipsparse(data, indices, indptr, B, shape, out=None, return_metadata=False):
+def _prepare_spmm_csr_ref_hipsparse(data, indices, indptr, B, shape, out=None):
     skip_reason = _hipsparse_spmm_csr_skip_reason(
         data.dtype,
         indices.dtype,
@@ -2478,11 +2478,13 @@ def _spmm_csr_ref_hipsparse(data, indices, indptr, B, shape, out=None, return_me
 
     n_dense_cols = int(B.shape[1])
     if n_dense_cols == 0:
-        result = torch.empty((n_rows, 0), dtype=data.dtype, device=data.device)
-        metadata = {"backend": "hipsparse", "buffer_size": 0, "format": "csr"}
-        if return_metadata:
-            return result, metadata
-        return result
+        return {
+            "backend": "hipsparse",
+            "buffer_size": 0,
+            "format": "csr",
+            "C": torch.empty((n_rows, 0), dtype=data.dtype, device=data.device),
+            "empty": True,
+        }
 
     data = data.contiguous()
     indices = indices.contiguous()
@@ -2617,63 +2619,129 @@ def _spmm_csr_ref_hipsparse(data, indices, indptr, B, shape, out=None, return_me
             ),
             "hipsparseSpMM_preprocess",
         )
-        C.zero_()
-        _hip_check_result(
-            hipsparse.hipsparseSpMM(
-                handle,
-                op_enum,
-                op_enum,
-                alpha,
-                spmat,
-                matb,
-                beta,
-                matc,
-                value_type,
-                alg,
-                workspace,
-            ),
-            "hipsparseSpMM",
-        )
-        metadata = {
+        return {
             "backend": "hipsparse",
             "buffer_size": buffer_size,
             "format": "csr",
+            "handle": handle,
+            "spmat": spmat,
+            "matb": matb,
+            "matc": matc,
+            "workspace": workspace,
+            "workspace_allocated": workspace_allocated,
+            "op_enum": op_enum,
+            "alpha": alpha,
+            "beta": beta,
+            "value_type": value_type,
+            "alg": alg,
+            "C": C,
+            "empty": False,
         }
-        if return_metadata:
-            return C, metadata
-        return C
     finally:
-        if matc is not None:
+        if handle is None and matc is not None:
             try:
                 _hip_check_result(
                     hipsparse.hipsparseDestroyDnMat(matc), "hipsparseDestroyDnMat(C)"
                 )
             except Exception:
                 pass
-        if matb is not None:
+        if handle is None and matb is not None:
             try:
                 _hip_check_result(
                     hipsparse.hipsparseDestroyDnMat(matb), "hipsparseDestroyDnMat(B)"
                 )
             except Exception:
                 pass
-        if spmat is not None:
+        if handle is None and spmat is not None:
             try:
                 _hip_check_result(
                     hipsparse.hipsparseDestroySpMat(spmat), "hipsparseDestroySpMat"
                 )
             except Exception:
                 pass
-        if workspace_allocated:
+        if handle is None and workspace_allocated:
             try:
                 _hip_check_result(hip.hipFree(workspace), "hipFree")
             except Exception:
                 pass
-        if handle is not None:
-            try:
-                _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
-            except Exception:
-                pass
+ 
+
+def _run_spmm_csr_ref_hipsparse_prepared(state):
+    if state.get("empty"):
+        return state["C"]
+    _hip_check_result(
+        hipsparse.hipsparseSpMM(
+            state["handle"],
+            state["op_enum"],
+            state["op_enum"],
+            state["alpha"],
+            state["spmat"],
+            state["matb"],
+            state["beta"],
+            state["matc"],
+            state["value_type"],
+            state["alg"],
+            state["workspace"],
+        ),
+        "hipsparseSpMM",
+    )
+    return state["C"]
+
+
+def _destroy_spmm_csr_ref_hipsparse_prepared(state):
+    matc = state.get("matc")
+    matb = state.get("matb")
+    spmat = state.get("spmat")
+    workspace_allocated = bool(state.get("workspace_allocated"))
+    workspace = state.get("workspace", 0)
+    handle = state.get("handle")
+    if matc is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnMat(matc), "hipsparseDestroyDnMat(C)"
+            )
+        except Exception:
+            pass
+    if matb is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnMat(matb), "hipsparseDestroyDnMat(B)"
+            )
+        except Exception:
+            pass
+    if spmat is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroySpMat(spmat), "hipsparseDestroySpMat"
+            )
+        except Exception:
+            pass
+    if workspace_allocated:
+        try:
+            _hip_check_result(hip.hipFree(workspace), "hipFree")
+        except Exception:
+            pass
+    if handle is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+        except Exception:
+            pass
+
+
+def _spmm_csr_ref_hipsparse(data, indices, indptr, B, shape, out=None, return_metadata=False):
+    state = _prepare_spmm_csr_ref_hipsparse(data, indices, indptr, B, shape, out=out)
+    try:
+        C = _run_spmm_csr_ref_hipsparse_prepared(state)
+        metadata = {
+            "backend": "hipsparse",
+            "buffer_size": int(state.get("buffer_size", 0)),
+            "format": "csr",
+        }
+        if return_metadata:
+            return C, metadata
+        return C
+    finally:
+        _destroy_spmm_csr_ref_hipsparse_prepared(state)
 
 
 def _spmm_csr_reference(
@@ -2754,8 +2822,10 @@ def _benchmark_spmm_csr_sparse_ref(
     if backend is None:
         return result
     if backend == "hipsparse":
-        values, ms = _benchmark_cuda_op(
-            lambda: _spmm_csr_ref_hipsparse(data, indices, indptr, B, shape),
+        values, ms = _common_mod._benchmark_prepared_cuda_op(
+            lambda: _prepare_spmm_csr_ref_hipsparse(data, indices, indptr, B, shape),
+            _run_spmm_csr_ref_hipsparse_prepared,
+            _destroy_spmm_csr_ref_hipsparse_prepared,
             warmup=warmup,
             iters=iters,
         )

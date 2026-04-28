@@ -830,7 +830,7 @@ def _spmv_coo_ref_cupy(
     return _cast_sparse_reference_output(_torch_from_cupy(y_ref), out_dtype)
 
 
-def spmv_coo_ref_hipsparse(
+def _prepare_spmv_coo_ref_hipsparse(
     data,
     row,
     col,
@@ -838,7 +838,6 @@ def spmv_coo_ref_hipsparse(
     shape,
     out=None,
     op="non",
-    return_metadata=False,
 ):
     op_name = _normalize_sparse_reference_op(op)
     skip_reason = _hipsparse_spmv_coo_direct_skip_reason(
@@ -892,10 +891,13 @@ def spmv_coo_ref_hipsparse(
         y.zero_()
 
     if y_size == 0:
-        metadata = {"backend": "hipsparse", "buffer_size": 0, "format": "coo"}
-        if return_metadata:
-            return y, metadata
-        return y
+        return {
+            "backend": "hipsparse",
+            "buffer_size": 0,
+            "format": "coo",
+            "y": y,
+            "empty": True,
+        }
 
     handle = None
     spmat = None
@@ -971,60 +973,148 @@ def spmv_coo_ref_hipsparse(
             workspace_allocated = True
         else:
             workspace = 0
-        _hip_check_result(
-            hipsparse.hipsparseSpMV(
-                handle,
-                op_enum,
-                alpha,
-                spmat,
-                vecx,
-                beta,
-                vecy,
-                value_type,
-                alg,
-                workspace,
-            ),
-            "hipsparseSpMV",
-        )
-        metadata = {"backend": "hipsparse", "buffer_size": buffer_size, "format": "coo"}
-        if return_metadata:
-            return y, metadata
-        return y
+        return {
+            "backend": "hipsparse",
+            "buffer_size": buffer_size,
+            "format": "coo",
+            "handle": handle,
+            "spmat": spmat,
+            "vecx": vecx,
+            "vecy": vecy,
+            "workspace": workspace,
+            "workspace_allocated": workspace_allocated,
+            "op_enum": op_enum,
+            "alpha": alpha,
+            "beta": beta,
+            "value_type": value_type,
+            "alg": alg,
+            "y": y,
+            "empty": False,
+        }
     finally:
-        if vecy is not None:
+        if handle is None and vecy is not None:
             try:
                 _hip_check_result(
                     hipsparse.hipsparseDestroyDnVec(vecy), "hipsparseDestroyDnVec(y)"
                 )
             except Exception:
                 pass
-        if vecx is not None:
+        if handle is None and vecx is not None:
             try:
                 _hip_check_result(
                     hipsparse.hipsparseDestroyDnVec(vecx), "hipsparseDestroyDnVec(x)"
                 )
             except Exception:
                 pass
-        if spmat is not None:
+        if handle is None and spmat is not None:
             try:
                 _hip_check_result(
                     hipsparse.hipsparseDestroySpMat(spmat), "hipsparseDestroySpMat"
                 )
             except Exception:
                 pass
-        if workspace_allocated:
+        if handle is None and workspace_allocated:
             try:
                 _hip_check_result(hip.hipFree(workspace), "hipFree")
             except Exception:
                 pass
-        if handle is not None:
-            try:
-                _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
-            except Exception:
-                pass
+ 
+
+def _run_spmv_coo_ref_hipsparse_prepared(state):
+    if state.get("empty"):
+        return state["y"]
+    _hip_check_result(
+        hipsparse.hipsparseSpMV(
+            state["handle"],
+            state["op_enum"],
+            state["alpha"],
+            state["spmat"],
+            state["vecx"],
+            state["beta"],
+            state["vecy"],
+            state["value_type"],
+            state["alg"],
+            state["workspace"],
+        ),
+        "hipsparseSpMV",
+    )
+    return state["y"]
 
 
-def spmv_csr_ref_hipsparse(
+def _destroy_spmv_coo_ref_hipsparse_prepared(state):
+    vecy = state.get("vecy")
+    vecx = state.get("vecx")
+    spmat = state.get("spmat")
+    workspace_allocated = bool(state.get("workspace_allocated"))
+    workspace = state.get("workspace", 0)
+    handle = state.get("handle")
+    if vecy is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnVec(vecy), "hipsparseDestroyDnVec(y)"
+            )
+        except Exception:
+            pass
+    if vecx is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnVec(vecx), "hipsparseDestroyDnVec(x)"
+            )
+        except Exception:
+            pass
+    if spmat is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroySpMat(spmat), "hipsparseDestroySpMat"
+            )
+        except Exception:
+            pass
+    if workspace_allocated:
+        try:
+            _hip_check_result(hip.hipFree(workspace), "hipFree")
+        except Exception:
+            pass
+    if handle is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+        except Exception:
+            pass
+
+
+def spmv_coo_ref_hipsparse(
+    data,
+    row,
+    col,
+    x,
+    shape,
+    out=None,
+    op="non",
+    return_metadata=False,
+):
+    state = _prepare_spmv_coo_ref_hipsparse(
+        data,
+        row,
+        col,
+        x,
+        shape,
+        out=out,
+        op=op,
+    )
+    try:
+        y = _run_spmv_coo_ref_hipsparse_prepared(state)
+        metadata = {
+            "backend": "hipsparse",
+            "buffer_size": int(state.get("buffer_size", 0)),
+            "format": "coo",
+        }
+        if return_metadata:
+            return y, metadata
+        return y
+    finally:
+        _destroy_spmv_coo_ref_hipsparse_prepared(state)
+
+
+def _prepare_spmv_csr_ref_hipsparse(
     data,
     indices,
     indptr,
@@ -1032,7 +1122,6 @@ def spmv_csr_ref_hipsparse(
     shape,
     out=None,
     op="non",
-    return_metadata=False,
 ):
     op_name = _normalize_spmv_reference_op(op)
     skip_reason = _hipsparse_spmv_csr_skip_reason(data.dtype, indices.dtype, op=op_name)
@@ -1087,10 +1176,12 @@ def spmv_csr_ref_hipsparse(
         y.zero_()
 
     if y_size == 0:
-        metadata = {"backend": "hipsparse", "buffer_size": 0}
-        if return_metadata:
-            return y, metadata
-        return y
+        return {
+            "backend": "hipsparse",
+            "buffer_size": 0,
+            "y": y,
+            "empty": True,
+        }
 
     handle = None
     spmat = None
@@ -1178,57 +1269,140 @@ def spmv_csr_ref_hipsparse(
         else:
             # hipSPARSE may legitimately report buffer_size == 0 for small inputs.
             workspace = 0
-        _hip_check_result(
-            hipsparse.hipsparseSpMV(
-                handle,
-                op_enum,
-                alpha,
-                spmat,
-                vecx,
-                beta,
-                vecy,
-                value_type,
-                alg,
-                workspace,
-            ),
-            "hipsparseSpMV",
-        )
-        metadata = {"backend": "hipsparse", "buffer_size": buffer_size}
-        if return_metadata:
-            return y, metadata
-        return y
+        return {
+            "backend": "hipsparse",
+            "buffer_size": buffer_size,
+            "handle": handle,
+            "spmat": spmat,
+            "vecx": vecx,
+            "vecy": vecy,
+            "workspace": workspace,
+            "workspace_allocated": workspace_allocated,
+            "op_enum": op_enum,
+            "alpha": alpha,
+            "beta": beta,
+            "value_type": value_type,
+            "alg": alg,
+            "y": y,
+            "empty": False,
+        }
     finally:
-        if vecy is not None:
+        if handle is None and vecy is not None:
             try:
                 _hip_check_result(
                     hipsparse.hipsparseDestroyDnVec(vecy), "hipsparseDestroyDnVec(y)"
                 )
             except Exception:
                 pass
-        if vecx is not None:
+        if handle is None and vecx is not None:
             try:
                 _hip_check_result(
                     hipsparse.hipsparseDestroyDnVec(vecx), "hipsparseDestroyDnVec(x)"
                 )
             except Exception:
                 pass
-        if spmat is not None:
+        if handle is None and spmat is not None:
             try:
                 _hip_check_result(
                     hipsparse.hipsparseDestroySpMat(spmat), "hipsparseDestroySpMat"
                 )
             except Exception:
                 pass
-        if workspace_allocated:
+        if handle is None and workspace_allocated:
             try:
                 _hip_check_result(hip.hipFree(workspace), "hipFree")
             except Exception:
                 pass
-        if handle is not None:
-            try:
-                _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
-            except Exception:
-                pass
+ 
+
+def _run_spmv_csr_ref_hipsparse_prepared(state):
+    if state.get("empty"):
+        return state["y"]
+    _hip_check_result(
+        hipsparse.hipsparseSpMV(
+            state["handle"],
+            state["op_enum"],
+            state["alpha"],
+            state["spmat"],
+            state["vecx"],
+            state["beta"],
+            state["vecy"],
+            state["value_type"],
+            state["alg"],
+            state["workspace"],
+        ),
+        "hipsparseSpMV",
+    )
+    return state["y"]
+
+
+def _destroy_spmv_csr_ref_hipsparse_prepared(state):
+    vecy = state.get("vecy")
+    vecx = state.get("vecx")
+    spmat = state.get("spmat")
+    workspace_allocated = bool(state.get("workspace_allocated"))
+    workspace = state.get("workspace", 0)
+    handle = state.get("handle")
+    if vecy is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnVec(vecy), "hipsparseDestroyDnVec(y)"
+            )
+        except Exception:
+            pass
+    if vecx is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnVec(vecx), "hipsparseDestroyDnVec(x)"
+            )
+        except Exception:
+            pass
+    if spmat is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroySpMat(spmat), "hipsparseDestroySpMat"
+            )
+        except Exception:
+            pass
+    if workspace_allocated:
+        try:
+            _hip_check_result(hip.hipFree(workspace), "hipFree")
+        except Exception:
+            pass
+    if handle is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+        except Exception:
+            pass
+
+
+def spmv_csr_ref_hipsparse(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    out=None,
+    op="non",
+    return_metadata=False,
+):
+    state = _prepare_spmv_csr_ref_hipsparse(
+        data,
+        indices,
+        indptr,
+        x,
+        shape,
+        out=out,
+        op=op,
+    )
+    try:
+        y = _run_spmv_csr_ref_hipsparse_prepared(state)
+        metadata = {"backend": "hipsparse", "buffer_size": int(state.get("buffer_size", 0))}
+        if return_metadata:
+            return y, metadata
+        return y
+    finally:
+        _destroy_spmv_csr_ref_hipsparse_prepared(state)
 
 
 def _spmv_csr_reference(
@@ -1307,8 +1481,12 @@ def _benchmark_spmv_csr_sparse_ref(
     if backend is None:
         return result
     if backend == "hipsparse":
-        values, ms = _benchmark_cuda_op(
-            lambda: spmv_csr_ref_hipsparse(data, indices, indptr, x, shape, op=op_name),
+        values, ms = _benchmark_prepared_cuda_op(
+            lambda: _prepare_spmv_csr_ref_hipsparse(
+                data, indices, indptr, x, shape, op=op_name
+            ),
+            _run_spmv_csr_ref_hipsparse_prepared,
+            _destroy_spmv_csr_ref_hipsparse_prepared,
             warmup=warmup,
             iters=iters,
         )
@@ -1416,15 +1594,12 @@ def _benchmark_spmv_coo_sparse_ref(
     if backend is None:
         return result
     if backend == "hipsparse":
-        values, ms = _benchmark_cuda_op(
-            lambda: spmv_coo_ref_hipsparse(
-                data,
-                row,
-                col,
-                x,
-                shape,
-                op=op_name,
+        values, ms = _benchmark_prepared_cuda_op(
+            lambda: _prepare_spmv_coo_ref_hipsparse(
+                data, row, col, x, shape, op=op_name
             ),
+            _run_spmv_coo_ref_hipsparse_prepared,
+            _destroy_spmv_coo_ref_hipsparse_prepared,
             warmup=warmup,
             iters=iters,
         )
@@ -1618,3 +1793,26 @@ def _benchmark_cuda_op(op, warmup, iters):
         cp.cuda.runtime.deviceSynchronize()
     elapsed_ms = (time.perf_counter() - start_time) * 1000.0 / iters
     return output, elapsed_ms
+
+
+def _benchmark_prepared_cuda_op(prepare_fn, run_fn, destroy_fn, warmup, iters):
+    warmup = max(0, int(warmup))
+    iters = max(1, int(iters))
+    state = None
+    try:
+        state = prepare_fn()
+        output = None
+        for _ in range(warmup):
+            output = run_fn(state)
+        torch.cuda.synchronize()
+        start_ev = torch.cuda.Event(enable_timing=True)
+        end_ev = torch.cuda.Event(enable_timing=True)
+        start_ev.record()
+        for _ in range(iters):
+            output = run_fn(state)
+        end_ev.record()
+        torch.cuda.synchronize()
+        return output, start_ev.elapsed_time(end_ev) / iters
+    finally:
+        if state is not None:
+            destroy_fn(state)

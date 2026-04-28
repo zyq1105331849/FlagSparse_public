@@ -1427,7 +1427,7 @@ def _hipsparse_spgemm_compute(
     return int(size_out.value)
 
 
-def _spgemm_csr_ref_hipsparse(
+def _prepare_spgemm_csr_ref_hipsparse(
     a_data,
     a_indices,
     a_indptr,
@@ -1436,7 +1436,6 @@ def _spgemm_csr_ref_hipsparse(
     b_indices,
     b_indptr,
     b_shape,
-    return_metadata=False,
 ):
     skip_reason = _hipsparse_spgemm_csr_skip_reason(
         a_data.dtype,
@@ -1653,32 +1652,29 @@ def _spgemm_csr_ref_hipsparse(
             ),
             "hipsparseCsrSetPointers",
         )
-        _hip_check_result(
-            hipsparse.hipsparseSpGEMM_copy(
-                handle,
-                op_enum,
-                op_enum,
-                alpha,
-                mat_a,
-                mat_b,
-                beta,
-                mat_c,
-                value_type,
-                alg,
-                descr,
-            ),
-            "hipsparseSpGEMM_copy",
-        )
-        result = (c_data, c_indices, c_indptr, (m, n))
-        if return_metadata:
-            return result, {
-                "backend": "hipsparse",
-                "buffer1_size": buffer1_size,
-                "buffer2_size": buffer2_size,
-            }
-        return result
+        return {
+            "backend": "hipsparse",
+            "buffer1_size": buffer1_size,
+            "buffer2_size": buffer2_size,
+            "compute_size_out": ctypes.c_size_t(buffer2_size),
+            "handle": handle,
+            "mat_a": mat_a,
+            "mat_b": mat_b,
+            "mat_c": mat_c,
+            "descr": descr,
+            "buffer1": buffer1,
+            "buffer2": buffer2,
+            "buffer1_allocated": buffer1_allocated,
+            "buffer2_allocated": buffer2_allocated,
+            "op_enum": op_enum,
+            "alpha": alpha,
+            "beta": beta,
+            "value_type": value_type,
+            "alg": alg,
+            "result": (c_data, c_indices, c_indptr, (m, n)),
+        }
     finally:
-        if descr is not None:
+        if handle is None and descr is not None:
             try:
                 _hip_check_result(
                     hipsparse.hipsparseSpGEMM_destroyDescr(descr),
@@ -1691,26 +1687,139 @@ def _spgemm_csr_ref_hipsparse(
             ("hipsparseDestroySpMat(B)", mat_b),
             ("hipsparseDestroySpMat(A)", mat_a),
         ):
-            if mat is not None:
+            if handle is None and mat is not None:
                 try:
                     _hip_check_result(hipsparse.hipsparseDestroySpMat(mat), name)
                 except Exception:
                     pass
-        if buffer2_allocated:
+        if handle is None and buffer2_allocated:
             try:
                 _hip_check_result(hip.hipFree(buffer2), "hipFree(buffer2)")
             except Exception:
                 pass
-        if buffer1_allocated:
+        if handle is None and buffer1_allocated:
             try:
                 _hip_check_result(hip.hipFree(buffer1), "hipFree(buffer1)")
             except Exception:
                 pass
-        if handle is not None:
+ 
+
+def _run_spgemm_csr_ref_hipsparse_prepared(state):
+    _hip_check_result(
+        hipsparse.hipsparseSpGEMM_compute(
+            state["handle"],
+            state["op_enum"],
+            state["op_enum"],
+            state["alpha"],
+            state["mat_a"],
+            state["mat_b"],
+            state["beta"],
+            state["mat_c"],
+            state["value_type"],
+            state["alg"],
+            state["descr"],
+            state["compute_size_out"],
+            state["buffer2"],
+        ),
+        "hipsparseSpGEMM_compute",
+    )
+    _hip_check_result(
+        hipsparse.hipsparseSpGEMM_copy(
+            state["handle"],
+            state["op_enum"],
+            state["op_enum"],
+            state["alpha"],
+            state["mat_a"],
+            state["mat_b"],
+            state["beta"],
+            state["mat_c"],
+            state["value_type"],
+            state["alg"],
+            state["descr"],
+        ),
+        "hipsparseSpGEMM_copy",
+    )
+    return state["result"]
+
+
+def _destroy_spgemm_csr_ref_hipsparse_prepared(state):
+    descr = state.get("descr")
+    mat_c = state.get("mat_c")
+    mat_b = state.get("mat_b")
+    mat_a = state.get("mat_a")
+    buffer2_allocated = bool(state.get("buffer2_allocated"))
+    buffer1_allocated = bool(state.get("buffer1_allocated"))
+    buffer2 = state.get("buffer2", 0)
+    buffer1 = state.get("buffer1", 0)
+    handle = state.get("handle")
+    if descr is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseSpGEMM_destroyDescr(descr),
+                "hipsparseSpGEMM_destroyDescr",
+            )
+        except Exception:
+            pass
+    for name, mat in (
+        ("hipsparseDestroySpMat(C)", mat_c),
+        ("hipsparseDestroySpMat(B)", mat_b),
+        ("hipsparseDestroySpMat(A)", mat_a),
+    ):
+        if mat is not None:
             try:
-                _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+                _hip_check_result(hipsparse.hipsparseDestroySpMat(mat), name)
             except Exception:
                 pass
+    if buffer2_allocated:
+        try:
+            _hip_check_result(hip.hipFree(buffer2), "hipFree(buffer2)")
+        except Exception:
+            pass
+    if buffer1_allocated:
+        try:
+            _hip_check_result(hip.hipFree(buffer1), "hipFree(buffer1)")
+        except Exception:
+            pass
+    if handle is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+        except Exception:
+            pass
+
+
+def _spgemm_csr_ref_hipsparse(
+    a_data,
+    a_indices,
+    a_indptr,
+    a_shape,
+    b_data,
+    b_indices,
+    b_indptr,
+    b_shape,
+    return_metadata=False,
+):
+    state = _prepare_spgemm_csr_ref_hipsparse(
+        a_data,
+        a_indices,
+        a_indptr,
+        a_shape,
+        b_data,
+        b_indices,
+        b_indptr,
+        b_shape,
+    )
+    try:
+        result = _run_spgemm_csr_ref_hipsparse_prepared(state)
+        metadata = {
+            "backend": "hipsparse",
+            "buffer1_size": int(state.get("buffer1_size", 0)),
+            "buffer2_size": int(state.get("buffer2_size", 0)),
+        }
+        if return_metadata:
+            return result, metadata
+        return result
+    finally:
+        _destroy_spgemm_csr_ref_hipsparse_prepared(state)
 
 
 def _spgemm_csr_sparse_ref_backend(
@@ -1766,8 +1875,8 @@ def _benchmark_spgemm_csr_sparse_ref(
         return result
 
     if backend == "hipsparse":
-        values, ms = _benchmark_cuda_op(
-            lambda: _spgemm_csr_ref_hipsparse(
+        values, ms = _common_mod._benchmark_prepared_cuda_op(
+            lambda: _prepare_spgemm_csr_ref_hipsparse(
                 a_data,
                 a_indices,
                 a_indptr,
@@ -1777,6 +1886,8 @@ def _benchmark_spgemm_csr_sparse_ref(
                 b_indptr,
                 b_shape,
             ),
+            _run_spgemm_csr_ref_hipsparse_prepared,
+            _destroy_spgemm_csr_ref_hipsparse_prepared,
             warmup=warmup,
             iters=iters,
         )

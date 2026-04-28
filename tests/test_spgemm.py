@@ -1195,7 +1195,8 @@ def run_mtx_batch(
 
 def _print_spgemm_mtx_header(value_dtype, index_dtype):
     print(f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}")
-    print("Formats: FlagSparse=CSR SpGEMM(A@B), cuSPARSE=CSR@CSR, PyTorch=sparse.mm.")
+    print("Formats: FlagSparse=CSR SpGEMM(A@B), cuSPARSE/hipSPARSE=direct CSR SpGEMM, PyTorch=sparse.mm.")
+    print("CU(ms) reports steady-state direct sparse backend time only; descriptor setup, workEstimation, and workspace management are excluded.")
     print("Err(PT/CU)=max(|diff|/(atol+rtol*|ref|)); MaxRel=max(|diff|)/max(|ref|).")
     print("-" * 320)
     print(

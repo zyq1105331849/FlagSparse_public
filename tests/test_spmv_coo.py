@@ -652,7 +652,7 @@ def run_all_dtypes_coo_csv(
 
     print("=" * 208)
     print("Input: MatrixMarket -> COO. FlagSparse: native COO Triton only (seg + atomic), no CSR.")
-    print("PyTorch = COO sparse.mm; CU(ms) = cuSPARSE/hipSPARSE timing on the original compare slot.")
+    print("PyTorch = COO sparse.mm; CU(ms) = cuSPARSE/hipSPARSE steady-state timing on the original compare slot.")
     print("=" * 208)
     for dtype in value_dtypes:
         for index_dtype in index_dtypes:

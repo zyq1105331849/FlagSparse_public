@@ -684,8 +684,9 @@ def _print_mtx_header(value_dtype, index_dtype, op="non"):
     print(
         f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}  |  op: {op}  |  transpose: {bool(transpose)}"
     )
-    print("Formats: FlagSparse=CSR, cuSPARSE/hipSPARSE=CSR/CSC, PyTorch=CSR or COO.")
+    print("Formats: FlagSparse=CSR, cuSPARSE/hipSPARSE=CSR/CSC direct sparse backend, PyTorch=CSR or COO.")
     print("Timing stays in native dtype. For float32, correctness references use float64 compute then cast.")
+    print("CU(ms) reports steady-state direct sparse backend time only; setup and workspace management are excluded.")
     print("PT/CU show per-reference correctness. Legacy CSR/CSC columns are preserved.")
     print("Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|)).")
     print("-" * 150)
@@ -817,7 +818,7 @@ def run_comprehensive_synthetic(op="non"):
     print("FLAGSPARSE SpMV BENCHMARK (synthetic CSR)")
     print("=" * 110)
     print(f"GPU: {torch.cuda.get_device_name(0)}  |  Warmup: {WARMUP}  Iters: {ITERS}  |  op: {op}  |  transpose: {bool(transpose)}")
-    print("Formats: FlagSparse=CSR, CU(ms)=cuSPARSE/hipSPARSE sparse backend.")
+    print("Formats: FlagSparse=CSR, CU(ms)=cuSPARSE/hipSPARSE steady-state sparse backend.")
     print()
     total = 0
     failed = 0

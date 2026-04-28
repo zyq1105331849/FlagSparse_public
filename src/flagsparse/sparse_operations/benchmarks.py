@@ -8,6 +8,8 @@ from .gather_scatter import (
     _pytorch_scatter_impl,
     _triton_gather_impl,
     _triton_scatter_impl,
+    benchmark_hipsparse_gather,
+    benchmark_hipsparse_scatter,
     hipsparse_gather,
     hipsparse_scatter,
 )
@@ -113,8 +115,9 @@ def benchmark_gather_case(
     if run_cusparse:
         if _is_rocm_runtime():
             try:
-                cusparse_values, cusparse_ms = _benchmark_cuda_op(
-                    lambda: hipsparse_gather(dense_vector, indices),
+                cusparse_values, cusparse_ms = benchmark_hipsparse_gather(
+                    dense_vector,
+                    indices,
                     warmup=warmup,
                     iters=iters,
                 )
@@ -301,14 +304,13 @@ def benchmark_scatter_case(
             skip_reason = None
             try:
                 cusparse_out = base_out.clone()
-                cusparse_values, cusparse_ms = _benchmark_cuda_op(
-                    lambda: hipsparse_scatter(
-                        sparse_values,
-                        indices,
-                        dense_size=dense_size,
-                        out=cusparse_out,
-                        reset_output=reset_output,
-                    ),
+                cusparse_values, cusparse_ms = benchmark_hipsparse_scatter(
+                    sparse_values,
+                    indices,
+                    dense_size=dense_size,
+                    out=cusparse_out,
+                    reset_output=reset_output,
+                    dtype_policy="strict",
                     warmup=warmup,
                     iters=iters,
                 )

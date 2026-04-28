@@ -234,7 +234,7 @@ def run_cli(args):
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(
         f"Warmup: {args.warmup} | Iterations: {args.iters} | "
-        f"unique_indices: {unique_indices}"
+        f"unique_indices: {unique_indices} | CU(ms): direct sparse backend steady-state time"
     )
     print()
     _print_header()
@@ -424,7 +424,7 @@ def run_cli(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Scatter benchmark/validation with direct sparse reference and CSV export."
+        description="Scatter benchmark/validation with direct sparse reference steady-state timing and CSV export."
     )
     parser.add_argument("--value-dtypes", default=DEFAULT_VALUE_DTYPES)
     parser.add_argument("--index-dtypes", default=DEFAULT_INDEX_DTYPES)
