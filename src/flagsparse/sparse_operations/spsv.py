@@ -507,20 +507,65 @@ def _score_transpose_cw(matrix_stats, n_rhs, complex_mode):
     return score
 
 
+def _nontrans_cw_eligible(matrix_stats, n_rhs, complex_mode):
+    if complex_mode:
+        return False
+    if n_rhs > 2:
+        return False
+    if int(matrix_stats.get("num_levels", 0)) < 256:
+        return False
+    if float(matrix_stats.get("avg_frontier", 0.0)) > 24.0:
+        return False
+    if float(matrix_stats.get("frontier_ratio", 1.0)) > 0.08:
+        return False
+    avg_nnz = float(matrix_stats.get("avg_nnz_per_row", 0.0))
+    max_nnz = int(matrix_stats.get("max_nnz_per_row", 0))
+    if avg_nnz <= 0.0 or avg_nnz > 256.0:
+        return False
+    if max_nnz > 2048:
+        return False
+    return True
+
+
+def _transpose_cw_eligible(matrix_stats, n_rhs, complex_mode, trans_mode):
+    if trans_mode != "T":
+        return False
+    if complex_mode:
+        return False
+    if n_rhs != 1:
+        return False
+    if int(matrix_stats.get("num_levels", 0)) < 512:
+        return False
+    if float(matrix_stats.get("avg_frontier", 0.0)) > 16.0:
+        return False
+    if float(matrix_stats.get("frontier_ratio", 1.0)) > 0.04:
+        return False
+    avg_nnz = float(matrix_stats.get("avg_nnz_per_row", 0.0))
+    max_nnz = int(matrix_stats.get("max_nnz_per_row", 0))
+    if avg_nnz <= 0.0 or avg_nnz > 160.0:
+        return False
+    if max_nnz > 1024:
+        return False
+    return True
+
+
 def _select_nontrans_route(matrix_stats, n_rhs, complex_mode):
+    if not _nontrans_cw_eligible(matrix_stats, n_rhs, complex_mode):
+        return "csr_levels"
     levels_score = _score_nontrans_levels(matrix_stats, n_rhs, complex_mode)
     cw_score = _score_nontrans_cw(matrix_stats, n_rhs, complex_mode)
-    return "csr_cw" if cw_score > levels_score else "csr_levels"
+    return "csr_cw" if cw_score >= (levels_score + 1.0) else "csr_levels"
 
 
-def _select_transpose_route(matrix_stats, n_rhs, complex_mode):
+def _select_transpose_route(matrix_stats, n_rhs, complex_mode, trans_mode):
+    if not _transpose_cw_eligible(matrix_stats, n_rhs, complex_mode, trans_mode):
+        return "transpose_push"
     push_score = _score_transpose_push(matrix_stats, n_rhs, complex_mode)
     cw_score = _score_transpose_cw(matrix_stats, n_rhs, complex_mode)
-    return "transpose_cw" if cw_score > push_score else "transpose_push"
+    return "transpose_cw" if cw_score >= (push_score + 1.0) else "transpose_push"
 
 
 def _prepare_spsv_csr_system(data, indices64, indptr64, n_rows, n_cols, lower, trans_mode, unit_diagonal):
-    complex_mode = torch.is_complex(data)
     if trans_mode == "N":
         levels = _build_spsv_levels(indptr64, indices64, n_rows, lower=lower)
         matrix_stats = _build_spsv_matrix_stats(indptr64, levels, n_rows)
@@ -572,10 +617,6 @@ def _prepare_spsv_csr_system(data, indices64, indptr64, n_rows, n_cols, lower, t
             "route_name": "csr_cw",
             "alt_plan": None,
         }
-        preferred_kind = _select_nontrans_route(matrix_stats, 1, complex_mode)
-        if preferred_kind == "csr_cw":
-            cw_plan["alt_plan"] = levels_plan
-            return cw_plan
         levels_plan["alt_plan"] = cw_plan
         return levels_plan
 
@@ -633,10 +674,6 @@ def _prepare_spsv_csr_system(data, indices64, indptr64, n_rows, n_cols, lower, t
         "route_name": "transpose_cw",
         "alt_plan": None,
     }
-    preferred_kind = _select_transpose_route(matrix_stats, 1, complex_mode)
-    if preferred_kind == "transpose_cw":
-        cw_plan["alt_plan"] = push_plan
-        return cw_plan
     push_plan["alt_plan"] = cw_plan
     return push_plan
 
@@ -706,9 +743,9 @@ def _select_spsv_runtime_plan(solve_plan, rhs_cols, compute_dtype, trans_mode):
     if trans_mode == "N":
         desired = _select_nontrans_route(matrix_stats, rhs_cols, complex_mode)
     else:
-        desired = _select_transpose_route(matrix_stats, rhs_cols, complex_mode)
-        if complex_mode and rhs_cols >= 2:
-            desired = "transpose_push"
+        desired = _select_transpose_route(
+            matrix_stats, rhs_cols, complex_mode, trans_mode
+        )
     if desired == route_name or alt_plan is None:
         return solve_plan
     if alt_plan.get("route_name", alt_plan["solve_kind"]) == desired:
@@ -2359,6 +2396,7 @@ def flagsparse_spsv_csr(
                     diag_eps=diag_eps,
                     block_nnz_use=block_nnz_use,
                     max_segments_use=max_segments_use,
+                    worker_count=worker_count_use,
                     matrix_stats=matrix_stats_use,
                 )
             elif solve_kind == "csr_cw":
@@ -2428,6 +2466,7 @@ def flagsparse_spsv_csr(
                     diag_eps=diag_eps,
                     block_nnz_use=block_nnz_use,
                     max_segments_use=max_segments_use,
+                    worker_count=worker_count_use,
                     matrix_stats=matrix_stats_use,
                 )
             elif solve_kind == "csr_cw":
@@ -2506,6 +2545,7 @@ def flagsparse_spsv_csr(
                             diag_eps=diag_eps,
                             block_nnz_use=block_nnz_use,
                             max_segments_use=max_segments_use,
+                            worker_count=worker_count_use,
                             matrix_stats=matrix_stats_use,
                         )
                     )
