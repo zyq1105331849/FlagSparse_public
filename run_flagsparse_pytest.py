@@ -30,6 +30,7 @@ DEFAULT_OPS = (
     "spmv_coo_tocsr",
     "spmm_csr",
     "spmm_csr_opt",
+    "spmm_csr_opt_alg2",
     "spmm_coo",
     "spsv_csr",
     "spsv_coo",
