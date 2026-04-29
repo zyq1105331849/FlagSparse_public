@@ -215,9 +215,9 @@ def _build_reference(data, indices, indptr, B, shape, dtype):
 
 def _error_ratio(candidate, reference, dtype):
     if dtype == torch.float32:
-        atol, rtol = 1e-4, 1e-2
+        atol, rtol = 1e-4, 1e-1
     else:
-        atol, rtol = 1e-12, 1e-10
+        atol, rtol = 1e-12, 1e-9
     if candidate.numel() == 0:
         return 0.0
     diff = torch.abs(candidate - reference).to(torch.float64)

@@ -26,6 +26,7 @@ from .spmm_csr import (
     benchmark_spmm_opt_case,
     comprehensive_spmm_test,
 )
+from .spmm_csr_opt_alg2 import benchmark_spmm_opt_alg2_case
 from .spgemm_csr import benchmark_spgemm_case
 from .sddmm_csr import benchmark_sddmm_case
 from .spsm import benchmark_spsm_case

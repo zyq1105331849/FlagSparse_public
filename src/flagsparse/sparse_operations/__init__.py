@@ -18,10 +18,8 @@ from .benchmarks import (
 )
 from .gather_scatter import (
     cusparse_spmv_gather,
-    cusparse_spmv_gather_cupy,
     cusparse_spmv_scatter,
     flagsparse_gather,
-    flagsparse_gather_cupy,
     flagsparse_scatter,
     pytorch_index_gather,
     pytorch_index_scatter,
@@ -47,6 +45,12 @@ from .spmm_csr import (
     flagsparse_spmm_csr_opt,
     prepare_spmm_csr_opt,
 )
+from .spmm_csr_opt_alg2 import (
+    PreparedCsrSpmmOptAlg2,
+    benchmark_spmm_opt_alg2_case,
+    flagsparse_spmm_csr_opt_alg2,
+    prepare_spmm_csr_opt_alg2,
+)
 from .spmm_coo import flagsparse_spmm_coo
 from .spgemm_csr import SpGEMMPrepared, flagsparse_spgemm_csr, prepare_spgemm_csr
 from .sddmm_csr import SDDMMPrepared, flagsparse_sddmm_csr, prepare_sddmm_csr
@@ -57,6 +61,7 @@ __all__ = [
     "PreparedCoo",
     "PreparedCsrSpmv",
     "PreparedCsrSpmmOpt",
+    "PreparedCsrSpmmOptAlg2",
     "SDDMMPrepared",
     "SpGEMMPrepared",
     "SUPPORTED_INDEX_DTYPES",
@@ -68,6 +73,7 @@ __all__ = [
     "benchmark_spgemm_case",
     "benchmark_spmm_case",
     "benchmark_spmm_opt_case",
+    "benchmark_spmm_opt_alg2_case",
     "benchmark_spmv_case",
     "benchmark_spsm_case",
     "comprehensive_gather_test",
@@ -75,15 +81,14 @@ __all__ = [
     "comprehensive_spmm_test",
     "comprehensive_spsm_test",
     "cusparse_spmv_gather",
-    "cusparse_spmv_gather_cupy",
     "cusparse_spmv_scatter",
     "flagsparse_gather",
-    "flagsparse_gather_cupy",
     "flagsparse_sddmm_csr",
     "flagsparse_spgemm_csr",
     "flagsparse_spmm_coo",
     "flagsparse_spmm_csr",
     "flagsparse_spmm_csr_opt",
+    "flagsparse_spmm_csr_opt_alg2",
     "flagsparse_spmv_coo",
     "flagsparse_spmv_coo_tocsr",
     "flagsparse_spmv_csr",
@@ -94,6 +99,7 @@ __all__ = [
     "prepare_sddmm_csr",
     "prepare_spgemm_csr",
     "prepare_spmm_csr_opt",
+    "prepare_spmm_csr_opt_alg2",
     "prepare_spmv_coo",
     "prepare_spmv_coo_tocsr",
     "prepare_spmv_csr",
