@@ -57,6 +57,22 @@ SUMMARY_FIELDS = [
     "opt_alg2_status_vs_cusparse",
     "matrix_status",
 ]
+LAUNCH_FIELDS = [
+    "matrix",
+    "device_name",
+    "sm_count",
+    "dtype",
+    "dense_cols",
+    "warp_size",
+    "factor",
+    "block_size",
+    "block_rows",
+    "block_cols",
+    "num_warps",
+    "num_stages",
+    "grid_m",
+    "grid_n",
+]
 
 
 def _resolve_input_paths(input_paths):
@@ -399,6 +415,9 @@ def _print_summary_row(summary):
 
 
 def _write_csv(path, rows):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS, extrasaction="ignore")
         writer.writeheader()
@@ -406,11 +425,47 @@ def _write_csv(path, rows):
             writer.writerow({key: ("" if value is None else value) for key, value in row.items()})
 
 
+def _write_launch_csv(path, rows):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=LAUNCH_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: ("" if value is None else value) for key, value in row.items()})
+
+
+def _build_launch_row(matrix_name, dtype_name, dense_cols, prepared, B):
+    _, meta = fs.flagsparse_alpha_spmm_alg1(B=B, prepared=prepared, return_meta=True)
+    return {
+        "matrix": matrix_name,
+        "device_name": meta["device_name"],
+        "sm_count": meta["sm_count"],
+        "dtype": dtype_name,
+        "dense_cols": dense_cols,
+        "warp_size": meta["warp_size"],
+        "factor": meta["factor"],
+        "block_size": meta["block_size"],
+        "block_rows": meta["block_rows"],
+        "block_cols": meta["block_cols"],
+        "num_warps": meta["num_warps"],
+        "num_stages": meta["num_stages"],
+        "grid_m": meta["grid_m"],
+        "grid_n": meta["grid_n"],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Experimental AlphaSparse ALG1 Triton SpMM benchmark.")
     parser.add_argument("input_path", nargs="*", help=".mtx file or directory")
     parser.add_argument("--synthetic", action="store_true")
-    parser.add_argument("--csv", type=str, default=None)
+    parser.add_argument(
+        "--csv",
+        type=str,
+        default=None,
+        help="Write summary CSV; also writes launch CSV next to it as <stem>_launch.csv",
+    )
     parser.add_argument("--dense-cols", type=int, default=DEFAULT_DENSE_COLS)
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
@@ -420,6 +475,7 @@ def main():
 
     device = torch.device("cuda")
     rows = []
+    launch_rows = []
     _print_header()
     if args.synthetic:
         synthetic_cases = [
@@ -434,7 +490,7 @@ def main():
                 data, indices, indptr, shape = build_synthetic_case(
                     case_name, torch.float32, torch.int32, device
                 )
-                summary = run_one_case(
+                result = run_one_case(
                     f"{case_name}_n{dense_cols}",
                     data,
                     indices,
@@ -447,8 +503,22 @@ def main():
                     args.iters,
                     args.seed,
                     args.with_cusparse,
-                    return_details=False,
+                    return_details=bool(args.csv),
                 )
+                if args.csv:
+                    summary = result["summary"]
+                    B = _seeded_dense_matrix((shape[1], dense_cols), torch.float32, device, args.seed)
+                    launch_rows.append(
+                        _build_launch_row(
+                            summary["matrix"],
+                            "float32",
+                            dense_cols,
+                            result["prepared_alpha"],
+                            B,
+                        )
+                    )
+                else:
+                    summary = result
                 rows.append(summary)
                 _print_summary_row(summary)
     else:
@@ -460,7 +530,7 @@ def main():
                         path, dtype=value_dtype, device=device
                     )
                     indices = indices.to(index_dtype)
-                    summary = run_one_case(
+                    result = run_one_case(
                         os.path.basename(path),
                         data,
                         indices,
@@ -470,17 +540,36 @@ def main():
                         index_dtype,
                         args.dense_cols,
                         args.warmup,
-                        args.iters,
-                        args.seed,
-                        args.with_cusparse,
-                        return_details=False,
-                    )
+                    args.iters,
+                    args.seed,
+                    args.with_cusparse,
+                    return_details=bool(args.csv),
+                )
+                    if args.csv:
+                        summary = result["summary"]
+                        B = _seeded_dense_matrix((shape[1], args.dense_cols), value_dtype, device, args.seed)
+                        launch_rows.append(
+                            _build_launch_row(
+                                summary["matrix"],
+                                str(value_dtype).replace("torch.", ""),
+                                args.dense_cols,
+                                result["prepared_alpha"],
+                                B,
+                            )
+                        )
+                    else:
+                        summary = result
                     rows.append(summary)
                     _print_summary_row(summary)
     print("-" * 198)
     if args.csv:
-        _write_csv(args.csv, rows)
-        print(f"Wrote {len(rows)} rows to {os.path.abspath(args.csv)}")
+        csv_path = os.path.abspath(args.csv)
+        stem, ext = os.path.splitext(csv_path)
+        launch_csv_path = f"{stem}_launch{ext or '.csv'}"
+        _write_csv(csv_path, rows)
+        _write_launch_csv(launch_csv_path, launch_rows)
+        print(f"Wrote {len(rows)} rows to {csv_path}")
+        print(f"Wrote {len(launch_rows)} launch rows to {launch_csv_path}")
 
 
 if __name__ == "__main__":
