@@ -181,10 +181,9 @@ def _alpha_spmm_alg1_rowmajor_kernel(
             # Triton adaptation: one scalar element per inner iteration (tensor
             # blocks do not support constexpr indexing, so we load a_col/a_val as
             # scalars directly, matching the per-element data flow of the CUDA
-            # sequential reduce).  The chunk_mask / valid guard is encoded through
-            # the scalar load masks; when valid is False both a_col and a_val are
-            # other=0 / 0.0, making the accumulated contribution zero regardless of
-            # the B-load result.
+            # sequential reduce). The valid guard protects both sparse loads and
+            # dense B loads so tail elements neither contribute numerically nor
+            # trigger extra reads from B.
             for chunk_start in tl.range(row_start, row_end, WARP_SIZE):
                 for jj in tl.static_range(0, WARP_SIZE):
                     elem_idx = chunk_start + jj
@@ -196,28 +195,28 @@ def _alpha_spmm_alg1_rowmajor_kernel(
                     if FACTOR > 0:
                         b0 = tl.load(
                             b_ptr + a_col * stride_bk + offs0 * stride_bn,
-                            mask=mask0,
+                            mask=mask0 & valid,
                             other=0.0,
                         )
                         acc0 = acc0 + a_val * b0.to(ACC_DTYPE)
                     if FACTOR > 1:
                         b1 = tl.load(
                             b_ptr + a_col * stride_bk + offs1 * stride_bn,
-                            mask=mask1,
+                            mask=mask1 & valid,
                             other=0.0,
                         )
                         acc1 = acc1 + a_val * b1.to(ACC_DTYPE)
                     if FACTOR > 2:
                         b2 = tl.load(
                             b_ptr + a_col * stride_bk + offs2 * stride_bn,
-                            mask=mask2,
+                            mask=mask2 & valid,
                             other=0.0,
                         )
                         acc2 = acc2 + a_val * b2.to(ACC_DTYPE)
                     if FACTOR > 3:
                         b3 = tl.load(
                             b_ptr + a_col * stride_bk + offs3 * stride_bn,
-                            mask=mask3,
+                            mask=mask3 & valid,
                             other=0.0,
                         )
                         acc3 = acc3 + a_val * b3.to(ACC_DTYPE)
