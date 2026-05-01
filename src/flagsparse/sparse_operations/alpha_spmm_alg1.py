@@ -1,0 +1,299 @@
+"""Experimental Triton port of AlphaSparse CUDA CSR ALG1 for SpMM."""
+
+from ._common import *
+from ._alpha_spmm_alg1_common import (
+    _build_alpha_spmm_alg1_launch_meta,
+    _select_alpha_spmm_alg1_warp_and_factor,
+)
+from .spmm_csr import _prepare_spmm_csr_matrix
+
+
+SUPPORTED_ALPHA_SPMM_ALG1_DTYPES = (torch.float32, torch.float64)
+_ALPHA_SPMM_ALG1_NUM_WARPS = 8
+_ALPHA_SPMM_ALG1_NUM_STAGES = 1
+
+
+class PreparedAlphaSpmmAlg1:
+    """Cached CSR metadata for repeated alpha_spmm_alg1 calls."""
+
+    __slots__ = (
+        "data",
+        "kernel_indices",
+        "kernel_indptr",
+        "shape",
+        "n_rows",
+        "n_cols",
+        "row_lengths",
+        "max_row_nnz",
+    )
+
+    def __init__(
+        self,
+        data,
+        kernel_indices,
+        kernel_indptr,
+        shape,
+        n_rows,
+        n_cols,
+        row_lengths,
+        max_row_nnz,
+    ):
+        self.data = data
+        self.kernel_indices = kernel_indices
+        self.kernel_indptr = kernel_indptr
+        self.shape = (int(shape[0]), int(shape[1]))
+        self.n_rows = int(n_rows)
+        self.n_cols = int(n_cols)
+        self.row_lengths = row_lengths
+        self.max_row_nnz = int(max_row_nnz)
+
+
+def prepare_alpha_spmm_alg1(data, indices, indptr, shape):
+    (
+        data,
+        kernel_indices,
+        kernel_indptr,
+        n_rows,
+        n_cols,
+        row_lengths,
+        max_row_nnz,
+    ) = _prepare_spmm_csr_matrix(data, indices, indptr, shape)
+    if data.dtype not in SUPPORTED_ALPHA_SPMM_ALG1_DTYPES:
+        raise TypeError("prepare_alpha_spmm_alg1 only supports float32 and float64")
+    return PreparedAlphaSpmmAlg1(
+        data=data,
+        kernel_indices=kernel_indices,
+        kernel_indptr=kernel_indptr,
+        shape=shape,
+        n_rows=n_rows,
+        n_cols=n_cols,
+        row_lengths=row_lengths,
+        max_row_nnz=max_row_nnz,
+    )
+
+
+def _alpha_spmm_alg1_acc_dtype(dtype):
+    return tl.float64 if dtype == torch.float64 else tl.float32
+
+
+def _normalize_alpha_spmm_alg1_device_props(device):
+    props = torch.cuda.get_device_properties(device)
+    return {
+        "device_name": str(getattr(props, "name", "cuda")),
+        "sm_count": int(getattr(props, "multi_processor_count", 0) or 0),
+    }
+
+
+def _validate_alpha_spmm_alg1_runtime_inputs(prepared, B, out):
+    if B is None:
+        raise ValueError("B is required")
+    if B.ndim != 2:
+        raise ValueError("B must be a 2D dense tensor")
+    if not B.is_cuda:
+        raise ValueError("B must be a CUDA tensor")
+    if B.device != prepared.data.device:
+        raise ValueError("B must be on the same CUDA device as sparse matrix data")
+    if B.dtype != prepared.data.dtype:
+        raise TypeError("B dtype must match sparse matrix dtype")
+    if B.shape[0] != prepared.n_cols:
+        raise ValueError(f"B.shape[0] must be n_cols={prepared.n_cols}, got {B.shape[0]}")
+    if out is not None:
+        if not out.is_cuda:
+            raise ValueError("out must be a CUDA tensor")
+        if out.device != prepared.data.device:
+            raise ValueError("out must be on the same CUDA device as sparse matrix data")
+        if out.shape != (prepared.n_rows, int(B.shape[1])) or out.dtype != prepared.data.dtype:
+            raise ValueError("out shape/dtype must match result")
+    return B.contiguous()
+
+
+def _build_alpha_spmm_alg1_runtime_meta(prepared, B):
+    warp_size, factor = _select_alpha_spmm_alg1_warp_and_factor(
+        int(B.shape[1]),
+        order_row=True,
+    )
+    launch = _build_alpha_spmm_alg1_launch_meta(
+        prepared.n_rows,
+        int(B.shape[1]),
+        warp_size,
+        factor,
+        block_size=256,
+    )
+    device_props = _normalize_alpha_spmm_alg1_device_props(prepared.data.device)
+    meta = {
+        **device_props,
+        **launch,
+        "warp_size": int(warp_size),
+        "factor": int(factor),
+        "num_warps": _ALPHA_SPMM_ALG1_NUM_WARPS,
+        "num_stages": _ALPHA_SPMM_ALG1_NUM_STAGES,
+        "order_row_path": True,
+        "alpha": 1,
+        "beta": 0,
+    }
+    return meta
+
+
+@triton.jit
+def _alpha_spmm_alg1_rowmajor_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    c_ptr,
+    n_rows,
+    n_dense_cols,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    WARP_SIZE: tl.constexpr,
+    FACTOR: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    lane_offsets = tl.arange(0, WARP_SIZE)
+    block_row_start = pid_m * BLOCK_ROWS
+    block_col_start = pid_n * BLOCK_COLS
+    offs0 = block_col_start + lane_offsets
+    mask0 = offs0 < n_dense_cols
+    offs1 = block_col_start + WARP_SIZE + lane_offsets
+    mask1 = offs1 < n_dense_cols
+    offs2 = block_col_start + 2 * WARP_SIZE + lane_offsets
+    mask2 = offs2 < n_dense_cols
+    offs3 = block_col_start + 3 * WARP_SIZE + lane_offsets
+    mask3 = offs3 < n_dense_cols
+
+    for local_row in tl.static_range(0, BLOCK_ROWS):
+        row = block_row_start + local_row
+        if row < n_rows:
+            row_start = tl.load(indptr_ptr + row)
+            row_end = tl.load(indptr_ptr + row + 1)
+            acc0 = tl.zeros([WARP_SIZE], dtype=ACC_DTYPE)
+            acc1 = tl.zeros([WARP_SIZE], dtype=ACC_DTYPE)
+            acc2 = tl.zeros([WARP_SIZE], dtype=ACC_DTYPE)
+            acc3 = tl.zeros([WARP_SIZE], dtype=ACC_DTYPE)
+
+            # AlphaSparse: each warp consumes one WARP_SIZE-sized chunk of CSR entries.
+            # Triton adaptation: the whole CUDA block is simulated by one program that
+            # serially iterates over block rows while keeping the per-chunk data flow.
+            for chunk_start in tl.range(row_start, row_end, WARP_SIZE):
+                chunk_offsets = chunk_start + lane_offsets
+                chunk_mask = chunk_offsets < row_end
+                chunk_cols = tl.load(indices_ptr + chunk_offsets, mask=chunk_mask, other=0)
+                chunk_vals = tl.load(data_ptr + chunk_offsets, mask=chunk_mask, other=0.0)
+
+                for jj in tl.static_range(0, WARP_SIZE):
+                    valid = chunk_mask[jj]
+                    a_col = chunk_cols[jj]
+                    a_val = chunk_vals[jj].to(ACC_DTYPE)
+                    if FACTOR > 0:
+                        b0 = tl.load(
+                            b_ptr + a_col * stride_bk + offs0 * stride_bn,
+                            mask=mask0 & valid,
+                            other=0.0,
+                        )
+                        acc0 = acc0 + a_val * b0.to(ACC_DTYPE)
+                    if FACTOR > 1:
+                        b1 = tl.load(
+                            b_ptr + a_col * stride_bk + offs1 * stride_bn,
+                            mask=mask1 & valid,
+                            other=0.0,
+                        )
+                        acc1 = acc1 + a_val * b1.to(ACC_DTYPE)
+                    if FACTOR > 2:
+                        b2 = tl.load(
+                            b_ptr + a_col * stride_bk + offs2 * stride_bn,
+                            mask=mask2 & valid,
+                            other=0.0,
+                        )
+                        acc2 = acc2 + a_val * b2.to(ACC_DTYPE)
+                    if FACTOR > 3:
+                        b3 = tl.load(
+                            b_ptr + a_col * stride_bk + offs3 * stride_bn,
+                            mask=mask3 & valid,
+                            other=0.0,
+                        )
+                        acc3 = acc3 + a_val * b3.to(ACC_DTYPE)
+
+            tl.store(c_ptr + row * stride_cm + offs0 * stride_cn, acc0, mask=mask0)
+            if FACTOR > 1:
+                tl.store(c_ptr + row * stride_cm + offs1 * stride_cn, acc1, mask=mask1)
+            if FACTOR > 2:
+                tl.store(c_ptr + row * stride_cm + offs2 * stride_cn, acc2, mask=mask2)
+            if FACTOR > 3:
+                tl.store(c_ptr + row * stride_cm + offs3 * stride_cn, acc3, mask=mask3)
+
+
+def _run_alpha_spmm_alg1(prepared, B, meta):
+    if prepared.n_rows == 0 or int(B.shape[1]) == 0:
+        return torch.zeros(
+            (prepared.n_rows, int(B.shape[1])),
+            dtype=prepared.data.dtype,
+            device=prepared.data.device,
+        )
+
+    C_out = torch.empty(
+        (prepared.n_rows, int(B.shape[1])),
+        dtype=prepared.data.dtype,
+        device=prepared.data.device,
+    )
+    grid = (meta["grid_m"], meta["grid_n"])
+    _alpha_spmm_alg1_rowmajor_kernel[grid](
+        prepared.data,
+        prepared.kernel_indices,
+        prepared.kernel_indptr,
+        B,
+        C_out,
+        prepared.n_rows,
+        int(B.shape[1]),
+        B.stride(0),
+        B.stride(1),
+        C_out.stride(0),
+        C_out.stride(1),
+        WARP_SIZE=meta["warp_size"],
+        FACTOR=meta["factor"],
+        BLOCK_ROWS=meta["block_rows"],
+        BLOCK_COLS=meta["block_cols"],
+        ACC_DTYPE=_alpha_spmm_alg1_acc_dtype(prepared.data.dtype),
+        num_warps=meta["num_warps"],
+        num_stages=meta["num_stages"],
+    )
+    return C_out
+
+
+def flagsparse_alpha_spmm_alg1(
+    data=None,
+    indices=None,
+    indptr=None,
+    B=None,
+    shape=None,
+    prepared=None,
+    out=None,
+    return_meta=False,
+):
+    """Experimental Triton port of AlphaSparse CUDA CSR ALG1 for row-major CSR @ dense."""
+    if prepared is not None and not isinstance(prepared, PreparedAlphaSpmmAlg1):
+        raise TypeError("prepared must be a PreparedAlphaSpmmAlg1 instance")
+    raw_inputs_provided = any(arg is not None for arg in (data, indices, indptr, shape))
+    if prepared is not None and raw_inputs_provided:
+        raise ValueError("Pass either raw CSR inputs or prepared, not both")
+    if prepared is None:
+        if any(arg is None for arg in (data, indices, indptr, shape)):
+            raise ValueError(
+                "data, indices, indptr, and shape are required when prepared is not provided"
+            )
+        prepared = prepare_alpha_spmm_alg1(data, indices, indptr, shape)
+
+    B = _validate_alpha_spmm_alg1_runtime_inputs(prepared, B, out)
+    meta = _build_alpha_spmm_alg1_runtime_meta(prepared, B)
+    C = _run_alpha_spmm_alg1(prepared, B, meta)
+    if out is not None:
+        out.copy_(C)
+        C = out
+    if return_meta:
+        return C, meta
+    return C

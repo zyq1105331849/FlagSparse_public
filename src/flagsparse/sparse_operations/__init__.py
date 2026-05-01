@@ -45,6 +45,11 @@ from .spmm_csr import (
     flagsparse_spmm_csr_opt,
     prepare_spmm_csr_opt,
 )
+from .alpha_spmm_alg1 import (
+    PreparedAlphaSpmmAlg1,
+    flagsparse_alpha_spmm_alg1,
+    prepare_alpha_spmm_alg1,
+)
 from .spmm_csr_opt_alg2 import (
     PreparedCsrSpmmOptAlg2,
     benchmark_spmm_opt_alg2_case,
@@ -59,6 +64,7 @@ from .spsm import flagsparse_spsm_coo, flagsparse_spsm_csr
 
 __all__ = [
     "PreparedCoo",
+    "PreparedAlphaSpmmAlg1",
     "PreparedCsrSpmv",
     "PreparedCsrSpmmOpt",
     "PreparedCsrSpmmOptAlg2",
@@ -83,6 +89,7 @@ __all__ = [
     "cusparse_spmv_gather",
     "cusparse_spmv_scatter",
     "flagsparse_gather",
+    "flagsparse_alpha_spmm_alg1",
     "flagsparse_sddmm_csr",
     "flagsparse_spgemm_csr",
     "flagsparse_spmm_coo",
@@ -97,6 +104,7 @@ __all__ = [
     "flagsparse_spsv_coo",
     "flagsparse_spsv_csr",
     "prepare_sddmm_csr",
+    "prepare_alpha_spmm_alg1",
     "prepare_spgemm_csr",
     "prepare_spmm_csr_opt",
     "prepare_spmm_csr_opt_alg2",

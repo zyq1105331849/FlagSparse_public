@@ -1,6 +1,7 @@
 """CSR SpMM kernels, helpers, and benchmark entry points."""
 
 from ._common import *
+from ._alpha_spmm_alg1_common import _select_alpha_spmm_alg1_warp_and_factor
 
 SUPPORTED_SPMM_VALUE_DTYPES = SUPPORTED_VALUE_DTYPES
 def _spmm_relative_threshold(value_dtype):
@@ -134,7 +135,7 @@ def _spmm_csr_real_kernel(
     tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n)
 
 
-# Complex-path variant of the same AlphaSparse CSR ALG1 mapping.
+# Complex-path variant of the same Triton-native CSR base mapping.
 @triton.jit
 def _spmm_csr_complex_kernel(
     data_ri_ptr,
@@ -282,18 +283,9 @@ def _prepare_spmm_csr_inputs(data, indices, indptr, B, shape):
 
 
 def _select_spmm_alg1_warp_and_factor(n_dense_cols):
-    # Mirrors AlphaSparse CSR ALG1 row-major heuristics without exposing warp details publicly.
-    if n_dense_cols > 64:
-        return 32, 4
-    if n_dense_cols > 32:
-        return 32, 2
-    if n_dense_cols > 16:
-        return 32, 1
-    if n_dense_cols > 8:
-        return 16, 1
-    if n_dense_cols > 4:
-        return 8, 1
-    return 4, 1
+    # Reuse the AlphaSparse CSR ALG1 dense-N heuristic without claiming
+    # that the current Triton base path is a direct structural port.
+    return _select_alpha_spmm_alg1_warp_and_factor(n_dense_cols, order_row=True)
 
 
 def _resolve_spmm_alg1_launch_config(
@@ -2100,8 +2092,10 @@ def flagsparse_spmm_csr(
     """CSR SpMM: C = A @ B using Triton.
 
     A is provided as CSR arrays; B is a dense CUDA tensor with shape (n_cols, n_dense_cols).
-    This staged implementation is the row-major, non-transpose subset of
-    AlphaSparse CSR ALG1 (`csrspmm_rb_sr`) expressed in Triton.
+    This is the current Triton-native CSR base path for the row-major,
+    non-transpose subset. It borrows the dense-N launch heuristic from
+    AlphaSparse CSR ALG1 (`csrspmm_rb_sr`) but is not a direct structural
+    port of the CUDA kernel.
     """
     if block_n is not None and block_n <= 0:
         raise ValueError("block_n must be positive when provided")
@@ -2553,7 +2547,7 @@ def benchmark_spmm_case(
             "pytorch_unavailable_reason": pytorch_reason,
             "pytorch_sparse_format": pytorch_format,
             "cusparse_unavailable_reason": cusparse_reason,
-            "flagsparse_internal_route": "csr-alg1",
+            "flagsparse_internal_route": "csr-base-alg1-inspired",
         },
         "samples": {
             "pytorch": pytorch_values,
