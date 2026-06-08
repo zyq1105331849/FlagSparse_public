@@ -915,7 +915,8 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup runs")
     parser.add_argument("--iters", type=int, default=50, help="Timing iterations")
-    parser.add_argument("--no-cusparse", action="store_true", help="Skip direct hipSPARSE reference")
+    parser.add_argument("--no-hipsparse", action="store_true", dest="no_cusparse", help="Skip direct hipSPARSE reference")
+    parser.add_argument("--no-cusparse", action="store_true", dest="no_cusparse", help=argparse.SUPPRESS)
     parser.add_argument(
         "--csv-csr",
         type=str,

@@ -1,4 +1,4 @@
-"""Sparse matrix formats aligned with CuPy/cupyx."""
+"""Sparse matrix formats with optional CuPy/cupyx compatibility helpers."""
 
 try:
     import cupy as cp
@@ -6,7 +6,7 @@ try:
 except ImportError as exc:
     raise ImportError(
         "CuPy is required for sparse format utilities. "
-        "Install a CUDA-matched wheel, for example: pip install cupy-cuda12x"
+        "Optional CuPy sparse-format helpers are unavailable in this DCU build."
     ) from exc
 
 try:

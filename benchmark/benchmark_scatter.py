@@ -1,4 +1,4 @@
-"""Run scatter benchmark (FlagSparse vs PyTorch vs cuSPARSE)."""
+"""Run scatter benchmark (FlagSparse vs PyTorch vs hipSPARSE)."""
 import flagsparse as fs
 if __name__ == "__main__":
     fs.comprehensive_scatter_test()

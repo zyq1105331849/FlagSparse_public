@@ -333,8 +333,8 @@ def _print_header():
     print("-" * 196)
     print(
         f"{'ValueReq':>14} {'ValueEff':>18} {'Index':>6} {'Dense':>10} {'NNZ':>10} "
-        f"{'PT(ms)':>10} {'FS(ms)':>10} {'CS(ms)':>10} "
-        f"{'FS/PT':>8} {'FS/CS':>8} {'Status':>6} {'Err(FS)':>12} {'Err(CS)':>12}"
+        f"{'PT(ms)':>10} {'FS(ms)':>10} {'HS(ms)':>10} "
+        f"{'FS/PT':>8} {'FS/HS':>8} {'Status':>6} {'Err(FS)':>12} {'Err(HS)':>12}"
     )
     print("-" * 196)
 
@@ -351,7 +351,7 @@ def _print_row(row):
 
 def run_cli(args):
     if not torch.cuda.is_available():
-        print("CUDA is not available. Please run on a GPU-enabled system.")
+        print("ROCm/DCU device is not available through PyTorch. Please run on a GPU-enabled system.")
         return
 
     value_dtype_tokens = _parse_value_dtypes(args.value_dtypes)
@@ -364,7 +364,7 @@ def run_cli(args):
     print("=" * 180)
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(
-        f"Warmup: {args.warmup} | Iterations: {args.iters} | CU(ms): direct sparse backend steady-state time"
+        f"Warmup: {args.warmup} | Iterations: {args.iters} | HS(ms): direct hipSPARSE backend steady-state time"
     )
     print()
     _print_header()
@@ -518,7 +518,8 @@ def build_parser():
     )
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
-    parser.add_argument("--no-cusparse", action="store_true")
+    parser.add_argument("--no-hipsparse", action="store_true", dest="no_cusparse")
+    parser.add_argument("--no-cusparse", action="store_true", dest="no_cusparse", help=argparse.SUPPRESS)
     parser.add_argument("--csv-summary", default=None)
     parser.add_argument("--csv-samples", default=None)
     parser.add_argument("--sample-limit", type=int, default=32)

@@ -1021,7 +1021,8 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup runs")
     parser.add_argument("--iters", type=int, default=50, help="Timing iterations")
-    parser.add_argument("--no-cusparse", action="store_true", help="Skip direct hipSPARSE reference")
+    parser.add_argument("--no-hipsparse", action="store_true", dest="no_cusparse", help="Skip direct hipSPARSE reference")
+    parser.add_argument("--no-cusparse", action="store_true", dest="no_cusparse", help=argparse.SUPPRESS)
     parser.add_argument("--skip-api-checks", action="store_true", help="Skip API validation checks in synthetic mode")
     parser.add_argument("--skip-alg1-coverage", action="store_true", help="Skip dense-column ALG1 heuristic coverage in synthetic mode")
     parser.add_argument(

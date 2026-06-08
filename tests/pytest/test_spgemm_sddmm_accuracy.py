@@ -88,7 +88,7 @@ def test_spgemm_csr_sparse_ref_backend_reports_cupy_unavailable(monkeypatch):
     monkeypatch.setattr(spgemm_mod, "cpx_sparse", None, raising=False)
     backend, reason = spgemm_mod._spgemm_csr_sparse_ref_backend()
     assert backend is None
-    assert reason == "CuPy/cuSPARSE is not available"
+    assert reason == "optional sparse fallback is not available"
 
 
 def test_spgemm_csr_reference_returns_csr_tuple_and_metadata():

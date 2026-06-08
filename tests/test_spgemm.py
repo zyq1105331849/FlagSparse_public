@@ -462,7 +462,7 @@ def _build_cupy_spgemm_reference(
     b_shape,
 ):
     if ast_ops.cp is None or ast_ops.cpx_sparse is None:
-        raise RuntimeError("CuPy/cuSPARSE is not available")
+        raise RuntimeError("optional sparse fallback is not available")
     a_cp = ast_ops.cpx_sparse.csr_matrix(
         (
             ast_ops._cupy_from_torch(a_data),
@@ -1021,7 +1021,7 @@ def run_one_mtx(
                 result["ref_fail_stage"] = cu_ref.get("fail_stage")
             result["error"] = _append_error(result["error"], f"cu_ref: {cu_ref.get('reason')}")
     else:
-        result["cusparse_reason"] = "CuPy/cuSPARSE reference is disabled"
+        result["cusparse_reason"] = "sparse reference is disabled"
         result["cu_exec_mode"] = "disabled"
         result["attempted_modes_cu"] = "disabled"
     # Ensure reference-side temporary allocations are released before Triton run.
@@ -1195,15 +1195,15 @@ def run_mtx_batch(
 
 def _print_spgemm_mtx_header(value_dtype, index_dtype):
     print(f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}")
-    print("Formats: FlagSparse=CSR SpGEMM(A@B), cuSPARSE/hipSPARSE=direct CSR SpGEMM, PyTorch=sparse.mm.")
-    print("CU(ms) reports steady-state direct sparse backend time only; descriptor setup, workEstimation, and workspace management are excluded.")
-    print("Err(PT/CU)=max(|diff|/(atol+rtol*|ref|)); MaxRel=max(|diff|)/max(|ref|).")
+    print("Formats: FlagSparse=CSR SpGEMM(A@B), hipSPARSE=direct CSR SpGEMM, PyTorch=sparse.mm.")
+    print("HS(ms) reports steady-state direct sparse backend time only; descriptor setup, workEstimation, and workspace management are excluded.")
+    print("Err(PT/HS)=max(|diff|/(atol+rtol*|ref|)); MaxRel=max(|diff|)/max(|ref|).")
     print("-" * 320)
     print(
         f"{'Matrix':<28} {'Mode':<10} {'A_rows':>7} {'A_cols':>7} {'B_cols':>7} {'NNZ_A':>10} {'NNZ_B':>10} {'NNZ_C':>10} "
-        f"{'FlagSparse(ms)':>14} {'cuSPARSE(ms)':>13} {'PyTorch(ms)':>11} "
-        f"{'FS/CU':>7} {'FS/PT':>7} {'PT':>6} {'CU':>6} {'Status':>13} {'RefCode':>14} "
-        f"{'Err(PT)':>10} {'Err(CU)':>10} {'MaxAbs(PT)':>12} {'MaxRel(PT)':>12} {'MaxAbs(CU)':>12} {'MaxRel(CU)':>12} "
+        f"{'FlagSparse(ms)':>14} {'hipSPARSE(ms)':>13} {'PyTorch(ms)':>11} "
+        f"{'FS/HS':>7} {'FS/PT':>7} {'PT':>6} {'HS':>6} {'Status':>13} {'RefCode':>14} "
+        f"{'Err(PT)':>10} {'Err(HS)':>10} {'MaxAbs(PT)':>12} {'MaxRel(PT)':>12} {'MaxAbs(HS)':>12} {'MaxRel(HS)':>12} "
         f"{'Prep(ms)':>9} {'Count(ms)':>10} {'Fill(ms)':>9}"
     )
     print("-" * 320)
@@ -1614,7 +1614,8 @@ def main():
         default=TARGET_TIMED_WINDOW_SECONDS,
         help="adaptive target runtime window per matrix (only used with --adaptive-loops)",
     )
-    parser.add_argument("--no-cusparse", action="store_true")
+    parser.add_argument("--no-hipsparse", action="store_true", dest="no_cusparse", help="Disable sparse reference timing")
+    parser.add_argument("--no-cusparse", action="store_true", dest="no_cusparse", help=argparse.SUPPRESS)
     parser.add_argument(
         "--ref-blocked-retry",
         dest="ref_blocked_retry",

@@ -1841,7 +1841,7 @@ def _spgemm_csr_sparse_ref_backend(
             return "hipsparse", None
         return None, reason
     if cp is None or cpx_sparse is None:
-        return None, "CuPy/cuSPARSE is not available"
+        return None, "optional sparse fallback is not available"
     return "cupy_cusparse", None
 
 
@@ -1940,7 +1940,7 @@ def benchmark_spgemm_case(
     iters=30,
     run_cusparse=True,
 ):
-    """Benchmark CSR SpGEMM and compare with torch/cuSPARSE baselines."""
+    """Benchmark CSR SpGEMM and compare with torch/hipSPARSE baselines."""
     if value_dtype not in SUPPORTED_SPGEMM_VALUE_DTYPES:
         raise TypeError("value_dtype must be torch.float32 or torch.float64")
     device = torch.device("cuda")

@@ -167,8 +167,8 @@ def _print_header():
     print("-" * 196)
     print(
         f"{'ValueReq':>10} {'ValueEff':>10} {'Index':>6} {'Dense':>10} {'NNZ':>10} "
-        f"{'Reset':>6} {'FB':>4} {'IFB':>4} {'PT(ms)':>10} {'FS(ms)':>10} {'CS(ms)':>10} "
-        f"{'FS/PT':>8} {'FS/CS':>8} {'Status':>6} {'Err(FS)':>12} {'Err(CS)':>12}"
+        f"{'Reset':>6} {'FB':>4} {'IFB':>4} {'PT(ms)':>10} {'FS(ms)':>10} {'HS(ms)':>10} "
+        f"{'FS/PT':>8} {'FS/HS':>8} {'Status':>6} {'Err(FS)':>12} {'Err(HS)':>12}"
     )
     print("-" * 196)
 
@@ -187,7 +187,7 @@ def _print_row(row):
 
 def run_cli(args):
     if not torch.cuda.is_available():
-        print("CUDA is not available. Please run on a GPU-enabled system.")
+        print("ROCm/DCU device is not available through PyTorch. Please run on a GPU-enabled system.")
         return
 
     value_dtype_tokens = _parse_value_dtypes(args.value_dtypes)
@@ -381,7 +381,8 @@ def build_parser():
     )
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
-    parser.add_argument("--no-cusparse", action="store_true")
+    parser.add_argument("--no-hipsparse", action="store_true", dest="no_cusparse")
+    parser.add_argument("--no-cusparse", action="store_true", dest="no_cusparse", help=argparse.SUPPRESS)
     parser.add_argument("--unique-indices", default="true")
     parser.add_argument("--reset-output", choices=["true", "false", "both"], default="true")
     parser.add_argument("--dtype-policy", choices=["auto", "strict"], default="auto")

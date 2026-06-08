@@ -226,8 +226,8 @@ def _dense_to_coo(A):
 COO_SEP = "-" * 200
 COO_HEADER = (
     f"{'Matrix':<28} {'Op':>5} {'Out':>7} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10}  "
-    f"{'Base(ms)':>9} {'Opt(ms)':>9} {'PT(ms)':>9} {'CU(ms)':>9}  "
-    f"{'Opt/Base':>8} {'Opt/PT':>8} {'Opt/CU':>8}  "
+    f"{'Base(ms)':>9} {'Opt(ms)':>9} {'PT(ms)':>9} {'HS(ms)':>9}  "
+    f"{'Opt/Base':>8} {'Opt/PT':>8} {'Opt/HS':>8}  "
     f"{'Err(Base)':>10} {'Err(Opt)':>10} {'Status':>6}"
 )
 

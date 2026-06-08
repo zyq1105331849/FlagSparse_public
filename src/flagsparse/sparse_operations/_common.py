@@ -186,8 +186,8 @@ def _is_hipsparse_available():
 def _require_cupy():
     if cp is None or cpx_sparse is None:
         raise RuntimeError(
-            "CuPy is required for cuSPARSE baseline. "
-            "Install a CUDA-matched wheel, for example: pip install cupy-cuda12x"
+            "Optional CuPy sparse fallback is unavailable in this DCU build. "
+            "Use the hipSPARSE direct reference path when running on ROCm/DCU."
         )
 
 
@@ -195,7 +195,7 @@ def _cupy_dtype_from_torch(torch_dtype):
     _require_cupy()
     mapping = {
         torch.float16: cp.float16,
-        # Keep cuSPARSE baseline stable for bf16 by computing in fp32 on CuPy path.
+        # Keep the optional sparse fallback stable for bf16 by computing in fp32.
         torch.bfloat16: cp.float32,
         torch.float32: cp.float32,
         torch.float64: cp.float64,
@@ -241,9 +241,9 @@ def _to_backend_like(torch_tensor, ref_obj):
 
 def _cusparse_baseline_skip_reason(value_dtype):
     if value_dtype == torch.bfloat16:
-        return "bfloat16 is not supported by the cuSPARSE baseline path; skipped"
+        return "bfloat16 is not supported by the optional sparse fallback path; skipped"
     if _is_complex32_dtype(value_dtype):
-        return "complex32 is not supported by the cuSPARSE baseline path; skipped"
+        return "complex32 is not supported by the optional sparse fallback path; skipped"
     if cp is None and value_dtype == torch.float16:
         return "float16 is not supported by torch sparse fallback when CuPy is unavailable; skipped"
     return None

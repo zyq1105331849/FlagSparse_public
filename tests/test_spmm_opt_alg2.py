@@ -659,7 +659,6 @@ def main():
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--no-hipsparse", action="store_true", help="Disable direct hipSPARSE sparse reference timing")
-    parser.add_argument("--with-cusparse", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     with_hipsparse = not args.no_hipsparse
 

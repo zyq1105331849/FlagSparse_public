@@ -247,7 +247,6 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-hipsparse", action="store_true", help="Disable direct hipSPARSE sparse reference timing")
     parser.add_argument("--no-cusparse", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--with-cusparse", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--top-rows", type=int, default=512, help="Top rows by opt_alg2_vs_torch error")
     args = parser.parse_args()
 
