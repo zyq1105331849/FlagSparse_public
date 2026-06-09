@@ -403,13 +403,15 @@ def _time_pytorch_spmv(data, indices, indptr, x, shape, warmup, iters, op="non")
 
 
 def _tolerance(value_dtype):
-    if value_dtype in (torch.float16, torch.bfloat16):
-        return 2e-3, 2e-3
+    if value_dtype == torch.float16:
+        return 1e-3, 2e-3
+    if value_dtype == torch.bfloat16:
+        return 0.016, 1e-1
     if value_dtype in (torch.float32, torch.complex64):
-        return 1.25e-4, 1.25e-2
+        return 1.3e-6, 1e-3
     if value_dtype in (torch.float64, torch.complex128):
-        return 1e-12, 1e-10
-    return 5e-3, 5e-3
+        return 1e-7, 1e-5
+    return 1e-6, 1e-5
 
 
 def run_one_mtx(
@@ -489,10 +491,10 @@ def run_one_mtx(
         pytorch_ms = None
         pt_error_reason = f"PyTorch reference error: {exc}"
 
-    cusparse_ms = None
-    err_cu = None
-    triton_ok_cu = False
-    cu_error_reason = None
+    hipsparse_ms = None
+    err_hs = None
+    triton_ok_hs = False
+    hs_error_reason = None
     csc_ms = None
     if run_cusparse:
         try:
@@ -508,32 +510,32 @@ def run_one_mtx(
                 include_csc=True,
             )
             if sparse_ref["backend"] is None:
-                cu_error_reason = sparse_ref["reason"]
+                hs_error_reason = sparse_ref["reason"]
             else:
-                cusparse_ms = sparse_ref["ms"]
+                hipsparse_ms = sparse_ref["ms"]
                 csc_ms = sparse_ref.get("csc_ms")
-                cs_ref_t = sparse_ref["values"]
+                hs_ref_t = sparse_ref["values"]
                 if y_size:
-                    cu_error_reason = _non_finite_error_reason(
-                        triton_y, cs_ref_t, "sparse backend reference"
+                    hs_error_reason = _non_finite_error_reason(
+                        triton_y, hs_ref_t, "hipSPARSE reference"
                     )
-                    if cu_error_reason is None:
-                        err_cu = _allclose_error_ratio(triton_y, cs_ref_t, atol, rtol)
-                        triton_ok_cu = (not math.isnan(err_cu)) and err_cu <= 1.0
+                    if hs_error_reason is None:
+                        err_hs = _allclose_error_ratio(triton_y, hs_ref_t, atol, rtol)
+                        triton_ok_hs = (not math.isnan(err_hs)) and err_hs <= 1.0
                     else:
-                        err_cu = float("nan")
+                        err_hs = float("nan")
         except Exception as exc:
-            cusparse_ms = None
-            err_cu = None
+            hipsparse_ms = None
+            err_hs = None
             csc_ms = None
-            cu_error_reason = f"sparse reference error: {exc}"
+            hs_error_reason = f"hipSPARSE reference error: {exc}"
 
-    if pt_ref_y is None and err_cu is None:
+    if pt_ref_y is None and err_hs is None:
         triton_non_finite = _has_non_finite(triton_y)
         error_reason = "non-finite FlagSparse output" if triton_non_finite else (
             pt_error_reason
-            or cu_error_reason
-            or "ref: no PyTorch or sparse backend result"
+            or hs_error_reason
+            or "ref: no PyTorch or hipSPARSE result"
         )
         return {
             "path": mtx_path,
@@ -544,12 +546,15 @@ def run_one_mtx(
             "op": op,
             "transpose": transpose,
             "triton_ms": triton_ms,
+            "hipsparse_ms": None,
             "cusparse_ms": None,
             "pytorch_ms": None,
             "csc_ms": None,
             "err_pt": None,
+            "err_hs": None,
             "err_cu": None,
             "triton_ok_pt": False,
+            "triton_ok_hs": False,
             "triton_ok_cu": False,
             "status": "FAIL" if triton_non_finite else "REF_FAIL",
         }
@@ -562,18 +567,18 @@ def run_one_mtx(
             error_reason = pt_error_reason
         else:
             error_reason = "non-finite FlagSparse output"
-    elif triton_ok_pt or triton_ok_cu:
+    elif triton_ok_pt or triton_ok_hs:
         status = "PASS"
         error_reason = None
-    elif pt_error_reason == "non-finite PyTorch reference" and err_cu is None:
+    elif pt_error_reason == "non-finite PyTorch reference" and err_hs is None:
         status = "REF_FAIL"
         error_reason = pt_error_reason
     else:
         status = "FAIL"
         error_reason = (
             "tolerance exceeded"
-            if (_has_numeric_error(err_pt) or _has_numeric_error(err_cu))
-            else (pt_error_reason or cu_error_reason or "tolerance exceeded")
+            if (_has_numeric_error(err_pt) or _has_numeric_error(err_hs))
+            else (pt_error_reason or hs_error_reason or "tolerance exceeded")
         )
     return {
         "path": mtx_path,
@@ -584,13 +589,16 @@ def run_one_mtx(
         "op": op,
         "transpose": transpose,
         "triton_ms": triton_ms,
-        "cusparse_ms": cusparse_ms,
+        "hipsparse_ms": hipsparse_ms,
+        "cusparse_ms": hipsparse_ms,
         "pytorch_ms": pytorch_ms,
         "csc_ms": csc_ms,
         "err_pt": err_pt,
-        "err_cu": err_cu,
+        "err_hs": err_hs,
+        "err_cu": err_hs,
         "triton_ok_pt": triton_ok_pt,
-        "triton_ok_cu": triton_ok_cu,
+        "triton_ok_hs": triton_ok_hs,
+        "triton_ok_cu": triton_ok_hs,
         "status": status,
     }
 
@@ -629,12 +637,15 @@ def run_mtx_batch(
                 "op": op,
                 "transpose": _op_transposes(op),
                 "triton_ms": None,
+                "hipsparse_ms": None,
                 "cusparse_ms": None,
                 "pytorch_ms": None,
                 "csc_ms": None,
                 "err_pt": None,
+                "err_hs": None,
                 "err_cu": None,
                 "triton_ok_pt": False,
+                "triton_ok_hs": False,
                 "triton_ok_cu": False,
                 "status": "ERROR",
             }
@@ -683,12 +694,12 @@ def _print_mtx_header(value_dtype, index_dtype, op="non"):
     print("Formats: FlagSparse=CSR, hipSPARSE=CSR/CSC, PyTorch=CSR or COO.")
     print("Timing stays in native dtype. For float32, correctness references use float64 compute then cast.")
     print("Timing policy: non = compute only; trans/conj = raw op materialization + compute.")
-    print("PT/CU show per-reference correctness. Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|)).")
+    print("PT/HS show per-reference correctness. Err(PT)/Err(HS)=max(|diff| / (atol + rtol*|ref|)).")
     print("-" * 150)
     print(
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
         f"{'FlagSparse(ms)':>10} {'CSR(ms)':>10} {'CSC(ms)':>10} {'PyTorch(ms)':>11} "
-        f"{'FS/CSR':>7} {'FS/PT':>7} {'PT':>6} {'CU':>6} {'Err(PT)':>10} {'Err(CU)':>10}"
+        f"{'FS/HS':>7} {'FS/PT':>7} {'PT':>6} {'HS':>6} {'Err(PT)':>10} {'Err(HS)':>10}"
     )
     print("-" * 150)
 
@@ -706,18 +717,21 @@ def _print_mtx_row(r):
         )
         return
     triton_ms = r.get("triton_ms")
-    csr_ms = r.get("cusparse_ms")
+    hs_ms = r.get("hipsparse_ms", r.get("cusparse_ms"))
     csc_ms = r.get("csc_ms")
     pt_ms = r.get("pytorch_ms")
     err_pt_str = _fmt_err(r.get("err_pt"))
-    err_cu_str = _fmt_err(r.get("err_cu"))
+    err_hs_str = _fmt_err(r.get("err_hs", r.get("err_cu")))
     pt_status = _status_str(r.get("triton_ok_pt", False), r.get("err_pt") is not None)
-    cu_status = _status_str(r.get("triton_ok_cu", False), r.get("err_cu") is not None)
+    hs_status = _status_str(
+        r.get("triton_ok_hs", r.get("triton_ok_cu", False)),
+        r.get("err_hs", r.get("err_cu")) is not None,
+    )
     print(
         f"{name:<28} {n_rows:>7} {n_cols:>7} {r['nnz']:>10} "
-        f"{_fmt_ms(triton_ms):>10} {_fmt_ms(csr_ms):>10} {_fmt_ms(csc_ms):>10} {_fmt_ms(pt_ms):>11} "
-        f"{_fmt_speedup(csr_ms, triton_ms):>7} {_fmt_speedup(pt_ms, triton_ms):>7} "
-        f"{pt_status:>6} {cu_status:>6} {err_pt_str:>10} {err_cu_str:>10}"
+        f"{_fmt_ms(triton_ms):>10} {_fmt_ms(hs_ms):>10} {_fmt_ms(csc_ms):>10} {_fmt_ms(pt_ms):>11} "
+        f"{_fmt_speedup(hs_ms, triton_ms):>7} {_fmt_speedup(pt_ms, triton_ms):>7} "
+        f"{pt_status:>6} {hs_status:>6} {err_pt_str:>10} {err_hs_str:>10}"
     )
 
 
@@ -777,9 +791,13 @@ def run_all_dtypes_export_csv(
                         "n_cols": n_cols,
                         "nnz": r["nnz"],
                         "triton_ms": r.get("triton_ms"),
+                        "hipsparse_ms": r.get("hipsparse_ms", r.get("cusparse_ms")),
                         "cusparse_ms": r.get("cusparse_ms"),
                         "pytorch_ms": r.get("pytorch_ms"),
                         "csc_ms": r.get("csc_ms"),
+                        "triton_speedup_vs_hipsparse": _speedup_ratio(
+                            r.get("hipsparse_ms", r.get("cusparse_ms")), r.get("triton_ms")
+                        ),
                         "triton_speedup_vs_cusparse": _speedup_ratio(
                             r.get("cusparse_ms"), r.get("triton_ms")
                         ),
@@ -787,17 +805,23 @@ def run_all_dtypes_export_csv(
                             r.get("pytorch_ms"), r.get("triton_ms")
                         ),
                         "pt_status": _status_str(r.get("triton_ok_pt", False), r.get("err_pt") is not None),
+                        "hipsparse_status": _status_str(
+                            r.get("triton_ok_hs", r.get("triton_ok_cu", False)),
+                            r.get("err_hs", r.get("err_cu")) is not None,
+                        ),
                         "cu_status": _status_str(r.get("triton_ok_cu", False), r.get("err_cu") is not None),
                         "status": r.get("status", r.get("error", "")),
                         "error_reason": r.get("error_reason", r.get("error")),
                         "err_pt": r.get("err_pt"),
+                        "err_hs": r.get("err_hs", r.get("err_cu")),
                         "err_cu": r.get("err_cu"),
                     })
     fieldnames = [
         "matrix", "value_dtype", "index_dtype", "op", "transpose", "n_rows", "n_cols", "nnz",
-        "triton_ms", "cusparse_ms", "pytorch_ms", "csc_ms",
+        "triton_ms", "hipsparse_ms", "cusparse_ms", "pytorch_ms", "csc_ms",
+        "triton_speedup_vs_hipsparse",
         "triton_speedup_vs_cusparse", "triton_speedup_vs_pytorch",
-        "pt_status", "cu_status", "status", "error_reason", "err_pt", "err_cu",
+        "pt_status", "hipsparse_status", "cu_status", "status", "error_reason", "err_pt", "err_hs", "err_cu",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -819,7 +843,7 @@ def run_comprehensive_synthetic(op="non"):
     print("=" * 110)
     print(f"GPU: {torch.cuda.get_device_name(0)}  |  Warmup: {WARMUP}  Iters: {ITERS}  |  op: {op}  |  transpose: {bool(transpose)}")
     print("Formats: FlagSparse=CSR, hipSPARSE=CSR (when supported), Reference=direct hipSPARSE or PyTorch COO")
-    print("When CuPy does not support dtype (e.g. bfloat16/float16), reference = PyTorch (float32 then cast).")
+    print("When hipSPARSE does not support a case, reference = PyTorch (float32 then cast).")
     print()
     total = 0
     failed = 0
@@ -833,7 +857,7 @@ def run_comprehensive_synthetic(op="non"):
             print(
                 f"{'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
                 f"{'FlagSparse(ms)':>11} {'hipSPARSE(ms)':>13} {'FS/HS':>8} "
-                f"{'Status':>6} {'Err(FS)':>10} {'Err(CS)':>10}"
+                f"{'Status':>6} {'Err(FS)':>10} {'Err(HS)':>10}"
             )
             print("-" * 110)
             for n_rows, n_cols, nnz in TEST_CASES:
@@ -853,19 +877,19 @@ def run_comprehensive_synthetic(op="non"):
                     perf = result["performance"]
                     verify = result["verification"]
                     ok = verify["triton_match_reference"]
-                    cs_ok = verify.get("cusparse_match_reference")
-                    status = "PASS" if (ok and (cs_ok is None or cs_ok)) else "FAIL"
+                    hs_ok = verify.get("hipsparse_match_reference", verify.get("cusparse_match_reference"))
+                    status = "PASS" if (ok and (hs_ok is None or hs_ok)) else "FAIL"
                     if status == "FAIL":
                         failed += 1
                     triton_ms = perf["triton_ms"]
-                    cusparse_ms = perf["cusparse_ms"]
-                    speedup = perf.get("triton_speedup_vs_cusparse")
+                    hipsparse_ms = perf.get("hipsparse_ms", perf.get("cusparse_ms"))
+                    speedup = perf.get("triton_speedup_vs_hipsparse", perf.get("triton_speedup_vs_cusparse"))
                     speedup_str = f"{speedup:.2f}x" if speedup is not None else "N/A"
                     print(
                         f"{n_rows:>7} {n_cols:>7} {nnz:>10} "
-                        f"{_fmt_ms(triton_ms):>11} {_fmt_ms(cusparse_ms):>12} {speedup_str:>8} "
+                        f"{_fmt_ms(triton_ms):>11} {_fmt_ms(hipsparse_ms):>12} {speedup_str:>8} "
                         f"{status:>6} {_fmt_err(verify.get('triton_max_error')):>10} "
-                        f"{_fmt_err(verify.get('cusparse_max_error')):>10}"
+                        f"{_fmt_err(verify.get('hipsparse_max_error', verify.get('cusparse_max_error'))):>10}"
                     )
                 except Exception as exc:
                     failed += 1

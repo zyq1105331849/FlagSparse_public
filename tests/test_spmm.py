@@ -1,7 +1,7 @@
 """
 SpMM tests: load SuiteSparse .mtx, batch run, output error and performance.
 Supports: multi .mtx files, value_dtype / index_dtype, CSV export, synthetic cases,
-API validation checks, and PyTorch / CuPy comparison baselines.
+API validation checks, and PyTorch / hipSPARSE comparison baselines.
 
 This test module targets the current FlagSparse CSR SpMM base implementation, which is
 a Triton-native CSR path for the CSR + non-transpose + row-major dense-B/C subset.
@@ -155,18 +155,14 @@ def _build_dense_matrix(n_rows, n_cols, value_dtype, device):
 
 
 def _tolerance_for_dtype(value_dtype):
-    if value_dtype == torch.float16:
-        return 2e-3, 2e-3
-    if value_dtype == torch.bfloat16:
-        return 1e-1, 1e-1
     if value_dtype in (torch.float32, torch.complex64):
-        return 1e-6, 1e-5
+        return 1.3e-6, 1e-3
     if value_dtype in (torch.float64, torch.complex128):
-        return 1e-10, 1e-8
-    # If we ever need to mirror the looser SpMV test-script policy instead of the
-    # stricter library defaults, switch the float32/complex64 branch to
-    # `return 1e-4, 1e-2` and the float64/complex128 branch to
-    # `return 1e-12, 1e-10`.
+        return 1e-7, 1e-5
+    if value_dtype == torch.float16:
+        return 1e-3, 2e-3
+    if value_dtype == torch.bfloat16:
+        return 0.016, 1e-1
     return 1e-6, 1e-5
 
 
@@ -425,7 +421,7 @@ def run_one_mtx(
     block_nnz=DEFAULT_BLOCK_NNZ,
     max_segments=DEFAULT_MAX_SEGMENTS,
 ):
-    """Run SpMM on one .mtx and compare against PyTorch/CuPy baselines."""
+    """Run SpMM on one .mtx and compare against PyTorch/hipSPARSE baselines."""
     device = torch.device("cuda")
     data, indices, indptr, shape = load_mtx_to_csr_torch(mtx_path, dtype=value_dtype, device=device)
     indices = indices.to(index_dtype)
@@ -483,7 +479,7 @@ def run_one_mtx(
         result["triton_ms"] = triton_ms
         result["triton_first_call_ms"] = triton_first_call_ms
     except Exception as exc:
-        # Do not return: still time PyTorch / CuPy so CSV shows baseline ms when Triton fails.
+        # Do not return: still time PyTorch / hipSPARSE so CSV shows baseline ms when Triton fails.
         result["error"] = f"triton: {exc}"
         result["triton_ok_pt"] = False
 

@@ -10,6 +10,7 @@ from flagsparse import (
 import flagsparse.sparse_operations.spmv_coo as spmv_coo_mod
 import flagsparse.sparse_operations._common as common_mod
 
+from tests.pytest.accuracy_utils import close_tolerances
 from tests.pytest.param_shapes import (
     SPMV_COO_DTYPES,
     SPMV_COO_DTYPE_IDS,
@@ -61,9 +62,7 @@ def _random_coo_mn(M, N, dtype, device):
 
 
 def _tol(dtype):
-    if dtype in (torch.float32, torch.complex64):
-        return 1e-4, 1e-4
-    return 1e-10, 1e-8
+    return close_tolerances(dtype)
 
 
 def _make_x(length, dtype, device):
@@ -317,7 +316,8 @@ def test_spmv_coo_int64_auto_fallback_to_int32(monkeypatch):
         index_fallback_policy="auto",
     )
     assert state["forced_once"]
-    assert torch.allclose(out.to(torch.float64), ref, rtol=1e-4, atol=1e-4)
+    rtol, atol = _tol(torch.float32)
+    assert torch.allclose(out.to(torch.float64), ref, rtol=rtol, atol=atol)
 
 
 @CUDA_REQUIRED
@@ -355,4 +355,5 @@ def test_spmv_coo_tocsr_prepared_path_matches_torch():
     prepared = prepare_spmv_coo_tocsr(data, row, col, (M, N))
     ref = torch.sparse.mm(Asp, x.unsqueeze(1)).squeeze(1)
     out = flagsparse_spmv_coo_tocsr(x=x, prepared=prepared)
-    assert torch.allclose(out, ref, rtol=1e-4, atol=1e-4)
+    rtol, atol = _tol(torch.float32)
+    assert torch.allclose(out, ref, rtol=rtol, atol=atol)

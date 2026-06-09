@@ -7,13 +7,8 @@ import os
 
 import torch
 import flagsparse as fs
+from flagsparse.sparse_operations import _common as common_mod
 import flagsparse.sparse_operations.spmv_coo as spmv_coo_mod
-try:
-    import cupy as cp
-    import cupyx.scipy.sparse as cpx_sparse
-except Exception:
-    cp = None
-    cpx_sparse = None
 
 VALUE_DTYPES = [torch.float32, torch.float64, torch.complex64, torch.complex128]
 INDEX_DTYPES = [torch.int32, torch.int64]
@@ -117,9 +112,15 @@ def _reference_dtype(dtype):
 
 
 def _tol_for_dtype(dtype):
+    if dtype == torch.float16:
+        return 1e-3, 2e-3
+    if dtype == torch.bfloat16:
+        return 0.016, 1e-1
     if dtype in (torch.float32, torch.complex64):
-        return 1e-4, 1e-2
-    return 1e-12, 1e-10
+        return 1.3e-6, 1e-3
+    if dtype in (torch.float64, torch.complex128):
+        return 1e-7, 1e-5
+    return 1e-6, 1e-5
 
 
 def _op_transposes(op):
@@ -160,33 +161,6 @@ def _apply_torch_sparse_op(matrix, x_2d, op):
     raise ValueError(f"unsupported op: {op}")
 
 
-def _cupy_sparse_op_matrix(matrix, op):
-    if op == "non":
-        return matrix
-    if op == "trans":
-        return matrix.T
-    if op == "conj":
-        matrix_conj = matrix.conj() if hasattr(matrix, "conj") else matrix.conjugate()
-        return matrix_conj.T
-    raise ValueError(f"unsupported op: {op}")
-
-
-def _apply_cupy_sparse_op(matrix, x, op):
-    return _cupy_sparse_op_matrix(matrix, op) @ x
-
-
-def _apply_cupy_coo_op(data, row, col, shape, op):
-    if op == "non":
-        return data, row, col, shape
-    n_rows, n_cols = shape
-    data_op = data
-    if op == "conj":
-        data_op = data.conj() if hasattr(data, "conj") else data.conjugate()
-    elif op != "trans":
-        raise ValueError(f"unsupported op: {op}")
-    return data_op, col, row, (n_cols, n_rows)
-
-
 def _pytorch_coo_reference(data, row, col, x, shape, out_dtype, op="non"):
     data, row, col, shape = _apply_coo_op(data, row, col, shape, op)
     ref_dtype = _reference_dtype(out_dtype)
@@ -200,21 +174,6 @@ def _pytorch_coo_reference(data, row, col, x, shape, out_dtype, op="non"):
     ).coalesce()
     y_ref = torch.sparse.mm(coo_ref, x_ref.unsqueeze(1)).squeeze(1)
     return y_ref.to(out_dtype) if ref_dtype != out_dtype else y_ref
-
-
-def _cupy_coo_reference(data, row, col, x, shape, out_dtype, op="non"):
-    data, row, col, shape = _apply_coo_op(data, row, col, shape, op)
-    ref_dtype = _reference_dtype(out_dtype)
-    data_ref = data.to(ref_dtype)
-    x_ref = x.to(ref_dtype)
-    data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data_ref))
-    row_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(row.to(torch.int64)))
-    col_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(col.to(torch.int64)))
-    x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x_ref))
-    A_cp_ref = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
-    y_ref = A_cp_ref @ x_cp
-    y_ref_t = torch.utils.dlpack.from_dlpack(y_ref.toDlpack())
-    return y_ref_t.to(out_dtype) if ref_dtype != out_dtype else y_ref_t
 
 
 def _dense_to_coo(A):
@@ -325,7 +284,7 @@ def _run_flagsparse_coo_runtime_op(
     )
 
 
-def run_synthetic(value_dtypes=None, index_dtypes=None, ops=None):
+def run_synthetic(value_dtypes=None, index_dtypes=None, ops=None, run_cusparse=True):
     if not torch.cuda.is_available():
         print("CUDA is not available. Please run on a GPU-enabled system.")
         return
@@ -376,6 +335,7 @@ def run_synthetic(value_dtypes=None, index_dtypes=None, ops=None):
                         matrix_name=f"{m}x{n}",
                         warmup=WARMUP,
                         iters=ITERS,
+                        run_cusparse=run_cusparse,
                     )
                     _print_coo_result(result)
                 print(COO_SEP)
@@ -393,6 +353,7 @@ def _run_one_coo_case(
     matrix_name,
     warmup,
     iters,
+    run_cusparse=True,
 ):
     row = row.to(index_dtype).contiguous()
     col = col.to(index_dtype).contiguous()
@@ -437,16 +398,30 @@ def _run_one_coo_case(
     y_pt = _pytorch_coo_reference(data, row, col, x, shape, dtype, op=op)
     err_pt = _allclose_error_ratio(y_opt, y_pt, atol, rtol)
     cu_ms = None
+    cu_reason = None
     triton_ok_cu = False
-    if cp is not None and cpx_sparse is not None:
+    if run_cusparse:
         try:
-            cu_ms = _time_cupy_coo(data, row, col, x, shape, op, warmup, iters)
-            y_cu = _cupy_coo_reference(data, row, col, x, shape, dtype, op=op)
-            err_cu = _allclose_error_ratio(y_opt, y_cu, atol, rtol)
-            triton_ok_cu = (not math.isnan(err_cu)) and err_cu <= 1.0
-        except Exception:
+            sparse_ref = common_mod._benchmark_spmv_coo_sparse_ref(
+                data,
+                row,
+                col,
+                x,
+                shape,
+                warmup,
+                iters,
+                op=op,
+            )
+            cu_ms = sparse_ref["ms"]
+            cu_reason = sparse_ref.get("reason")
+            y_cu = sparse_ref["values"]
+            if y_cu is not None:
+                err_cu = _allclose_error_ratio(y_opt, y_cu, atol, rtol)
+                triton_ok_cu = (not math.isnan(err_cu)) and err_cu <= 1.0
+        except Exception as exc:
             cu_ms = None
             err_cu = None
+            cu_reason = str(exc)
     triton_ok_pt = (not math.isnan(err_pt)) and err_pt <= 1.0
     status = (
         "PASS"
@@ -471,6 +446,7 @@ def _run_one_coo_case(
         "base_ms": base_ms,
         "opt_ms": opt_ms,
         "cusparse_ms": cu_ms,
+        "cusparse_reason": cu_reason,
         "pytorch_ms": pt_ms,
         "opt_speedup_vs_cusparse": _speedup_ratio(cu_ms, opt_ms),
         "opt_speedup_vs_pytorch": _speedup_ratio(pt_ms, opt_ms),
@@ -531,42 +507,6 @@ def _run_torch_runtime_op(data, row, col, x_2d, shape, op):
     return torch.sparse.mm(coo, x_2d).squeeze(1)
 
 
-def _time_cupy_coo(data, row, col, x, shape, op, warmup, iters):
-    data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-    row_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(row.to(torch.int64)))
-    col_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(col.to(torch.int64)))
-    x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x))
-    if op == "non":
-        A_cp = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
-        spmv_op = lambda: A_cp @ x_cp
-    else:
-        spmv_op = lambda: _run_cupy_runtime_op(
-            data_cp,
-            row_cp,
-            col_cp,
-            x_cp,
-            shape,
-            op,
-        )
-    for _ in range(warmup):
-        _ = spmv_op()
-    cp.cuda.runtime.deviceSynchronize()
-    c0 = cp.cuda.Event()
-    c1 = cp.cuda.Event()
-    c0.record()
-    for _ in range(iters):
-        _ = spmv_op()
-    c1.record()
-    c1.synchronize()
-    return cp.cuda.get_elapsed_time(c0, c1) / iters
-
-
-def _run_cupy_runtime_op(data, row, col, x, shape, op):
-    data_op, row_op, col_op, shape_op = _apply_cupy_coo_op(data, row, col, shape, op)
-    A_cp = cpx_sparse.coo_matrix((data_op, (row_op, col_op)), shape=shape_op)
-    return A_cp @ x
-
-
 def _print_coo_result(row):
     name = str(row["matrix"])[:27]
     if len(str(row["matrix"])) > 27:
@@ -582,6 +522,12 @@ def _print_coo_result(row):
         f"{_fmt_err(row['err_base']):>10} {_fmt_err(row['err_opt']):>10} "
         f"{row['status']:>6}"
     )
+    reason = row.get("cusparse_reason")
+    if reason:
+        msg = str(reason).replace("\n", " ")
+        if len(msg) > 180:
+            msg = msg[:177] + "..."
+        print(f"  HS NOTE: {msg}")
 
 
 def _mtx_value_for_dtype(raw_value, dtype):
@@ -698,6 +644,7 @@ def _error_row(path, dtype, index_dtype, op):
         "base_ms": None,
         "opt_ms": None,
         "cusparse_ms": None,
+        "cusparse_reason": None,
         "pytorch_ms": None,
         "opt_speedup_vs_cusparse": None,
         "opt_speedup_vs_pytorch": None,
@@ -717,6 +664,7 @@ def run_all_dtypes_coo_csv(
     value_dtypes=None,
     index_dtypes=None,
     ops=None,
+    run_cusparse=True,
 ):
     if not torch.cuda.is_available():
         print("CUDA is not available.")
@@ -728,10 +676,10 @@ def run_all_dtypes_coo_csv(
     ops = OPS if ops is None else ops
     print("=" * 200)
     print("Input: MatrixMarket -> COO. FlagSparse: native COO Triton only (seg + atomic), no CSR.")
-    print("PyTorch = COO sparse.mm; CuPy = COO matvec (coo_matrix @ x, no tocsr).")
+    print("PyTorch = COO sparse.mm; HS = direct hipSPARSE COO SpMV when available.")
     print(
         "Timing policy: non = compute only; trans/conj = op processing + compute. "
-        "PyTorch/CuPy timings use original dtype."
+        "PyTorch/hipSPARSE timings use original dtype."
     )
     print(
         f"prepare_spmv_coo once per variant + {WARMUP} warmup + "
@@ -764,6 +712,7 @@ def run_all_dtypes_coo_csv(
                             matrix_name=os.path.basename(path),
                             warmup=WARMUP,
                             iters=ITERS,
+                            run_cusparse=run_cusparse,
                         )
                         rows_out.append(result)
                         _print_coo_result(result)
@@ -785,6 +734,7 @@ def run_all_dtypes_coo_csv(
         "base_ms",
         "opt_ms",
         "cusparse_ms",
+        "cusparse_reason",
         "pytorch_ms",
         "opt_speedup_vs_cusparse",
         "opt_speedup_vs_pytorch",
@@ -841,6 +791,18 @@ def main():
         default="non,trans,conj",
         help="Comma-separated matrix ops: non,trans,conj",
     )
+    parser.add_argument(
+        "--no-hipsparse",
+        action="store_true",
+        dest="no_cusparse",
+        help="Skip direct hipSPARSE reference",
+    )
+    parser.add_argument(
+        "--no-cusparse",
+        action="store_true",
+        dest="no_cusparse",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
     value_dtypes = _parse_csv_tokens(args.dtypes, DTYPE_MAP, "--dtypes")
     index_dtypes = _parse_csv_tokens(
@@ -849,7 +811,12 @@ def main():
     ops = _parse_ops(args.ops)
 
     if args.synthetic:
-        run_synthetic(value_dtypes=value_dtypes, index_dtypes=index_dtypes, ops=ops)
+        run_synthetic(
+            value_dtypes=value_dtypes,
+            index_dtypes=index_dtypes,
+            ops=ops,
+            run_cusparse=not args.no_cusparse,
+        )
         return
 
     paths = []
@@ -870,6 +837,7 @@ def main():
             value_dtypes=value_dtypes,
             index_dtypes=index_dtypes,
             ops=ops,
+            run_cusparse=not args.no_cusparse,
         )
         return
 

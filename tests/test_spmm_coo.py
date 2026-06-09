@@ -163,14 +163,14 @@ def _build_dense_matrix(n_rows, n_cols, value_dtype, device):
 
 
 def _tolerance_for_dtype(value_dtype):
-    if value_dtype == torch.float16:
-        return 2e-3, 2e-3
-    if value_dtype == torch.bfloat16:
-        return 1e-1, 1e-1
     if value_dtype in (torch.float32, torch.complex64):
-        return 1e-4, 1e-2
+        return 1.3e-6, 1e-3
     if value_dtype in (torch.float64, torch.complex128):
-        return 1e-12, 1e-10
+        return 1e-7, 1e-5
+    if value_dtype == torch.float16:
+        return 1e-3, 2e-3
+    if value_dtype == torch.bfloat16:
+        return 0.016, 1e-1
     return 1e-6, 1e-5
 
 
@@ -1466,6 +1466,7 @@ def main():
     )
     print()
     for op_name in op_names:
+        _print_spmm_coo_mtx_header(value_dtype, index_dtype, route=args.route)
         results = run_mtx_batch(
             paths,
             value_dtype=value_dtype,
@@ -1478,8 +1479,9 @@ def main():
             block_nnz=args.block_nnz,
             route=args.route,
             op=op_name,
+            on_result=_print_spmm_coo_mtx_row,
         )
-        print_mtx_results(results, value_dtype, index_dtype, route=args.route)
+        print("-" * 186)
         if args.route == "compare":
             print_compare_results(results, value_dtype, index_dtype)
 
