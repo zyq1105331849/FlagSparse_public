@@ -104,6 +104,7 @@ WORST_ROW_FIELDS = [
     "cpu_ref_value",
     "gpu_hp_ref_value",
     "gpu_native_ref_value",
+    "cusparse_ref_value",
     "abs_diff_vs_cpu_ref",
 ]
 
@@ -123,6 +124,7 @@ WORST_VALUE_FIELDS = [
     "cpu_ref_value",
     "gpu_hp_ref_value",
     "gpu_native_ref_value",
+    "cusparse_ref_value",
 ]
 
 BUCKET_FIELDS = [
@@ -500,6 +502,7 @@ def _build_worst_rows(matrix_name, dtype_name, op, alg, candidate, refs, profile
     cpu_ref = refs.get("cpu")
     gpu_hp = refs.get("gpu_hp")
     gpu_native = refs.get("gpu_native")
+    cusparse = refs.get("cusparse")
     row_lengths_cpu = row_lengths.to(torch.int64).cpu()
     for row_id in order.to(torch.int64).tolist():
         col = int(worst_col[row_id].item())
@@ -519,6 +522,7 @@ def _build_worst_rows(matrix_name, dtype_name, op, alg, candidate, refs, profile
                 "cpu_ref_value": _scalar(cpu_ref[row_id, col]) if cpu_ref is not None else None,
                 "gpu_hp_ref_value": _scalar(gpu_hp[row_id, col]) if gpu_hp is not None else None,
                 "gpu_native_ref_value": _scalar(gpu_native[row_id, col]) if gpu_native is not None else None,
+                "cusparse_ref_value": _scalar(cusparse[row_id, col]) if cusparse is not None else None,
                 "abs_diff_vs_cpu_ref": (
                     float(torch.abs(candidate[row_id, col].to(torch.float64) - cpu_ref[row_id, col].to(torch.float64)).item())
                     if candidate is not None and cpu_ref is not None
@@ -544,6 +548,7 @@ def _build_worst_values(matrix_name, dtype_name, op, alg, candidate, refs, dtype
     dense_cols = int(ratio.shape[1])
     gpu_hp = refs.get("gpu_hp")
     gpu_native = refs.get("gpu_native")
+    cusparse = refs.get("cusparse")
     row_lengths_cpu = row_lengths.to(torch.int64).cpu()
     out = []
     for rank, (value, flat_index) in enumerate(zip(values.tolist(), flat_indices.tolist()), start=1):
@@ -566,6 +571,7 @@ def _build_worst_values(matrix_name, dtype_name, op, alg, candidate, refs, dtype
                 "cpu_ref_value": _scalar(cpu_ref[row, col]),
                 "gpu_hp_ref_value": _scalar(gpu_hp[row, col]) if gpu_hp is not None else None,
                 "gpu_native_ref_value": _scalar(gpu_native[row, col]) if gpu_native is not None else None,
+                "cusparse_ref_value": _scalar(cusparse[row, col]) if cusparse is not None else None,
             }
         )
     return out
@@ -767,7 +773,12 @@ def _run_one_case(args, path, dtype, op, alg_names):
             "cusparse_reason": cusparse_reason or "",
         }
         case_summary.append(summary_row)
-        refs_for_rows = {"cpu": cpu_ref, "gpu_hp": refs["gpu_hp"], "gpu_native": refs["gpu_native"]}
+        refs_for_rows = {
+            "cpu": cpu_ref,
+            "gpu_hp": refs["gpu_hp"],
+            "gpu_native": refs["gpu_native"],
+            "cusparse": refs["cusparse"],
+        }
         case_worst_rows.extend(
             _build_worst_rows(
                 matrix_name,
