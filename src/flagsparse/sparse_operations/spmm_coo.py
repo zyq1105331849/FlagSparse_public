@@ -2,7 +2,6 @@
 
 from ._common import *
 from .spmm_csr import (
-    SpmmCsrAlgorithmUnavailable,
     SUPPORTED_SPMM_VALUE_DTYPES,
     _select_spmm_alg1_warp_and_factor,
     _spmm_coo_reference_tolerance,
@@ -621,12 +620,21 @@ def _triton_spmm_coo_rowrun_impl(
             return C_cast
         return C_compute
 
-    if dense_layout == "col" or (out is not None and _is_col_major_2d(out)):
-        raise SpmmCsrAlgorithmUnavailable("coo col-major layout does not support complex dtypes yet")
-
     data_ri = torch.view_as_real(data).contiguous().reshape(-1)
-    B_ri = torch.view_as_real(B).contiguous()
-    C_ri = torch.zeros((n_rows, n_dense_cols, 2), dtype=B_ri.dtype, device=device)
+    B_ri = torch.view_as_real(B)
+    C_compute = (
+        out
+        if out is not None and dtype == output_dtype
+        else _zeros_dense_layout(
+            (n_rows, n_dense_cols),
+            dtype,
+            device,
+            dense_layout,
+        )
+    )
+    if C_compute is out:
+        C_compute.zero_()
+    C_ri = torch.view_as_real(C_compute)
     acc_dtype = tl.float64 if B_ri.dtype == torch.float64 else tl.float32
     _spmm_coo_rowrun_complex_kernel[grid](
         data_ri,
@@ -647,11 +655,17 @@ def _triton_spmm_coo_rowrun_impl(
         BLOCK_NNZ=block_nnz,
         ACC_DTYPE=acc_dtype,
     )
-    C = torch.view_as_complex(C_ri.contiguous())
-    if out is not None:
-        out.copy_(C if dtype == output_dtype else C.to(output_dtype))
-        return out
-    return C if dtype == output_dtype else C.to(output_dtype)
+    if dtype != output_dtype:
+        C_cast = C_compute.to(output_dtype)
+        if out is not None:
+            out.copy_(C_cast)
+            return out
+        if dense_layout == "col":
+            C_out = _empty_dense_layout((n_rows, n_dense_cols), output_dtype, device, dense_layout)
+            C_out.copy_(C_cast)
+            return C_out
+        return C_cast
+    return C_compute
 
 def _triton_spmm_coo_atomic_impl(
     data,
@@ -722,12 +736,21 @@ def _triton_spmm_coo_atomic_impl(
             return C_cast
         return C_compute
 
-    if dense_layout == "col" or (out is not None and _is_col_major_2d(out)):
-        raise SpmmCsrAlgorithmUnavailable("coo col-major layout does not support complex dtypes yet")
-
     data_ri = torch.view_as_real(data).contiguous().reshape(-1)
-    B_ri = torch.view_as_real(B).contiguous()
-    C_ri = torch.zeros((n_rows, n_dense_cols, 2), dtype=B_ri.dtype, device=device)
+    B_ri = torch.view_as_real(B)
+    C_compute = (
+        out
+        if out is not None and dtype == output_dtype
+        else _zeros_dense_layout(
+            (n_rows, n_dense_cols),
+            dtype,
+            device,
+            dense_layout,
+        )
+    )
+    if C_compute is out:
+        C_compute.zero_()
+    C_ri = torch.view_as_real(C_compute)
     acc_dtype = tl.float64 if B_ri.dtype == torch.float64 else tl.float32
     _spmm_coo_atomic_complex_kernel[(nnz, n_dense_cols)](
         data_ri,
@@ -745,11 +768,17 @@ def _triton_spmm_coo_atomic_impl(
         C_ri.stride(2),
         ACC_DTYPE=acc_dtype,
     )
-    C = torch.view_as_complex(C_ri.contiguous())
-    if out is not None:
-        out.copy_(C if dtype == output_dtype else C.to(output_dtype))
-        return out
-    return C if dtype == output_dtype else C.to(output_dtype)
+    if dtype != output_dtype:
+        C_cast = C_compute.to(output_dtype)
+        if out is not None:
+            out.copy_(C_cast)
+            return out
+        if dense_layout == "col":
+            C_out = _empty_dense_layout((n_rows, n_dense_cols), output_dtype, device, dense_layout)
+            C_out.copy_(C_cast)
+            return C_out
+        return C_cast
+    return C_compute
 
 def _normalize_spmm_coo_route(route):
     route = "rowrun" if route is None else str(route).lower()
@@ -835,11 +864,6 @@ def _run_spmm_coo_canonical_route(
             raise ValueError("out must be on the same CUDA device as the inputs")
         if out.shape != (n_rows, n_dense_cols) or out.dtype != output_dtype:
             raise ValueError("out shape/dtype must match result")
-    if _is_complex_dtype(output_dtype) and (
-        dense_layout == "col" or (out is not None and _is_col_major_2d(out))
-    ):
-        raise SpmmCsrAlgorithmUnavailable("coo col-major layout does not support complex dtypes yet")
-
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     C = _triton_spmm_coo_impl(

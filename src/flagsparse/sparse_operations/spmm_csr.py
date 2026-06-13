@@ -708,8 +708,6 @@ def _materialize_spmm_csr_route_op(prepared, op_name, *, timing=False):
 def _run_spmm_csr_base_route(prepared, B, *, timing=False, diagnostics=False, dense_layout="row"):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     dense_layout = _normalize_dense_layout(dense_layout)
-    if dense_layout == "col" and _is_complex_dtype(prepared.data.dtype):
-        raise SpmmCsrAlgorithmUnavailable("csr_base col-major layout does not support complex dtypes yet")
     B = _materialize_dense_layout(B, dense_layout)
     C_out = _empty_dense_layout(
         (prepared.n_rows, int(B.shape[1])),
@@ -2754,11 +2752,15 @@ def _triton_spmm_csr_impl(
             return C_cast
         return C_compute
 
-    if dense_layout == "col" or (out is not None and _is_col_major_2d(out)):
-        raise SpmmCsrAlgorithmUnavailable("csr_base col-major layout does not support complex dtypes yet")
     data_ri = torch.view_as_real(data).contiguous().reshape(-1)
-    B_ri = torch.view_as_real(B).contiguous()
-    C_ri = torch.empty((n_rows, n_dense_cols, 2), dtype=B_ri.dtype, device=device)
+    B_ri = torch.view_as_real(B)
+    C_complex = out if out is not None else _empty_dense_layout(
+        (n_rows, n_dense_cols),
+        dtype,
+        device,
+        dense_layout,
+    )
+    C_ri = torch.view_as_real(C_complex)
     grid = (n_rows, triton.cdiv(n_dense_cols, block_n))
     acc_dtype = tl.float64 if B_ri.dtype == torch.float64 else tl.float32
     _spmm_csr_complex_kernel[grid](
@@ -2781,7 +2783,7 @@ def _triton_spmm_csr_impl(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-    return torch.view_as_complex(C_ri.contiguous())
+    return C_complex
 
 
 @triton.jit

@@ -688,11 +688,6 @@ def run_one_mtx(
         "status": "UNKNOWN",
         "compare": None,
     }
-    if layout == "col" and _is_complex_dtype(value_dtype):
-        result["status"] = "SKIP"
-        result["error"] = "coo col-major layout does not support complex dtypes yet"
-        return result
-
     try:
         prepared = _prepare_canonical_case(data, row, col, shape, B, op=op_name, layout=layout)
         ref_C, pytorch_op, pytorch_format, pytorch_reason = _build_pytorch_reference(
@@ -1169,18 +1164,6 @@ def run_api_validation_checks():
         ("op transpose conflict", lambda: ast.flagsparse_spmm_coo(data, row, col, B, (2, 2), op="non", transpose=True), ValueError),
         ("out shape mismatch", lambda: ast.flagsparse_spmm_coo(data, row, col, B, (2, 2), out=torch.empty((3, 4), dtype=torch.float32, device=device)), ValueError),
         (
-            "complex col layout unsupported",
-            lambda: ast.flagsparse_spmm_coo(
-                data.to(torch.complex64),
-                row,
-                col,
-                _materialize_dense_layout_for_test(B.to(torch.complex64), "col"),
-                (2, 2),
-                dense_layout="col",
-            ),
-            ast_ops.SpmmCsrAlgorithmUnavailable,
-        ),
-        (
             "trans out shape mismatch",
             lambda: ast.flagsparse_spmm_coo(
                 data,
@@ -1295,6 +1278,23 @@ def run_api_validation_checks():
             raise AssertionError(f"unexpected col-major output stride: {tuple(result.stride())}")
 
     positive_checks.append(("col layout success", _positive_col_layout))
+
+    def _positive_complex_col_layout():
+        complex_data = data.to(torch.complex64) * (1 + 2j)
+        complex_B = _materialize_dense_layout_for_test(B.to(torch.complex64) * (2 - 1j), "col")
+        result, _ = _assert_spmm_coo_matches_reference(
+            complex_data,
+            row,
+            col,
+            complex_B,
+            (2, 2),
+            torch.complex64,
+            layout="col",
+        )
+        if tuple(result.stride()) != (1, result.shape[0]):
+            raise AssertionError(f"unexpected complex col-major output stride: {tuple(result.stride())}")
+
+    positive_checks.append(("complex col layout success", _positive_complex_col_layout))
 
     def _positive_unsorted_duplicate():
         _assert_spmm_coo_matches_reference(
@@ -1447,16 +1447,6 @@ def run_comprehensive_synthetic(
             combo_reason = None
             for op_name in op_names:
                 for layout_name in layout_names:
-                    if layout_name == "col" and _is_complex_dtype(value_dtype):
-                        for n_rows, n_cols, nnz, n_dense_cols in TEST_CASES:
-                            print(
-                                f"{op_name:>5} {layout_name:>4} {n_rows:>7} {n_cols:>7} {nnz:>10} {n_dense_cols:>8} "
-                                f"{'N/A':>4} {'N/A':>6} {'N/A':>5} {'N/A':>5} "
-                                f"{'N/A':>12} {'N/A':>14} {'N/A':>12} "
-                                f"{'N/A':>8} {'N/A':>8} {'SKIP':>6} {'N/A':>6} {'N/A':>11} {'N/A':>12}"
-                            )
-                        combo_reason = "coo col-major layout does not support complex dtypes yet"
-                        continue
                     for n_rows, n_cols, nnz, n_dense_cols in TEST_CASES:
                         result = ast_ops.benchmark_spmm_coo_case(
                             n_rows=n_rows,
