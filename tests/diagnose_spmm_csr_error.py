@@ -1,9 +1,9 @@
 """
 Diagnose CSR SpMM route error across all registered CSR algorithms.
 
-The primary reference is a CPU float64 CSR row loop.  This is intentionally
-independent of Triton, CUDA sparse kernels, CuPy, and SciPy so it can separate
-route/kernel error from GPU reference-path behavior.
+The primary reference is a CPU CSR row loop in the tested dtype.  Separate
+float64-accumulation references are kept only as comparison points, not as the
+default f32 pass/fail reference.
 
 Usage:
     python tests/diagnose_spmm_csr_error.py tests/data/wave.mtx --out-dir diag_smoke --no-cusparse
@@ -57,16 +57,20 @@ SUMMARY_FIELDS = [
     "process_cpu_ms",
     "process_gpu_ms",
     "compute_ms",
+    "cpu_ref_kind",
     "cpu_ref_status",
     "cpu_ref_reason",
-    "gpu_hp_ref_err_vs_cpu_ref",
-    "gpu_hp_ref_reason",
-    "gpu_native_ref_err_vs_cpu_ref",
-    "gpu_native_ref_reason",
+    "cpu_f64_ref_err_vs_cpu_ref",
+    "cpu_f64_ref_reason",
+    "torch_f64_cast_ref_err_vs_cpu_ref",
+    "torch_f64_cast_ref_reason",
+    "torch_native_ref_err_vs_cpu_ref",
+    "torch_native_ref_reason",
     "cusparse_ref_err_vs_cpu_ref",
     "err_vs_cpu_ref",
-    "err_vs_gpu_hp_ref",
-    "err_vs_gpu_native_ref",
+    "err_vs_cpu_f64_ref",
+    "err_vs_torch_f64_cast_ref",
+    "err_vs_torch_native_ref",
     "err_vs_cusparse_ref",
     "err_vs_csr_base",
     "max_abs_vs_cpu_ref",
@@ -102,8 +106,9 @@ WORST_ROW_FIELDS = [
     "worst_col",
     "candidate_value",
     "cpu_ref_value",
-    "gpu_hp_ref_value",
-    "gpu_native_ref_value",
+    "cpu_f64_ref_value",
+    "torch_f64_cast_ref_value",
+    "torch_native_ref_value",
     "cusparse_ref_value",
     "abs_diff_vs_cpu_ref",
 ]
@@ -122,8 +127,9 @@ WORST_VALUE_FIELDS = [
     "abs_diff_vs_cpu_ref",
     "candidate_value",
     "cpu_ref_value",
-    "gpu_hp_ref_value",
-    "gpu_native_ref_value",
+    "cpu_f64_ref_value",
+    "torch_f64_cast_ref_value",
+    "torch_native_ref_value",
     "cusparse_ref_value",
 ]
 
@@ -140,8 +146,9 @@ WORST_CONTRIB_FIELDS = [
     "scaled_ratio_vs_cpu_ref",
     "candidate_value",
     "cpu_ref_value",
-    "gpu_hp_ref_value",
-    "gpu_native_ref_value",
+    "cpu_f64_ref_value",
+    "torch_f64_cast_ref_value",
+    "torch_native_ref_value",
     "cusparse_ref_value",
     "tolerance_atol",
     "tolerance_rtol",
@@ -421,40 +428,40 @@ def _error_profile(candidate, reference, dtype):
     }
 
 
-def _cpu_csr_spmm_reference(data, indices, indptr, shape, B, dtype, op):
-    data64 = data.detach().cpu().to(torch.float64)
+def _cpu_csr_spmm_reference(data, indices, indptr, shape, B, dtype, op, accumulate_dtype):
+    data_acc = data.detach().cpu().to(accumulate_dtype)
     indices64 = indices.detach().cpu().to(torch.int64)
     indptr64 = indptr.detach().cpu().to(torch.int64)
-    B64 = B.detach().cpu().to(torch.float64)
+    B_acc = B.detach().cpu().to(accumulate_dtype)
     n_rows, n_cols = int(shape[0]), int(shape[1])
-    dense_cols = int(B64.shape[1])
+    dense_cols = int(B_acc.shape[1])
     if op == "non":
-        out = torch.zeros((n_rows, dense_cols), dtype=torch.float64)
+        out = torch.zeros((n_rows, dense_cols), dtype=accumulate_dtype)
         for row in range(n_rows):
             start = int(indptr64[row].item())
             end = int(indptr64[row + 1].item())
             if start == end:
                 continue
             cols = indices64[start:end]
-            vals = data64[start:end].view(-1, 1)
-            out[row] = torch.sum(vals * B64.index_select(0, cols), dim=0)
+            vals = data_acc[start:end].view(-1, 1)
+            out[row] = torch.sum(vals * B_acc.index_select(0, cols), dim=0)
     elif op in ("trans", "conj"):
-        out = torch.zeros((n_cols, dense_cols), dtype=torch.float64)
+        out = torch.zeros((n_cols, dense_cols), dtype=accumulate_dtype)
         for row in range(n_rows):
             start = int(indptr64[row].item())
             end = int(indptr64[row + 1].item())
             if start == end:
                 continue
             cols = indices64[start:end]
-            vals = data64[start:end].view(-1, 1)
-            contrib = vals * B64[row].view(1, -1)
+            vals = data_acc[start:end].view(-1, 1)
+            contrib = vals * B_acc[row].view(1, -1)
             out.index_add_(0, cols, contrib)
     else:
         raise ValueError(f"unsupported op: {op}")
     return out.to(dtype), None
 
 
-def _gpu_native_reference(data, indices, indptr, shape, B, op):
+def _torch_native_reference(data, indices, indptr, shape, B, op):
     ref, _, _ = _build_pytorch_reference(data, indices, indptr, shape, B, op=op)
     if data.dtype == torch.float32:
         ref_dtype = data.dtype
@@ -562,8 +569,9 @@ def _build_worst_rows(matrix_name, dtype_name, op, alg, candidate, refs, profile
     out = []
     candidate = _to_cpu_compare(candidate)
     cpu_ref = refs.get("cpu")
-    gpu_hp = refs.get("gpu_hp")
-    gpu_native = refs.get("gpu_native")
+    cpu_f64 = refs.get("cpu_f64")
+    torch_f64_cast = refs.get("torch_f64_cast")
+    torch_native = refs.get("torch_native")
     cusparse = refs.get("cusparse")
     row_lengths_cpu = row_lengths.to(torch.int64).cpu()
     for row_id in order.to(torch.int64).tolist():
@@ -582,8 +590,9 @@ def _build_worst_rows(matrix_name, dtype_name, op, alg, candidate, refs, profile
                 "worst_col": col,
                 "candidate_value": _scalar(candidate[row_id, col]) if candidate is not None else None,
                 "cpu_ref_value": _scalar(cpu_ref[row_id, col]) if cpu_ref is not None else None,
-                "gpu_hp_ref_value": _scalar(gpu_hp[row_id, col]) if gpu_hp is not None else None,
-                "gpu_native_ref_value": _scalar(gpu_native[row_id, col]) if gpu_native is not None else None,
+                "cpu_f64_ref_value": _scalar(cpu_f64[row_id, col]) if cpu_f64 is not None else None,
+                "torch_f64_cast_ref_value": _scalar(torch_f64_cast[row_id, col]) if torch_f64_cast is not None else None,
+                "torch_native_ref_value": _scalar(torch_native[row_id, col]) if torch_native is not None else None,
                 "cusparse_ref_value": _scalar(cusparse[row_id, col]) if cusparse is not None else None,
                 "abs_diff_vs_cpu_ref": (
                     float(torch.abs(candidate[row_id, col].to(torch.float64) - cpu_ref[row_id, col].to(torch.float64)).item())
@@ -608,8 +617,9 @@ def _build_worst_values(matrix_name, dtype_name, op, alg, candidate, refs, dtype
         return []
     values, flat_indices = torch.topk(ratio.reshape(-1), k=flat_count)
     dense_cols = int(ratio.shape[1])
-    gpu_hp = refs.get("gpu_hp")
-    gpu_native = refs.get("gpu_native")
+    cpu_f64 = refs.get("cpu_f64")
+    torch_f64_cast = refs.get("torch_f64_cast")
+    torch_native = refs.get("torch_native")
     cusparse = refs.get("cusparse")
     row_lengths_cpu = row_lengths.to(torch.int64).cpu()
     out = []
@@ -631,8 +641,9 @@ def _build_worst_values(matrix_name, dtype_name, op, alg, candidate, refs, dtype
                 "abs_diff_vs_cpu_ref": float(diff[row, col].item()),
                 "candidate_value": _scalar(candidate_cpu[row, col]),
                 "cpu_ref_value": _scalar(cpu_ref[row, col]),
-                "gpu_hp_ref_value": _scalar(gpu_hp[row, col]) if gpu_hp is not None else None,
-                "gpu_native_ref_value": _scalar(gpu_native[row, col]) if gpu_native is not None else None,
+                "cpu_f64_ref_value": _scalar(cpu_f64[row, col]) if cpu_f64 is not None else None,
+                "torch_f64_cast_ref_value": _scalar(torch_f64_cast[row, col]) if torch_f64_cast is not None else None,
+                "torch_native_ref_value": _scalar(torch_native[row, col]) if torch_native is not None else None,
                 "cusparse_ref_value": _scalar(cusparse[row, col]) if cusparse is not None else None,
             }
         )
@@ -872,6 +883,7 @@ def _skip_summary(matrix_name, dtype_name, op, alg, shape, nnz, dense_cols, b_st
         "b_stride": b_stride,
         "status": "SKIP",
         "reason": reason,
+        "cpu_ref_kind": refs.get("cpu_kind") or "",
         "cpu_ref_status": "SKIP" if refs.get("cpu") is None else "PASS",
         "cpu_ref_reason": refs.get("cpu_reason") or "",
     }
@@ -894,21 +906,35 @@ def _run_one_case(args, path, dtype, op, alg_names):
     )
     b_stride = _stride_string(B)
 
-    refs = {"cpu": None, "cpu_reason": "", "gpu_hp": None, "gpu_native": None, "cusparse": None}
+    refs = {
+        "cpu": None,
+        "cpu_kind": f"cpu_{_dtype_name(dtype)}_accum",
+        "cpu_reason": "",
+        "cpu_f64": None,
+        "cpu_f64_reason": "",
+        "torch_f64_cast": None,
+        "torch_native": None,
+        "cusparse": None,
+    }
     if args.cpu_ref:
         try:
-            refs["cpu"], refs["cpu_reason"] = _cpu_csr_spmm_reference(data, indices, indptr, shape, B, dtype, op)
+            refs["cpu"], refs["cpu_reason"] = _cpu_csr_spmm_reference(
+                data, indices, indptr, shape, B, dtype, op, dtype
+            )
+            refs["cpu_f64"], refs["cpu_f64_reason"] = _cpu_csr_spmm_reference(
+                data, indices, indptr, shape, B, dtype, op, torch.float64
+            )
         except Exception as exc:
             refs["cpu_reason"] = str(exc)
     try:
-        gpu_hp, _, _ = _build_pytorch_reference(data, indices, indptr, shape, B, op=op)
-        refs["gpu_hp"] = _to_cpu_compare(gpu_hp)
+        torch_f64_cast, _, _ = _build_pytorch_reference(data, indices, indptr, shape, B, op=op)
+        refs["torch_f64_cast"] = _to_cpu_compare(torch_f64_cast)
     except Exception as exc:
-        refs["gpu_hp_reason"] = str(exc)
+        refs["torch_f64_cast_reason"] = str(exc)
     try:
-        refs["gpu_native"] = _to_cpu_compare(_gpu_native_reference(data, indices, indptr, shape, B, op))
+        refs["torch_native"] = _to_cpu_compare(_torch_native_reference(data, indices, indptr, shape, B, op))
     except Exception as exc:
-        refs["gpu_native_reason"] = str(exc)
+        refs["torch_native_reason"] = str(exc)
 
     cusparse_ms = None
     cusparse_reason = ""
@@ -921,8 +947,9 @@ def _run_one_case(args, path, dtype, op, alg_names):
         cusparse_reason = "disabled"
 
     cpu_ref = refs["cpu"]
-    gpu_hp_vs_cpu = _error_profile(refs["gpu_hp"], cpu_ref, dtype)["global_err"] if cpu_ref is not None else None
-    gpu_native_vs_cpu = _error_profile(refs["gpu_native"], cpu_ref, dtype)["global_err"] if cpu_ref is not None else None
+    cpu_f64_vs_cpu = _error_profile(refs["cpu_f64"], cpu_ref, dtype)["global_err"] if cpu_ref is not None else None
+    torch_f64_cast_vs_cpu = _error_profile(refs["torch_f64_cast"], cpu_ref, dtype)["global_err"] if cpu_ref is not None else None
+    torch_native_vs_cpu = _error_profile(refs["torch_native"], cpu_ref, dtype)["global_err"] if cpu_ref is not None else None
     cusparse_vs_cpu = _error_profile(refs["cusparse"], cpu_ref, dtype)["global_err"] if cpu_ref is not None else None
 
     prepared = fs.prepare_spmm_csr_route(data, indices, indptr, shape, op=op, alg="auto")
@@ -963,8 +990,9 @@ def _run_one_case(args, path, dtype, op, alg_names):
         diagnostics = meta.get("diagnostics", {})
         buckets = _build_row_bucket_map(int(out_cpu.shape[0]), diagnostics)
         cpu_profile = _error_profile(out_cpu, cpu_ref, dtype)
-        gpu_hp_profile = _error_profile(out_cpu, refs["gpu_hp"], dtype)
-        gpu_native_profile = _error_profile(out_cpu, refs["gpu_native"], dtype)
+        cpu_f64_profile = _error_profile(out_cpu, refs["cpu_f64"], dtype)
+        torch_f64_cast_profile = _error_profile(out_cpu, refs["torch_f64_cast"], dtype)
+        torch_native_profile = _error_profile(out_cpu, refs["torch_native"], dtype)
         cusparse_profile = _error_profile(out_cpu, refs["cusparse"], dtype)
         base_profile = _error_profile(out_cpu, base_out, dtype) if base_out is not None else {"global_err": None}
         worst_row = cpu_profile["worst_row"]
@@ -988,16 +1016,20 @@ def _run_one_case(args, path, dtype, op, alg_names):
             "process_cpu_ms": meta.get("process_cpu_ms"),
             "process_gpu_ms": meta.get("process_gpu_ms"),
             "compute_ms": meta.get("compute_ms"),
+            "cpu_ref_kind": refs.get("cpu_kind") or "",
             "cpu_ref_status": "SKIP" if cpu_ref is None else "PASS",
             "cpu_ref_reason": refs.get("cpu_reason") or "",
-            "gpu_hp_ref_err_vs_cpu_ref": gpu_hp_vs_cpu,
-            "gpu_hp_ref_reason": refs.get("gpu_hp_reason") or "",
-            "gpu_native_ref_err_vs_cpu_ref": gpu_native_vs_cpu,
-            "gpu_native_ref_reason": refs.get("gpu_native_reason") or "",
+            "cpu_f64_ref_err_vs_cpu_ref": cpu_f64_vs_cpu,
+            "cpu_f64_ref_reason": refs.get("cpu_f64_reason") or "",
+            "torch_f64_cast_ref_err_vs_cpu_ref": torch_f64_cast_vs_cpu,
+            "torch_f64_cast_ref_reason": refs.get("torch_f64_cast_reason") or "",
+            "torch_native_ref_err_vs_cpu_ref": torch_native_vs_cpu,
+            "torch_native_ref_reason": refs.get("torch_native_reason") or "",
             "cusparse_ref_err_vs_cpu_ref": cusparse_vs_cpu,
             "err_vs_cpu_ref": cpu_profile["global_err"],
-            "err_vs_gpu_hp_ref": gpu_hp_profile["global_err"],
-            "err_vs_gpu_native_ref": gpu_native_profile["global_err"],
+            "err_vs_cpu_f64_ref": cpu_f64_profile["global_err"],
+            "err_vs_torch_f64_cast_ref": torch_f64_cast_profile["global_err"],
+            "err_vs_torch_native_ref": torch_native_profile["global_err"],
             "err_vs_cusparse_ref": cusparse_profile["global_err"],
             "err_vs_csr_base": base_profile["global_err"],
             "max_abs_vs_cpu_ref": cpu_profile["max_abs"],
@@ -1026,8 +1058,9 @@ def _run_one_case(args, path, dtype, op, alg_names):
         case_summary.append(summary_row)
         refs_for_rows = {
             "cpu": cpu_ref,
-            "gpu_hp": refs["gpu_hp"],
-            "gpu_native": refs["gpu_native"],
+            "cpu_f64": refs["cpu_f64"],
+            "torch_f64_cast": refs["torch_f64_cast"],
+            "torch_native": refs["torch_native"],
             "cusparse": refs["cusparse"],
         }
         case_worst_rows.extend(
