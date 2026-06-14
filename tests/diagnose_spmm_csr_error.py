@@ -127,6 +127,62 @@ WORST_VALUE_FIELDS = [
     "cusparse_ref_value",
 ]
 
+WORST_CONTRIB_FIELDS = [
+    "matrix",
+    "dtype",
+    "op",
+    "alg",
+    "rank",
+    "row",
+    "col",
+    "row_nnz",
+    "bucket",
+    "scaled_ratio_vs_cpu_ref",
+    "candidate_value",
+    "cpu_ref_value",
+    "gpu_hp_ref_value",
+    "gpu_native_ref_value",
+    "cusparse_ref_value",
+    "tolerance_atol",
+    "tolerance_rtol",
+    "tolerance_denom",
+    "contribution_count",
+    "seq_f32_sum",
+    "reverse_f32_sum",
+    "pairwise_f32_sum",
+    "abs_asc_f32_sum",
+    "abs_desc_f32_sum",
+    "f64_sum",
+    "f64_seq_sum",
+    "f32_cast_of_f64_sum",
+    "seq_f32_scaled_ratio_vs_cpu_ref",
+    "reverse_f32_scaled_ratio_vs_cpu_ref",
+    "pairwise_f32_scaled_ratio_vs_cpu_ref",
+    "abs_asc_f32_scaled_ratio_vs_cpu_ref",
+    "abs_desc_f32_scaled_ratio_vs_cpu_ref",
+    "candidate_minus_cpu_ref",
+    "candidate_minus_seq_f32",
+    "candidate_minus_reverse_f32",
+    "candidate_minus_pairwise_f32",
+    "candidate_minus_abs_asc_f32",
+    "candidate_minus_abs_desc_f32",
+    "sum_abs_products",
+    "abs_sum",
+    "cancellation_ratio",
+    "positive_sum",
+    "negative_sum",
+    "positive_count",
+    "negative_count",
+    "zero_count",
+    "max_abs_product",
+    "min_nonzero_abs_product",
+    "product_abs_dynamic_range",
+    "mean_abs_product",
+    "max_abs_a",
+    "max_abs_b",
+    "top_abs_products",
+]
+
 BUCKET_FIELDS = [
     "matrix",
     "dtype",
@@ -583,6 +639,194 @@ def _build_worst_values(matrix_name, dtype_name, op, alg, candidate, refs, dtype
     return out
 
 
+def _sum_float32_sequence(values):
+    acc = torch.tensor(0.0, dtype=torch.float32)
+    for value in values.reshape(-1):
+        acc = acc + value.to(torch.float32)
+    return float(acc.item())
+
+
+def _sum_float64_sequence(values):
+    acc = torch.tensor(0.0, dtype=torch.float64)
+    for value in values.reshape(-1):
+        acc = acc + value.to(torch.float64)
+    return float(acc.item())
+
+
+def _sum_float32_pairwise(values):
+    work = values.reshape(-1).to(torch.float32)
+    if work.numel() == 0:
+        return 0.0
+    while work.numel() > 1:
+        if work.numel() % 2:
+            work = torch.cat([work, torch.zeros(1, dtype=torch.float32)])
+        work = torch.sum(work.reshape(-1, 2), dim=1, dtype=torch.float32)
+    return float(work.item())
+
+
+def _format_top_products(source_indices, a_values, b_values, products, top_k):
+    if top_k <= 0 or products.numel() == 0:
+        return ""
+    count = min(int(top_k), int(products.numel()))
+    _, order = torch.topk(torch.abs(products), k=count)
+    terms = []
+    for idx in order.to(torch.int64).tolist():
+        terms.append(
+            f"{int(source_indices[idx].item())}:"
+            f"{float(a_values[idx].item()):.9g}:"
+            f"{float(b_values[idx].item()):.9g}:"
+            f"{float(products[idx].item()):.9g}"
+        )
+    return ";".join(terms)
+
+
+def _extract_contrib_terms(data_cpu, indices_cpu, indptr_cpu, B_cpu, shape, op, row, col, row_ids_cpu=None):
+    row = int(row)
+    col = int(col)
+    n_rows, _n_cols = int(shape[0]), int(shape[1])
+    if op == "non":
+        start = int(indptr_cpu[row].item())
+        end = int(indptr_cpu[row + 1].item())
+        source = indices_cpu[start:end].to(torch.int64)
+        a_values = data_cpu[start:end].to(torch.float64)
+        b_values = B_cpu.index_select(0, source).select(1, col).to(torch.float64)
+        return source, a_values, b_values
+
+    if row_ids_cpu is None:
+        row_counts = indptr_cpu[1:] - indptr_cpu[:-1]
+        row_ids_cpu = torch.repeat_interleave(torch.arange(n_rows, dtype=torch.int64), row_counts.to(torch.int64))
+    mask = indices_cpu.to(torch.int64) == row
+    source = row_ids_cpu[mask].to(torch.int64)
+    a_values = data_cpu[mask].to(torch.float64)
+    b_values = B_cpu.index_select(0, source).select(1, col).to(torch.float64)
+    return source, a_values, b_values
+
+
+def _contrib_metrics_for_value(
+    value_row,
+    data_cpu,
+    indices_cpu,
+    indptr_cpu,
+    B_cpu,
+    shape,
+    op,
+    dtype,
+    row_ids_cpu,
+    top_products,
+):
+    row = int(value_row["row"])
+    col = int(value_row["col"])
+    source, a_values, b_values = _extract_contrib_terms(
+        data_cpu,
+        indices_cpu,
+        indptr_cpu,
+        B_cpu,
+        shape,
+        op,
+        row,
+        col,
+        row_ids_cpu=row_ids_cpu,
+    )
+    products64 = a_values * b_values
+    products32 = a_values.to(torch.float32) * b_values.to(torch.float32)
+    abs_products = torch.abs(products64)
+    nonzero_abs = abs_products[abs_products > 0]
+    f64_sum = float(torch.sum(products64).item()) if products64.numel() else 0.0
+    sum_abs = float(torch.sum(abs_products).item()) if abs_products.numel() else 0.0
+    abs_sum = abs(f64_sum)
+    tiny = torch.finfo(torch.float64).tiny
+    positive = products64[products64 > 0]
+    negative = products64[products64 < 0]
+    asc_order = torch.argsort(torch.abs(products32), descending=False) if products32.numel() else torch.empty(0, dtype=torch.int64)
+    desc_order = torch.argsort(torch.abs(products32), descending=True) if products32.numel() else torch.empty(0, dtype=torch.int64)
+    max_abs_product = float(torch.max(abs_products).item()) if abs_products.numel() else 0.0
+    min_nonzero = float(torch.min(nonzero_abs).item()) if nonzero_abs.numel() else 0.0
+    seq_f32 = _sum_float32_sequence(products32)
+    reverse_f32 = _sum_float32_sequence(torch.flip(products32, dims=(0,)))
+    pairwise_f32 = _sum_float32_pairwise(products32)
+    abs_asc_f32 = _sum_float32_sequence(products32.index_select(0, asc_order)) if products32.numel() else 0.0
+    abs_desc_f32 = _sum_float32_sequence(products32.index_select(0, desc_order)) if products32.numel() else 0.0
+    cpu_ref_value = float(value_row["cpu_ref_value"]) if value_row.get("cpu_ref_value") not in ("", None) else f64_sum
+    candidate_value = float(value_row["candidate_value"]) if value_row.get("candidate_value") not in ("", None) else 0.0
+    atol, rtol = _reference_tolerance(dtype)
+    denom = atol + rtol * abs(cpu_ref_value)
+
+    def scaled(value):
+        return abs(float(value) - cpu_ref_value) / denom if denom != 0 else 0.0
+
+    return {
+        **value_row,
+        "tolerance_atol": atol,
+        "tolerance_rtol": rtol,
+        "tolerance_denom": denom,
+        "contribution_count": int(products64.numel()),
+        "seq_f32_sum": seq_f32,
+        "reverse_f32_sum": reverse_f32,
+        "pairwise_f32_sum": pairwise_f32,
+        "abs_asc_f32_sum": abs_asc_f32,
+        "abs_desc_f32_sum": abs_desc_f32,
+        "f64_sum": f64_sum,
+        "f64_seq_sum": _sum_float64_sequence(products64),
+        "f32_cast_of_f64_sum": float(torch.tensor(f64_sum, dtype=torch.float32).item()),
+        "seq_f32_scaled_ratio_vs_cpu_ref": scaled(seq_f32),
+        "reverse_f32_scaled_ratio_vs_cpu_ref": scaled(reverse_f32),
+        "pairwise_f32_scaled_ratio_vs_cpu_ref": scaled(pairwise_f32),
+        "abs_asc_f32_scaled_ratio_vs_cpu_ref": scaled(abs_asc_f32),
+        "abs_desc_f32_scaled_ratio_vs_cpu_ref": scaled(abs_desc_f32),
+        "candidate_minus_cpu_ref": candidate_value - cpu_ref_value,
+        "candidate_minus_seq_f32": candidate_value - seq_f32,
+        "candidate_minus_reverse_f32": candidate_value - reverse_f32,
+        "candidate_minus_pairwise_f32": candidate_value - pairwise_f32,
+        "candidate_minus_abs_asc_f32": candidate_value - abs_asc_f32,
+        "candidate_minus_abs_desc_f32": candidate_value - abs_desc_f32,
+        "sum_abs_products": sum_abs,
+        "abs_sum": abs_sum,
+        "cancellation_ratio": sum_abs / max(abs_sum, tiny),
+        "positive_sum": float(torch.sum(positive).item()) if positive.numel() else 0.0,
+        "negative_sum": float(torch.sum(negative).item()) if negative.numel() else 0.0,
+        "positive_count": int(positive.numel()),
+        "negative_count": int(negative.numel()),
+        "zero_count": int(torch.sum(products64 == 0).item()) if products64.numel() else 0,
+        "max_abs_product": max_abs_product,
+        "min_nonzero_abs_product": min_nonzero,
+        "product_abs_dynamic_range": (max_abs_product / min_nonzero) if min_nonzero > 0 else None,
+        "mean_abs_product": float(torch.mean(abs_products).item()) if abs_products.numel() else 0.0,
+        "max_abs_a": float(torch.max(torch.abs(a_values)).item()) if a_values.numel() else 0.0,
+        "max_abs_b": float(torch.max(torch.abs(b_values)).item()) if b_values.numel() else 0.0,
+        "top_abs_products": _format_top_products(source, a_values, b_values, products64, top_products),
+    }
+
+
+def _build_worst_contribs(value_rows, data, indices, indptr, B, shape, op, dtype, top_contribs, top_products):
+    if top_contribs <= 0 or not value_rows:
+        return []
+    selected = value_rows[: int(top_contribs)]
+    data_cpu = data.detach().cpu()
+    indices_cpu = indices.detach().cpu().to(torch.int64)
+    indptr_cpu = indptr.detach().cpu().to(torch.int64)
+    B_cpu = B.detach().cpu()
+    row_ids_cpu = None
+    if op in ("trans", "conj"):
+        n_rows = int(shape[0])
+        row_counts = indptr_cpu[1:] - indptr_cpu[:-1]
+        row_ids_cpu = torch.repeat_interleave(torch.arange(n_rows, dtype=torch.int64), row_counts.to(torch.int64))
+    return [
+        _contrib_metrics_for_value(
+            row,
+            data_cpu,
+            indices_cpu,
+            indptr_cpu,
+            B_cpu,
+            shape,
+            op,
+            dtype,
+            row_ids_cpu,
+            top_products,
+        )
+        for row in selected
+    ]
+
+
 def _write_csv(path, rows, fieldnames):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as handle:
@@ -687,6 +931,7 @@ def _run_one_case(args, path, dtype, op, alg_names):
     case_summary = []
     case_worst_rows = []
     case_worst_values = []
+    case_worst_contribs = []
     case_buckets = []
     case_launch = []
 
@@ -799,18 +1044,31 @@ def _run_one_case(args, path, dtype, op, alg_names):
                 args.top_rows,
             )
         )
-        case_worst_values.extend(
-            _build_worst_values(
-                matrix_name,
-                dtype_name,
+        value_rows = _build_worst_values(
+            matrix_name,
+            dtype_name,
+            op,
+            meta.get("alg", alg),
+            out_cpu,
+            refs_for_rows,
+            dtype,
+            row_lengths,
+            buckets,
+            args.top_values,
+        )
+        case_worst_values.extend(value_rows)
+        case_worst_contribs.extend(
+            _build_worst_contribs(
+                value_rows,
+                data,
+                indices,
+                indptr,
+                B,
+                shape,
                 op,
-                meta.get("alg", alg),
-                out_cpu,
-                refs_for_rows,
                 dtype,
-                row_lengths,
-                buckets,
-                args.top_values,
+                args.top_contribs,
+                args.contrib_top_products,
             )
         )
         case_buckets.extend(
@@ -831,7 +1089,7 @@ def _run_one_case(args, path, dtype, op, alg_names):
             f"status={cpu_profile['status']}"
         )
 
-    return case_summary, case_worst_rows, case_worst_values, case_buckets, case_launch
+    return case_summary, case_worst_rows, case_worst_values, case_worst_contribs, case_buckets, case_launch
 
 
 def main():
@@ -847,8 +1105,20 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--cpu-ref", dest="cpu_ref", action="store_true", default=True, help="Enable CPU reference")
     parser.add_argument("--no-cpu-ref", dest="cpu_ref", action="store_false", help="Disable CPU reference")
-    parser.add_argument("--top-rows", type=int, default=512)
-    parser.add_argument("--top-values", type=int, default=128)
+    parser.add_argument("--top-rows", type=int, default=512, help="Rows to keep in worst_rows.csv per case")
+    parser.add_argument("--top-values", type=int, default=128, help="Elements to keep in worst_values.csv per case")
+    parser.add_argument(
+        "--top-contribs",
+        type=int,
+        default=32,
+        help="Worst elements per case to expand into contribution/order statistics",
+    )
+    parser.add_argument(
+        "--contrib-top-products",
+        type=int,
+        default=8,
+        help="Largest |A*B| contribution terms serialized per expanded element",
+    )
     parser.add_argument("--no-cusparse", action="store_true", help="Disable CuPy/cuSPARSE reference")
     args = parser.parse_args()
 
@@ -872,6 +1142,7 @@ def main():
     summary_rows = []
     worst_rows = []
     worst_values = []
+    worst_contribs = []
     bucket_rows = []
     launch_rows = []
 
@@ -884,12 +1155,14 @@ def main():
                 summary_rows.extend(case[0])
                 worst_rows.extend(case[1])
                 worst_values.extend(case[2])
-                bucket_rows.extend(case[3])
-                launch_rows.extend(case[4])
+                worst_contribs.extend(case[3])
+                bucket_rows.extend(case[4])
+                launch_rows.extend(case[5])
 
     _write_csv(os.path.join(args.out_dir, "summary.csv"), summary_rows, SUMMARY_FIELDS)
     _write_csv(os.path.join(args.out_dir, "worst_rows.csv"), worst_rows, WORST_ROW_FIELDS)
     _write_csv(os.path.join(args.out_dir, "worst_values.csv"), worst_values, WORST_VALUE_FIELDS)
+    _write_csv(os.path.join(args.out_dir, "worst_contribs.csv"), worst_contribs, WORST_CONTRIB_FIELDS)
     _write_csv(os.path.join(args.out_dir, "bucket_stats.csv"), bucket_rows, BUCKET_FIELDS)
     _write_csv(os.path.join(args.out_dir, "launch_stats.csv"), launch_rows, LAUNCH_FIELDS)
     print(f"Wrote diagnostics to {os.path.abspath(args.out_dir)}")
