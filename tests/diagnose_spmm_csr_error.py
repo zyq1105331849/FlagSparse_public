@@ -186,10 +186,16 @@ def _stride_string(tensor):
 
 
 def _reference_tolerance(dtype):
-    if dtype == torch.float32:
-        return 1e-4, 1e-2
-    if dtype == torch.float64:
-        return 1e-12, 1e-10
+    # Keep this diagnostic aligned with tests/test_spmm_csr.py.  The return
+    # order is (atol, rtol), matching the scaled-error denominator below.
+    if dtype in (torch.float32, torch.complex64):
+        return 1.3e-6, 1e-3
+    if dtype in (torch.float64, torch.complex128):
+        return 1e-7, 1e-5
+    if dtype == torch.float16:
+        return 1e-3, 2e-3
+    if dtype == torch.bfloat16:
+        return 0.016, 1e-1
     return 1e-6, 1e-5
 
 
