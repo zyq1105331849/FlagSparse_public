@@ -67,12 +67,33 @@ SUMMARY_FIELDS = [
     "torch_native_ref_err_vs_cpu_ref",
     "torch_native_ref_reason",
     "cusparse_ref_err_vs_cpu_ref",
+    "alpha_cpu_f64_ref_err_vs_cpu_ref",
+    "alpha_cpu_f64_ref_status_vs_cpu_ref",
+    "alpha_torch_f64_cast_ref_err_vs_cpu_ref",
+    "alpha_torch_f64_cast_ref_status_vs_cpu_ref",
+    "alpha_torch_native_ref_err_vs_cpu_ref",
+    "alpha_torch_native_ref_status_vs_cpu_ref",
+    "alpha_cusparse_ref_err_vs_cpu_ref",
+    "alpha_cusparse_ref_status_vs_cpu_ref",
     "err_vs_cpu_ref",
     "err_vs_cpu_f64_ref",
     "err_vs_torch_f64_cast_ref",
     "err_vs_torch_native_ref",
     "err_vs_cusparse_ref",
     "err_vs_csr_base",
+    "alpha_err_vs_cpu_ref",
+    "alpha_status_vs_cpu_ref",
+    "alpha_err_vs_cpu_f64_ref",
+    "alpha_status_vs_cpu_f64_ref",
+    "alpha_err_vs_torch_f64_cast_ref",
+    "alpha_status_vs_torch_f64_cast_ref",
+    "alpha_err_vs_torch_native_ref",
+    "alpha_status_vs_torch_native_ref",
+    "alpha_err_vs_cusparse_ref",
+    "alpha_status_vs_cusparse_ref",
+    "alpha_err_vs_csr_base",
+    "alpha_status_vs_csr_base",
+    "alpha_max_result_abs_vs_cpu_ref",
     "max_abs_vs_cpu_ref",
     "mean_abs_vs_cpu_ref",
     "row_p50_vs_cpu_ref",
@@ -268,6 +289,12 @@ def _status_from_error(error_value):
     return "PASS" if float(error_value) <= 1.0 else "FAIL"
 
 
+def _status_from_threshold(error_value, threshold):
+    if error_value is None:
+        return "SKIP"
+    return "PASS" if float(error_value) <= float(threshold) else "FAIL"
+
+
 def _resolve_input_paths(input_paths):
     paths = []
     for path in input_paths:
@@ -425,6 +452,50 @@ def _error_profile(candidate, reference, dtype):
         "rows_gt_10": int(torch.sum(row_max_ratio > 10.0).item()),
         "worst_row": worst_row,
         "worst_col": worst_col,
+    }
+
+
+def _alphasparse_error_profile(candidate, reference, threshold=1.3e-6):
+    """AlphaSparse check style: max(abs(answer-result)) / max(abs(result)).
+
+    The original AlphaSparse test check() receives (answer_data, result_data)
+    and divides the global max absolute difference by max(abs(result_data)).
+    Here `candidate` is the result under test, so it is used as the denominator
+    side to mirror that check as closely as possible.
+    """
+    if candidate is None or reference is None:
+        return {
+            "global_err": None,
+            "status": "SKIP",
+            "max_abs": None,
+            "max_result_abs": None,
+            "threshold": threshold,
+        }
+    candidate = candidate.to(torch.float64)
+    reference = reference.to(torch.float64)
+    if candidate.shape != reference.shape:
+        raise ValueError(f"shape mismatch: {candidate.shape} vs {reference.shape}")
+    if candidate.numel() == 0:
+        return {
+            "global_err": 0.0,
+            "status": "PASS",
+            "max_abs": 0.0,
+            "max_result_abs": 0.0,
+            "threshold": threshold,
+        }
+    diff = torch.abs(candidate - reference)
+    max_abs = float(torch.max(diff).item())
+    max_result_abs = float(torch.max(torch.abs(candidate)).item())
+    if max_result_abs == 0.0:
+        global_err = 0.0 if max_abs == 0.0 else float("inf")
+    else:
+        global_err = max_abs / max_result_abs
+    return {
+        "global_err": global_err,
+        "status": _status_from_threshold(global_err, threshold),
+        "max_abs": max_abs,
+        "max_result_abs": max_result_abs,
+        "threshold": threshold,
     }
 
 
@@ -951,6 +1022,22 @@ def _run_one_case(args, path, dtype, op, alg_names):
     torch_f64_cast_vs_cpu = _error_profile(refs["torch_f64_cast"], cpu_ref, dtype)["global_err"] if cpu_ref is not None else None
     torch_native_vs_cpu = _error_profile(refs["torch_native"], cpu_ref, dtype)["global_err"] if cpu_ref is not None else None
     cusparse_vs_cpu = _error_profile(refs["cusparse"], cpu_ref, dtype)["global_err"] if cpu_ref is not None else None
+    alpha_cpu_f64_vs_cpu = _alphasparse_error_profile(refs["cpu_f64"], cpu_ref) if cpu_ref is not None else {"global_err": None, "status": "SKIP"}
+    alpha_torch_f64_cast_vs_cpu = (
+        _alphasparse_error_profile(refs["torch_f64_cast"], cpu_ref)
+        if cpu_ref is not None
+        else {"global_err": None, "status": "SKIP"}
+    )
+    alpha_torch_native_vs_cpu = (
+        _alphasparse_error_profile(refs["torch_native"], cpu_ref)
+        if cpu_ref is not None
+        else {"global_err": None, "status": "SKIP"}
+    )
+    alpha_cusparse_vs_cpu = (
+        _alphasparse_error_profile(refs["cusparse"], cpu_ref)
+        if cpu_ref is not None
+        else {"global_err": None, "status": "SKIP"}
+    )
 
     prepared = fs.prepare_spmm_csr_route(data, indices, indptr, shape, op=op, alg="auto")
     algs = _expand_algs(alg_names, op, dtype)
@@ -995,6 +1082,16 @@ def _run_one_case(args, path, dtype, op, alg_names):
         torch_native_profile = _error_profile(out_cpu, refs["torch_native"], dtype)
         cusparse_profile = _error_profile(out_cpu, refs["cusparse"], dtype)
         base_profile = _error_profile(out_cpu, base_out, dtype) if base_out is not None else {"global_err": None}
+        alpha_cpu_profile = _alphasparse_error_profile(out_cpu, cpu_ref)
+        alpha_cpu_f64_profile = _alphasparse_error_profile(out_cpu, refs["cpu_f64"])
+        alpha_torch_f64_cast_profile = _alphasparse_error_profile(out_cpu, refs["torch_f64_cast"])
+        alpha_torch_native_profile = _alphasparse_error_profile(out_cpu, refs["torch_native"])
+        alpha_cusparse_profile = _alphasparse_error_profile(out_cpu, refs["cusparse"])
+        alpha_base_profile = (
+            _alphasparse_error_profile(out_cpu, base_out)
+            if base_out is not None
+            else {"global_err": None, "status": "SKIP"}
+        )
         worst_row = cpu_profile["worst_row"]
         worst_bucket = buckets[worst_row] if worst_row is not None and worst_row < len(buckets) else ""
         summary_row = {
@@ -1026,12 +1123,33 @@ def _run_one_case(args, path, dtype, op, alg_names):
             "torch_native_ref_err_vs_cpu_ref": torch_native_vs_cpu,
             "torch_native_ref_reason": refs.get("torch_native_reason") or "",
             "cusparse_ref_err_vs_cpu_ref": cusparse_vs_cpu,
+            "alpha_cpu_f64_ref_err_vs_cpu_ref": alpha_cpu_f64_vs_cpu["global_err"],
+            "alpha_cpu_f64_ref_status_vs_cpu_ref": alpha_cpu_f64_vs_cpu["status"],
+            "alpha_torch_f64_cast_ref_err_vs_cpu_ref": alpha_torch_f64_cast_vs_cpu["global_err"],
+            "alpha_torch_f64_cast_ref_status_vs_cpu_ref": alpha_torch_f64_cast_vs_cpu["status"],
+            "alpha_torch_native_ref_err_vs_cpu_ref": alpha_torch_native_vs_cpu["global_err"],
+            "alpha_torch_native_ref_status_vs_cpu_ref": alpha_torch_native_vs_cpu["status"],
+            "alpha_cusparse_ref_err_vs_cpu_ref": alpha_cusparse_vs_cpu["global_err"],
+            "alpha_cusparse_ref_status_vs_cpu_ref": alpha_cusparse_vs_cpu["status"],
             "err_vs_cpu_ref": cpu_profile["global_err"],
             "err_vs_cpu_f64_ref": cpu_f64_profile["global_err"],
             "err_vs_torch_f64_cast_ref": torch_f64_cast_profile["global_err"],
             "err_vs_torch_native_ref": torch_native_profile["global_err"],
             "err_vs_cusparse_ref": cusparse_profile["global_err"],
             "err_vs_csr_base": base_profile["global_err"],
+            "alpha_err_vs_cpu_ref": alpha_cpu_profile["global_err"],
+            "alpha_status_vs_cpu_ref": alpha_cpu_profile["status"],
+            "alpha_err_vs_cpu_f64_ref": alpha_cpu_f64_profile["global_err"],
+            "alpha_status_vs_cpu_f64_ref": alpha_cpu_f64_profile["status"],
+            "alpha_err_vs_torch_f64_cast_ref": alpha_torch_f64_cast_profile["global_err"],
+            "alpha_status_vs_torch_f64_cast_ref": alpha_torch_f64_cast_profile["status"],
+            "alpha_err_vs_torch_native_ref": alpha_torch_native_profile["global_err"],
+            "alpha_status_vs_torch_native_ref": alpha_torch_native_profile["status"],
+            "alpha_err_vs_cusparse_ref": alpha_cusparse_profile["global_err"],
+            "alpha_status_vs_cusparse_ref": alpha_cusparse_profile["status"],
+            "alpha_err_vs_csr_base": alpha_base_profile["global_err"],
+            "alpha_status_vs_csr_base": alpha_base_profile["status"],
+            "alpha_max_result_abs_vs_cpu_ref": alpha_cpu_profile["max_result_abs"],
             "max_abs_vs_cpu_ref": cpu_profile["max_abs"],
             "mean_abs_vs_cpu_ref": cpu_profile["mean_abs"],
             "row_p50_vs_cpu_ref": cpu_profile["row_p50"],
