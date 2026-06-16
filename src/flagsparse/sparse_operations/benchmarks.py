@@ -6,7 +6,6 @@ from .gather_scatter import (
     DEFAULT_GATHER_BLOCK_SIZE,
     _PreparedCusparseNativeGather,
     SUPPORTED_SCATTER_VALUE_DTYPES,
-    _cusparse_native_gather_skip_reason,
     _scatter_dtype_error_message,
     _cusparse_spmv,
     _make_scatter_selector_matrix,
@@ -110,7 +109,7 @@ def benchmark_gather_case(
     cusparse_max_error = None
     cusparse_reason = None
     if run_cusparse:
-        skip_reason = _cusparse_native_gather_skip_reason(value_dtype)
+        skip_reason = _cusparse_baseline_skip_reason(value_dtype)
         if skip_reason:
             cusparse_reason = skip_reason
         else:

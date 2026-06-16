@@ -22,6 +22,7 @@ from .alpha_spmm_alg1 import (
 )
 from .gather_scatter import (
     cusparse_native_gather,
+    cusparse_spmv_gather,
     cusparse_spmv_scatter,
     flagsparse_gather,
     flagsparse_scatter,
@@ -138,6 +139,7 @@ __all__ = [
     "comprehensive_scatter_test",
     "comprehensive_spmm_test",
     "comprehensive_spsm_test",
+    "cusparse_spmv_gather",
     "cusparse_spmv_scatter",
     "cusparse_native_gather",
     "flagsparse_gather",
