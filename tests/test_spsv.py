@@ -150,10 +150,43 @@ def _safe_ratio(other_ms, base_ms):
     return other_ms / base_ms
 
 
-def _sum_ms(*values):
-    if any(v is None for v in values):
+def _allinone_filtered_avg_ms(times, fmt="CSR"):
+    if not times:
         return None
-    return sum(values)
+    times = [float(t) for t in times]
+    if len(times) == 1:
+        return times[0]
+    if fmt.upper() == "COO":
+        avg = sum(times) / len(times)
+        kept = [t for t in times if t < 2.0 * avg]
+        return sum(kept) / len(kept) if kept else avg
+    ordered = sorted(times)
+    n = len(ordered)
+    if n % 2 == 0:
+        median = (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0
+    else:
+        median = ordered[n // 2]
+    lo = median * 0.9
+    hi = median * 1.1
+    kept = [t for t in ordered if lo <= t <= hi]
+    return sum(kept) / len(kept) if kept else median
+
+
+def _amortized_total_ms(analysis_ms, solve_ms, iters):
+    if (
+        analysis_ms is None
+        or solve_ms is None
+        or iters is None
+        or int(iters) <= 0
+    ):
+        return None
+    return (float(analysis_ms) / float(iters)) + float(solve_ms)
+
+
+def _sum_ms(analysis_ms, solve_ms, iters=None):
+    if iters is None:
+        iters = ITERS
+    return _amortized_total_ms(analysis_ms, solve_ms, iters)
 
 
 def _spsv_benchmark_schedule(nnz, op_mode, value_dtype, fmt="CSR"):
@@ -241,27 +274,68 @@ def _matrix_market_value(parts, mm_field):
     raise ValueError("MatrixMarket entry is missing a numeric value")
 
 
-def _build_csr_tensor_for_op(data, indices, indptr, shape, op_mode):
+def _effective_csr_for_op(data, indices, indptr, shape, *, lower, op_mode):
+    data_tri, indices_tri, indptr_tri = _extract_triangular_csr(
+        data, indices, indptr, shape, lower=lower
+    )
     if op_mode == "TRANS":
         data_eff, indices_eff, indptr_eff = _csr_transpose(
-            data,
-            indices.to(torch.int64),
-            indptr.to(torch.int64),
+            data_tri,
+            indices_tri,
+            indptr_tri,
             shape,
             conjugate=False,
         )
     elif op_mode == "CONJ":
         data_eff, indices_eff, indptr_eff = _csr_transpose(
-            data,
-            indices.to(torch.int64),
-            indptr.to(torch.int64),
+            data_tri,
+            indices_tri,
+            indptr_tri,
             shape,
             conjugate=True,
         )
     else:
-        data_eff = data
-        indices_eff = indices.to(torch.int64)
-        indptr_eff = indptr.to(torch.int64)
+        data_eff = data_tri
+        indices_eff = indices_tri
+        indptr_eff = indptr_tri
+    return data_eff, indices_eff, indptr_eff
+
+
+def _extract_triangular_csr(data, indices, indptr, shape, *, lower):
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if data.numel() == 0:
+        return (
+            data,
+            torch.empty(0, dtype=torch.int64, device=data.device),
+            torch.zeros(n_rows + 1, dtype=torch.int64, device=data.device),
+        )
+    row = torch.repeat_interleave(
+        torch.arange(n_rows, device=data.device, dtype=torch.int64),
+        indptr.to(torch.int64)[1:] - indptr.to(torch.int64)[:-1],
+    )
+    col = indices.to(torch.int64)
+    keep = col <= row if lower else col >= row
+    row = row[keep]
+    col = col[keep]
+    data_eff = data[keep]
+    key = row * max(1, n_cols) + col
+    try:
+        order = torch.argsort(key, stable=True)
+    except TypeError:
+        order = torch.argsort(key)
+    row = row[order]
+    col = col[order]
+    data_eff = data_eff[order]
+    nnz_per_row = torch.bincount(row, minlength=n_rows)
+    indptr_eff = torch.zeros(n_rows + 1, dtype=torch.int64, device=data.device)
+    indptr_eff[1:] = torch.cumsum(nnz_per_row, dim=0)
+    return data_eff.contiguous(), col.contiguous(), indptr_eff
+
+
+def _build_csr_tensor_for_op(data, indices, indptr, shape, op_mode, *, lower):
+    data_eff, indices_eff, indptr_eff = _effective_csr_for_op(
+        data, indices, indptr, shape, lower=lower, op_mode=op_mode
+    )
     return torch.sparse_csr_tensor(
         indptr_eff,
         indices_eff,
@@ -276,7 +350,9 @@ def _benchmark_pytorch_reference(data, indices, indptr, shape, b, *, lower, op_m
         sparse_spsolve = getattr(torch.sparse, "spsolve", None)
         if sparse_spsolve is None:
             raise NotImplementedError("torch.sparse.spsolve is unavailable")
-        A_csr = _build_csr_tensor_for_op(data, indices, indptr, shape, op_mode)
+        A_csr = _build_csr_tensor_for_op(
+            data, indices, indptr, shape, op_mode, lower=lower
+        )
         if not A_csr.is_cuda:
             raise RuntimeError("torch.sparse.spsolve CUDA path is unavailable")
         torch.cuda.synchronize()
@@ -532,36 +608,41 @@ def _random_rhs_for_spsv(shape, value_dtype, device, op_mode="NON", seed=None):
     return rhs.to(device)
 
 
-def _apply_csr_op(data, indices, indptr, x, shape, op_mode):
+def _apply_csr_op(data, indices, indptr, x, shape, op_mode, *, lower):
     n_rows, n_cols = int(shape[0]), int(shape[1])
+    data_eff, indices_eff, indptr_eff = _effective_csr_for_op(
+        data, indices, indptr, shape, lower=lower, op_mode=op_mode
+    )
     row = torch.repeat_interleave(
         torch.arange(n_rows, device=data.device, dtype=torch.int64),
-        indptr.to(torch.int64)[1:] - indptr.to(torch.int64)[:-1],
+        indptr_eff[1:] - indptr_eff[:-1],
     )
-    col = indices.to(torch.int64)
+    col = indices_eff.to(torch.int64)
     if op_mode == "NON":
         b = torch.zeros(n_rows, dtype=data.dtype, device=data.device)
-        b.scatter_add_(0, row, data * x[col])
+        b.scatter_add_(0, row, data_eff * x[col])
         return b
     if op_mode == "TRANS":
         b = torch.zeros(n_cols, dtype=data.dtype, device=data.device)
-        b.scatter_add_(0, col, data * x[row])
+        b.scatter_add_(0, row, data_eff * x[col])
         return b
     if op_mode == "CONJ":
         b = torch.zeros(n_cols, dtype=data.dtype, device=data.device)
-        data_eff = data.conj() if torch.is_complex(data) else data
-        b.scatter_add_(0, col, data_eff * x[row])
+        b.scatter_add_(0, row, data_eff * x[col])
         return b
     raise ValueError("op_mode must be 'NON', 'TRANS', or 'CONJ'")
 
 
-def _solution_residual_metrics(data, indices, indptr, shape, x, b, value_dtype, op_mode):
-    b_recon = _apply_csr_op(data, indices, indptr, x, shape, op_mode)
-    return (
+def _solution_residual_metrics(data, indices, indptr, shape, x, b, value_dtype, op_mode, *, lower):
+    atol, rtol = _tol_for_dtype(value_dtype)
+    b_recon = _apply_csr_op(data, indices, indptr, x, shape, op_mode, lower=lower)
+    err_res = (
         float(torch.max(torch.abs(b_recon - b)).item())
         if b.numel() > 0
         else 0.0
     )
+    ok_res = torch.allclose(b_recon, b, atol=atol, rtol=rtol)
+    return err_res, ok_res
 
 
 def _benchmark_flagsparse(call, *, warmup=WARMUP, iters=ITERS):
@@ -569,14 +650,16 @@ def _benchmark_flagsparse(call, *, warmup=WARMUP, iters=ITERS):
     for _ in range(warmup):
         x = call()
     torch.cuda.synchronize()
-    e0 = torch.cuda.Event(True)
-    e1 = torch.cuda.Event(True)
-    e0.record()
+    times = []
     for _ in range(iters):
+        e0 = torch.cuda.Event(True)
+        e1 = torch.cuda.Event(True)
+        e0.record()
         x = call()
-    e1.record()
-    torch.cuda.synchronize()
-    return x, e0.elapsed_time(e1) / iters
+        e1.record()
+        torch.cuda.synchronize()
+        times.append(e0.elapsed_time(e1))
+    return x, _allinone_filtered_avg_ms(times)
 
 
 def _analyze_flagsparse_spsv_csr_reuse(
@@ -627,6 +710,35 @@ def _benchmark_flagsparse_spsv_csr_reuse(
     )
 
 
+def _benchmark_flagsparse_spsv_csr(
+    data,
+    indices,
+    indptr,
+    b,
+    shape,
+    *,
+    lower=True,
+    transpose=False,
+    solve_kind=None,
+    warmup=WARMUP,
+    iters=ITERS,
+):
+    return _benchmark_flagsparse(
+        lambda: fs.flagsparse_spsv_csr(
+            data,
+            indices,
+            indptr,
+            b,
+            shape,
+            lower=lower,
+            transpose=transpose,
+            solve_kind=solve_kind,
+        ),
+        warmup=warmup,
+        iters=iters,
+    )
+
+
 def _benchmark_flagsparse_spsv_csr_split(
     data,
     indices,
@@ -639,16 +751,45 @@ def _benchmark_flagsparse_spsv_csr_split(
     solve_kind=None,
 ):
     op_mode = fs_spsv_impl._normalize_spsv_transpose_mode(transpose)
+    data_tri, indices_tri, indptr_tri = _extract_triangular_csr(
+        data, indices, indptr, shape, lower=lower
+    )
     warmup, iters = _spsv_benchmark_schedule(
-        int(data.numel()),
+        int(data_tri.numel()),
         "NON" if op_mode == "N" else ("TRANS" if op_mode == "T" else "CONJ"),
         data.dtype,
         fmt="CSR",
     )
+    if op_mode != "N":
+        analysis_ms = fs_spsv_impl._analyze_spsv_csr(
+            data_tri,
+            indices_tri,
+            indptr_tri,
+            b,
+            shape,
+            lower=lower,
+            transpose=transpose,
+            solve_kind=solve_kind,
+            clear_cache=True,
+            return_time=True,
+        )
+        x, solve_ms = _benchmark_flagsparse_spsv_csr(
+            data_tri,
+            indices_tri,
+            indptr_tri,
+            b,
+            shape,
+            lower=lower,
+            transpose=transpose,
+            solve_kind=solve_kind,
+            warmup=warmup,
+            iters=iters,
+        )
+        return x, analysis_ms, solve_ms
     descr, workspace, analysis_ms = _analyze_flagsparse_spsv_csr_reuse(
-        data,
-        indices,
-        indptr,
+        data_tri,
+        indices_tri,
+        indptr_tri,
         shape,
         lower=lower,
         transpose=transpose,
@@ -686,16 +827,45 @@ def _benchmark_flagsparse_spsv_coo_split(
     data_csr, indices_csr, indptr_csr = fs_spsv_impl._coo2csr_for_spsv(
         data, row64, col64, n_rows, assume_ordered=False
     )
+    data_tri, indices_tri, indptr_tri = _extract_triangular_csr(
+        data_csr, indices_csr, indptr_csr, (n_rows, n_cols), lower=lower
+    )
     warmup, iters = _spsv_benchmark_schedule(
-        int(data_csr.numel()),
+        int(data_tri.numel()),
         "NON" if trans_mode == "N" else ("TRANS" if trans_mode == "T" else "CONJ"),
         data.dtype,
         fmt="COO",
     )
+    if trans_mode != "N":
+        analysis_ms = fs_spsv_impl._analyze_spsv_csr(
+            data_tri,
+            indices_tri,
+            indptr_tri,
+            b,
+            (n_rows, n_cols),
+            lower=lower,
+            transpose=transpose,
+            solve_kind=solve_kind,
+            clear_cache=True,
+            return_time=True,
+        )
+        x, solve_ms = _benchmark_flagsparse_spsv_csr(
+            data_tri,
+            indices_tri,
+            indptr_tri,
+            b,
+            (n_rows, n_cols),
+            lower=lower,
+            transpose=transpose,
+            solve_kind=solve_kind,
+            warmup=warmup,
+            iters=iters,
+        )
+        return x, analysis_ms, solve_ms
     descr, workspace, analysis_ms = _analyze_flagsparse_spsv_csr_reuse(
-        data_csr,
-        indices_csr,
-        indptr_csr,
+        data_tri,
+        indices_tri,
+        indptr_tri,
         (n_rows, n_cols),
         lower=lower,
         transpose=transpose,
@@ -1101,7 +1271,7 @@ def _finalize_csv_row(
 ):
     atol, rtol = _tol_for_dtype(value_dtype)
     err_res = _solution_residual_metrics(
-        data, indices, indptr, shape, x, b, value_dtype, op_mode
+        data, indices, indptr, shape, x, b, value_dtype, op_mode, lower=lower
     )
     pytorch_ms = None
     err_pt = None
@@ -1248,7 +1418,7 @@ def _finalize_csv_row_csr_full(
 ):
     atol, rtol = _tol_for_dtype(value_dtype)
     err_res = _solution_residual_metrics(
-        data, indices, indptr, shape, x, b, value_dtype, op_mode
+        data, indices, indptr, shape, x, b, value_dtype, op_mode, lower=lower
     )
 
     pytorch_ms = None
@@ -1702,9 +1872,11 @@ def _check_one_csr_transpose_case(path, value_dtype, index_dtype, op_mode, devic
             _dtype_name(index_dtype),
         ),
     )
-    action_ref = _apply_csr_op(data, indices, indptr, probe, shape, op_mode)
+    action_ref = _apply_csr_op(
+        data, indices, indptr, probe, shape, op_mode, lower=lower
+    )
     action_trans = _apply_csr_op(
-        trans_data, trans_indices, trans_indptr, probe, trans_shape, "NON"
+        trans_data, trans_indices, trans_indptr, probe, trans_shape, "NON", lower=not lower
     )
     action_err = (
         float(torch.max(torch.abs(action_trans - action_ref)).item())

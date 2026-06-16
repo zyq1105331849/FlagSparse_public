@@ -103,11 +103,19 @@ def _safe_ratio(other_ms, triton_ms):
     return other_ms / triton_ms
 
 
-def _sum_ms(*values):
-    values = [v for v in values if v is not None]
-    if not values:
+def _amortized_total_ms(analysis_ms, solve_ms, iters):
+    if (
+        analysis_ms is None
+        or solve_ms is None
+        or iters is None
+        or int(iters) <= 0
+    ):
         return None
-    return sum(values)
+    return (float(analysis_ms) / float(iters)) + float(solve_ms)
+
+
+def _speedup_total_ratio(other_ms, analysis_ms, solve_ms, iters):
+    return _safe_ratio(other_ms, _amortized_total_ms(analysis_ms, solve_ms, iters))
 
 
 def _spsm_benchmark_schedule(nnz, n_rhs, value_dtype, fmt="csr"):
@@ -213,15 +221,40 @@ def _csr_to_coo(indices, indptr, n_rows):
     return row, indices.to(torch.int64)
 
 
+def _extract_effective_lower_csr(data, indices, indptr, shape):
+    n_rows = int(shape[0])
+    row, col = _csr_to_coo(indices, indptr, n_rows)
+    tri_mask = col <= row
+    data_tri = data[tri_mask]
+    row_tri = row[tri_mask]
+    col_tri = col[tri_mask]
+    if row_tri.numel() == 0:
+        empty_indptr = torch.zeros(n_rows + 1, dtype=torch.int64, device=indptr.device)
+        empty_indices = torch.empty((0,), dtype=torch.int64, device=indices.device)
+        empty_data = data.new_empty((0,))
+        return empty_data, empty_indices, empty_indptr
+    order = torch.argsort(row_tri * n_rows + col_tri)
+    row_tri = row_tri[order]
+    col_tri = col_tri[order]
+    data_tri = data_tri[order]
+    counts = torch.bincount(row_tri, minlength=n_rows)
+    indptr_tri = torch.zeros(n_rows + 1, dtype=torch.int64, device=indptr.device)
+    indptr_tri[1:] = torch.cumsum(counts, dim=0)
+    return data_tri, col_tri.to(torch.int64), indptr_tri
+
+
 def _benchmark_pytorch_reference(data, indices, indptr, shape, B):
     try:
         sparse_spsolve = getattr(torch.sparse, "spsolve", None)
         if sparse_spsolve is None:
             raise NotImplementedError("torch.sparse.spsolve is unavailable")
+        data_eff, indices_eff, indptr_eff = _extract_effective_lower_csr(
+            data, indices, indptr, shape
+        )
         A_csr = torch.sparse_csr_tensor(
-            indptr.to(torch.int64),
-            indices.to(torch.int64),
-            data,
+            indptr_eff,
+            indices_eff,
+            data_eff,
             size=shape,
             device=data.device,
         )
@@ -306,7 +339,10 @@ def _apply_csr_to_dense_rhs(data, indices, indptr, X, shape):
 
 def _solution_residual_metrics(data, indices, indptr, shape, X, B, value_dtype):
     atol, rtol = _tol(value_dtype)
-    B_recon = _apply_csr_to_dense_rhs(data, indices, indptr, X, shape)
+    data_eff, indices_eff, indptr_eff = _extract_effective_lower_csr(
+        data, indices, indptr, shape
+    )
+    B_recon = _apply_csr_to_dense_rhs(data_eff, indices_eff, indptr_eff, X, shape)
     err = float(torch.max(torch.abs(B_recon - B)).item()) if B.numel() else 0.0
     ok = torch.allclose(B_recon, B, atol=atol, rtol=rtol)
     return err, ok
@@ -435,7 +471,10 @@ def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
 
     def _accum(r, c, v):
         row = row_maps[r]
-        row[c] = row.get(c, 0.0) + v
+        if c in row:
+            row[c] += v
+        else:
+            row[c] = v
 
     for line in data_lines[:nnz]:
         parts = line.split()
@@ -459,17 +498,6 @@ def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
         elif mm_symmetry == "skew-symmetric" and r != c:
             _accum(c, r, -v)
 
-    for r in range(n_rows):
-        row = row_maps[r]
-        lower_row = {}
-        off_abs_sum = 0.0
-        for c, v in row.items():
-            if c < r:
-                lower_row[c] = lower_row.get(c, 0.0) + v
-                off_abs_sum += abs(v)
-        lower_row[r] = off_abs_sum + 2.0
-        row_maps[r] = lower_row
-
     cols_s = []
     vals_s = []
     indptr_list = [0]
@@ -489,22 +517,25 @@ def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
 def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n_rhs, fmt):
     n_rows = int(shape[0])
     B = torch.randn((n_rows, n_rhs), dtype=value_dtype, device=data.device).contiguous()
-    row, col = _csr_to_coo(indices, indptr, n_rows)
+    data_eff, indices_eff, indptr_eff = _extract_effective_lower_csr(
+        data, indices, indptr, shape
+    )
+    row, col = _csr_to_coo(indices_eff, indptr_eff, n_rows)
     warmup, iters = _spsm_benchmark_schedule(
-        data.numel(), n_rhs, value_dtype, fmt=fmt
+        data_eff.numel(), n_rhs, value_dtype, fmt=fmt
     )
 
     if fmt == "csr":
         X_fs, analysis_ms, solve_ms = _benchmark_flagsparse_spsm_csr_split(
-            data,
-            indices.to(index_dtype),
-            indptr.to(index_dtype),
+            data_eff,
+            indices_eff.to(index_dtype),
+            indptr_eff.to(index_dtype),
             B,
             shape,
         )
     else:
         X_fs, analysis_ms, solve_ms = _benchmark_flagsparse_spsm_coo_split(
-            data,
+            data_eff,
             row.to(index_dtype),
             col.to(index_dtype),
             B,
@@ -515,10 +546,10 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
         hipsparse_ms,
         hipsparse_reason,
     ) = _benchmark_sparse_reference(
-        data,
+        data_eff,
         row.to(index_dtype),
         col.to(index_dtype),
-        indptr.to(index_dtype),
+        indptr_eff.to(index_dtype),
         B,
         shape,
         fmt,
@@ -526,7 +557,7 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
         iters,
     )
     X_pt, pytorch_ms, _pt_backend, pytorch_reason = _benchmark_pytorch_reference(
-        data, indices, indptr, shape, B
+        data_eff, indices_eff, indptr_eff, shape, B
     )
 
     err_hs = None
@@ -546,7 +577,7 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
         ok_pt = rel_pt <= _reference_check_threshold(value_dtype)
 
     err_res, _ = _solution_residual_metrics(
-        data, indices, indptr, shape, X_fs, B, value_dtype
+        data_eff, indices_eff, indptr_eff, shape, X_fs, B, value_dtype
     )
     ref_errors = [v for v in (err_pt, err_hs) if v is not None]
     err_ref = min(ref_errors) if ref_errors else None
@@ -564,19 +595,21 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
         "format": fmt,
         "n_rows": n_rows,
         "n_cols": int(shape[1]),
-        "nnz": int(data.numel()),
+        "nnz": int(data_eff.numel()),
         "n_rhs": int(n_rhs),
         "analysis_ms": analysis_ms,
         "solve_ms": solve_ms,
-        "triton_total_ms": _sum_ms(analysis_ms, solve_ms),
+        "triton_total_ms": _amortized_total_ms(analysis_ms, solve_ms, iters),
         "hipsparse_ms": hipsparse_ms,
         "pytorch_ms": pytorch_ms,
         "hipsparse_speedup_solve": _safe_ratio(hipsparse_ms, solve_ms),
         "pytorch_speedup_solve": _safe_ratio(pytorch_ms, solve_ms),
-        "hipsparse_speedup_total": _safe_ratio(
-            hipsparse_ms, _sum_ms(analysis_ms, solve_ms)
+        "hipsparse_speedup_total": _speedup_total_ratio(
+            hipsparse_ms, analysis_ms, solve_ms, iters
         ),
-        "pytorch_speedup_total": _safe_ratio(pytorch_ms, _sum_ms(analysis_ms, solve_ms)),
+        "pytorch_speedup_total": _speedup_total_ratio(
+            pytorch_ms, analysis_ms, solve_ms, iters
+        ),
         "pt_status": "PASS" if ok_pt else ("FAIL" if X_pt is not None else "N/A"),
         "hs_status": "PASS" if ok_hs else ("FAIL" if X_hs is not None else "N/A"),
         "status": status,

@@ -3,6 +3,7 @@
 from ._common import *
 
 from .gather_scatter import (
+    DEFAULT_GATHER_BLOCK_SIZE,
     SUPPORTED_SCATTER_VALUE_DTYPES,
     _scatter_dtype_error_message,
     _pytorch_scatter_impl,
@@ -83,7 +84,7 @@ def benchmark_gather_case(
     index_dtype=torch.int32,
     warmup=20,
     iters=200,
-    block_size=1024,
+    block_size=DEFAULT_GATHER_BLOCK_SIZE,
     run_cusparse=True,
 ):
     """Benchmark Triton vs PyTorch indexing vs the active sparse reference backend."""
