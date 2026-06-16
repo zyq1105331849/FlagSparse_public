@@ -285,6 +285,12 @@ def _validate_gather_value_dtype(dense_vector, op_name):
     return None
 
 
+def _cusparse_native_gather_skip_reason(value_dtype):
+    if value_dtype == torch.bfloat16:
+        return "bfloat16 is not supported by the native cuSPARSE gather path; skipped"
+    return None
+
+
 _CUSPARSE_STATUS_SUCCESS = 0
 _CUSPARSE_INDEX_BASE_ZERO = 0
 _CUSPARSE_INDEX_32I = 2
@@ -408,7 +414,7 @@ class _PreparedCusparseNativeGather:
     def __init__(self, dense_vector, indices, out=None):
         dense_vector, indices, _ = _prepare_inputs(dense_vector, indices)
         _validate_gather_value_dtype(dense_vector, "cusparse_native_gather")
-        skip_reason = _cusparse_baseline_skip_reason(dense_vector.dtype)
+        skip_reason = _cusparse_native_gather_skip_reason(dense_vector.dtype)
         if skip_reason:
             raise RuntimeError(skip_reason)
 
@@ -555,25 +561,6 @@ def _cusparse_spmv(selector_matrix, dense_vector):
     raise TypeError(
         "selector_matrix must be a cupyx sparse matrix or torch sparse tensor"
     )
-
-
-def _make_gather_selector_matrix(indices, dense_size, value_dtype):
-    if cp is not None and cpx_sparse is not None:
-        rows_cp = cp.arange(indices.numel(), dtype=cp.int64)
-        cols_cp = _cupy_from_torch(indices.to(torch.int64))
-        vals_cp = cp.ones(indices.numel(), dtype=_cupy_dtype_from_torch(value_dtype))
-        return cpx_sparse.coo_matrix(
-            (vals_cp, (rows_cp, cols_cp)),
-            shape=(indices.numel(), dense_size),
-        )
-
-    rows = torch.arange(indices.numel(), dtype=torch.int64, device=indices.device)
-    cols = indices.to(torch.int64)
-    coords = torch.stack([rows, cols], dim=0)
-    values = torch.ones(indices.numel(), dtype=value_dtype, device=indices.device)
-    return torch.sparse_coo_tensor(
-        coords, values, size=(indices.numel(), dense_size), device=indices.device
-    ).coalesce()
 
 
 def _make_scatter_selector_matrix(indices, dense_size, value_dtype):
@@ -776,33 +763,6 @@ def pytorch_index_scatter(
     torch.cuda.synchronize()
     execution_time_ms = (time.perf_counter() - start_time) * 1000.0
     return dense_values, execution_time_ms
-
-
-def cusparse_spmv_gather(dense_vector, indices, selector_matrix=None):
-    """Equivalent gather baseline via cuSPARSE-backed COO SpMV."""
-    dense_vector, indices, _ = _prepare_inputs(dense_vector, indices)
-    _validate_gather_value_dtype(dense_vector, "cusparse_spmv_gather")
-    skip_reason = _cusparse_baseline_skip_reason(dense_vector.dtype)
-    if skip_reason:
-        raise RuntimeError(skip_reason)
-
-    if selector_matrix is None:
-        selector_matrix = _make_gather_selector_matrix(
-            indices, dense_vector.numel(), dense_vector.dtype
-        )
-
-    try:
-        torch.cuda.synchronize()
-        start_time = time.perf_counter()
-        sparse_values = _cusparse_spmv(selector_matrix, dense_vector)
-        torch.cuda.synchronize()
-        execution_time_ms = (time.perf_counter() - start_time) * 1000.0
-    except Exception as exc:
-        raise RuntimeError(
-            "cuSPARSE gather baseline is unavailable in this PyTorch/CUDA environment"
-        ) from exc
-
-    return sparse_values, execution_time_ms, selector_matrix
 
 
 def cusparse_native_gather(dense_vector, indices, out=None):
