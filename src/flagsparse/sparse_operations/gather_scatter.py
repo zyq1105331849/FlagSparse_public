@@ -421,6 +421,7 @@ def _prepare_hipsparse_gather(dense_vector, indices, out=None):
     handle = None
     spvec = None
     dnvec = None
+    success = False
     try:
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
         ptr_type = type(handle)
@@ -442,6 +443,7 @@ def _prepare_hipsparse_gather(dense_vector, indices, out=None):
             dense_vector,
             value_type,
         )
+        success = True
         return {
             "backend": "hipsparse",
             "handle": handle,
@@ -450,16 +452,22 @@ def _prepare_hipsparse_gather(dense_vector, indices, out=None):
             "values": sparse_values,
         }
     finally:
-        if handle is None and dnvec is not None:
-            try:
-                _hip_check_result(hipsparse.hipsparseDestroyDnVec(dnvec), "hipsparseDestroyDnVec")
-            except Exception:
-                pass
-        if handle is None and spvec is not None:
-            try:
-                _hip_check_result(hipsparse.hipsparseDestroySpVec(spvec), "hipsparseDestroySpVec")
-            except Exception:
-                pass
+        if not success:
+            if dnvec is not None:
+                try:
+                    _hip_check_result(hipsparse.hipsparseDestroyDnVec(dnvec), "hipsparseDestroyDnVec")
+                except Exception:
+                    pass
+            if spvec is not None:
+                try:
+                    _hip_check_result(hipsparse.hipsparseDestroySpVec(spvec), "hipsparseDestroySpVec")
+                except Exception:
+                    pass
+            if handle is not None:
+                try:
+                    _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+                except Exception:
+                    pass
  
 
 def _run_hipsparse_gather_prepared(state):
@@ -558,6 +566,7 @@ def _prepare_hipsparse_scatter(
     handle = None
     spvec = None
     dnvec = None
+    success = False
     try:
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
         ptr_type = type(handle)
@@ -579,6 +588,7 @@ def _prepare_hipsparse_scatter(
             dense_values,
             value_type,
         )
+        success = True
         return {
             "backend": "hipsparse",
             "handle": handle,
@@ -587,16 +597,22 @@ def _prepare_hipsparse_scatter(
             "values": dense_values,
         }
     finally:
-        if handle is None and dnvec is not None:
-            try:
-                _hip_check_result(hipsparse.hipsparseDestroyDnVec(dnvec), "hipsparseDestroyDnVec")
-            except Exception:
-                pass
-        if handle is None and spvec is not None:
-            try:
-                _hip_check_result(hipsparse.hipsparseDestroySpVec(spvec), "hipsparseDestroySpVec")
-            except Exception:
-                pass
+        if not success:
+            if dnvec is not None:
+                try:
+                    _hip_check_result(hipsparse.hipsparseDestroyDnVec(dnvec), "hipsparseDestroyDnVec")
+                except Exception:
+                    pass
+            if spvec is not None:
+                try:
+                    _hip_check_result(hipsparse.hipsparseDestroySpVec(spvec), "hipsparseDestroySpVec")
+                except Exception:
+                    pass
+            if handle is not None:
+                try:
+                    _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+                except Exception:
+                    pass
  
 
 def _run_hipsparse_scatter_prepared(state):
@@ -944,5 +960,3 @@ def cusparse_spmv_scatter(
         iters=200,
     )
     return dense_values, execution_time_ms, None
-
-

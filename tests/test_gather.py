@@ -2,7 +2,6 @@ import argparse
 import csv
 import math
 import os
-import time
 
 import torch
 
@@ -106,25 +105,6 @@ def _write_csv(path, rows, fieldnames):
             writer.writerow({k: ("" if v is None else v) for k, v in row.items()})
 
 
-def _sync_all():
-    torch.cuda.synchronize()
-
-
-def _bench_cuda_op(op, warmup, iters):
-    warmup = max(0, int(warmup))
-    iters = max(1, int(iters))
-    output = None
-    for _ in range(warmup):
-        output = op()
-    _sync_all()
-    start = time.perf_counter()
-    for _ in range(iters):
-        output = op()
-    _sync_all()
-    elapsed_ms = (time.perf_counter() - start) * 1000.0 / iters
-    return output, elapsed_ms
-
-
 def _to_real_imag(value):
     if hasattr(value, "is_complex") and value.is_complex():
         return float(value.real.item()), float(value.imag.item())
@@ -159,173 +139,32 @@ def _collect_samples(case_id, expected, flagsparse_out, limit):
     return rows
 
 
-def _dtype_mode(value_dtype_req):
-    return "gather_triton"
-
-
-def _select_mode(value_dtype_req, index_dtype):
-    return _dtype_mode(value_dtype_req)
-
-
-def _build_dense(value_dtype_req, dense_size, device):
-    if value_dtype_req == "float16":
-        return torch.randn(dense_size, dtype=torch.float16, device=device)
-    if value_dtype_req == "bfloat16":
-        return torch.randn(dense_size, dtype=torch.bfloat16, device=device)
-    if value_dtype_req == "float32":
-        return torch.randn(dense_size, dtype=torch.float32, device=device)
-    if value_dtype_req == "float64":
-        return torch.randn(dense_size, dtype=torch.float64, device=device)
-    if value_dtype_req == "complex64":
-        real = torch.randn(dense_size, dtype=torch.float32, device=device)
-        imag = torch.randn(dense_size, dtype=torch.float32, device=device)
-        return torch.complex(real, imag)
-    if value_dtype_req == "complex128":
-        real = torch.randn(dense_size, dtype=torch.float64, device=device)
-        imag = torch.randn(dense_size, dtype=torch.float64, device=device)
-        return torch.complex(real, imag)
-    if value_dtype_req == "complex32":
-        return torch.randn(dense_size, 2, dtype=torch.float16, device=device)
-    raise ValueError(f"Unsupported value dtype request: {value_dtype_req}")
-
-
-def _effective_dtype_name(value_dtype_req):
-    mapping = {
-        "float16": "float16",
-        "bfloat16": "bfloat16",
-        "float32": "float32",
-        "float64": "float64",
-        "complex64": "complex64",
-        "complex128": "complex128",
-        "complex32": "complex16_pair_f16",
-    }
-    return mapping[value_dtype_req]
-
-
-def _tolerance(value_dtype_req):
-    if value_dtype_req in ("float16", "complex32"):
-        return 5e-3, 5e-3
-    if value_dtype_req in ("bfloat16",):
-        return 1e-2, 1e-2
-    if value_dtype_req in ("float32", "complex64"):
-        return 1e-6, 1e-5
-    if value_dtype_req in ("float64", "complex128"):
-        return 1e-10, 1e-8
-    return 1e-6, 1e-5
-
-
 def _check_dtype_supported(value_dtype_req):
     if value_dtype_req in ("bfloat16",) and not torch.cuda.is_bf16_supported():
         raise RuntimeError("bfloat16 not supported on this GPU")
 
 
-def _is_supported_extra_gather_combo(value_dtype_req, index_dtype):
-    # Required extra gather combos only:
-    # Half+Int32/Int64, Bfloat16+Int32/Int64, Complex32+Int32/Int64, Complex64+Int32/Int64
-    if value_dtype_req == "float16":
-        return index_dtype in (torch.int32, torch.int64)
-    if value_dtype_req in ("bfloat16", "complex32", "complex64"):
-        return index_dtype in (torch.int32, torch.int64)
-    # Original gather path dtypes keep original behavior.
-    return True
-
-
-def _build_indices(dense_size, nnz, index_dtype, device):
-    return torch.randint(0, dense_size, (nnz,), dtype=index_dtype, device=device)
-
-
-def _benchmark_gather_case(
-    value_dtype_req,
-    index_dtype,
-    dense_size,
-    nnz,
-    warmup,
-    iters,
-    run_cusparse,
-):
-    device = torch.device("cuda")
-    _check_dtype_supported(value_dtype_req)
-    dense_vector = _build_dense(value_dtype_req, dense_size, device)
-    indices = _build_indices(dense_size, nnz, index_dtype, device)
-    expected = dense_vector.index_select(0, indices.to(torch.int64))
-
-    mode = _select_mode(value_dtype_req, index_dtype)
-    flagsparse_op = lambda: ast.flagsparse_gather(dense_vector, indices)
-
-    pytorch_op = lambda: dense_vector.index_select(0, indices.to(torch.int64))
-    pytorch_values, pytorch_ms = _bench_cuda_op(pytorch_op, warmup=warmup, iters=iters)
-    flagsparse_values, flagsparse_ms = _bench_cuda_op(flagsparse_op, warmup=warmup, iters=iters)
-
-    atol, rtol = _tolerance(value_dtype_req)
-    fs_match = torch.allclose(flagsparse_values, expected, atol=atol, rtol=rtol)
-    fs_max_error = (
-        float(torch.max(torch.abs(flagsparse_values - expected)).item())
-        if expected.numel() > 0
-        else 0.0
-    )
-
-    cusparse_values = None
-    cusparse_ms = None
-    cusparse_match = None
-    cusparse_max_error = None
-    cusparse_reason = None
-    if run_cusparse:
-        try:
-            cusparse_values, cusparse_ms = ast.benchmark_hipsparse_gather(
-                dense_vector, indices, warmup=warmup, iters=iters
-            )
-            cusparse_match = torch.allclose(cusparse_values, expected, atol=atol, rtol=rtol)
-            cusparse_max_error = (
-                float(torch.max(torch.abs(cusparse_values - expected)).item())
-                if expected.numel() > 0
-                else 0.0
-            )
-        except Exception as exc:
-            cusparse_reason = str(exc)
-
-    fs_vs_pt = pytorch_ms / flagsparse_ms if flagsparse_ms > 0 else float("inf")
-    fs_vs_cs = (
-        cusparse_ms / flagsparse_ms
-        if (cusparse_ms is not None and flagsparse_ms > 0)
-        else None
-    )
-
-    return {
-        "parameters": {
-            "dense_size": dense_size,
-            "nnz": int(indices.numel()),
-            "value_dtype": value_dtype_req,
-            "effective_value_dtype": _effective_dtype_name(value_dtype_req),
-            "index_dtype": str(index_dtype),
-            "mode": mode,
-        },
-        "performance": {
-            "pytorch_ms": pytorch_ms,
-            "triton_ms": flagsparse_ms,
-            "cusparse_ms": cusparse_ms,
-            "triton_speedup_vs_pytorch": fs_vs_pt,
-            "triton_speedup_vs_cusparse": fs_vs_cs,
-        },
-        "verification": {
-            "triton_match_pytorch": fs_match,
-            "triton_max_error": fs_max_error,
-            "cusparse_match_pytorch": cusparse_match,
-            "cusparse_max_error": cusparse_max_error,
-        },
-        "backend_status": {
-            "cusparse_unavailable_reason": cusparse_reason,
-        },
-        "samples": {
-            "pytorch": pytorch_values,
-            "triton": flagsparse_values,
-        },
+def _resolve_value_dtype(value_dtype_req):
+    mapping = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+        "float64": torch.float64,
+        "complex64": torch.complex64,
+        "complex128": torch.complex128,
     }
+    return mapping[value_dtype_req]
+
+
+def _is_supported_gather_combo(index_dtype):
+    # Required gather coverage is the full 6 value dtypes x 2 index dtypes matrix.
+    return index_dtype in (torch.int32, torch.int64)
 
 
 def _status_from_result(verification):
     triton_ok = verification.get("triton_match_pytorch")
-    cusparse_ok = verification.get("cusparse_match_pytorch")
-    overall_ok = bool(triton_ok) and (cusparse_ok is None or bool(cusparse_ok))
+    hipsparse_ok = verification.get("hipsparse_match_pytorch")
+    overall_ok = bool(triton_ok) and (hipsparse_ok is None or bool(hipsparse_ok))
     return "PASS" if overall_ok else "FAIL"
 
 
@@ -343,9 +182,9 @@ def _print_row(row):
     print(
         f"{row['value_dtype_req']:>14} {row['value_dtype_compute']:>18} {row['index_dtype']:>6} "
         f"{row['dense_size']:>10,d} {row['nnz']:>10,d} "
-        f"{_fmt_ms(row['pytorch_ms']):>10} {_fmt_ms(row['triton_ms']):>10} {_fmt_ms(row['cusparse_ms']):>10} "
-        f"{_fmt_speedup(row['triton_speedup_vs_pytorch']):>8} {_fmt_speedup(row['triton_speedup_vs_cusparse']):>8} "
-        f"{row['status']:>6} {_fmt_err(row['triton_max_error']):>12} {_fmt_err(row['cusparse_max_error']):>12}"
+        f"{_fmt_ms(row['pytorch_ms']):>10} {_fmt_ms(row['triton_ms']):>10} {_fmt_ms(row['hipsparse_ms']):>10} "
+        f"{_fmt_speedup(row['triton_speedup_vs_pytorch']):>8} {_fmt_speedup(row['triton_speedup_vs_hipsparse']):>8} "
+        f"{row['status']:>6} {_fmt_err(row['triton_max_error']):>12} {_fmt_err(row['hipsparse_max_error']):>12}"
     )
 
 
@@ -356,7 +195,7 @@ def run_cli(args):
 
     value_dtype_tokens = _parse_value_dtypes(args.value_dtypes)
     index_dtype_pairs = _parse_index_dtypes(args.index_dtypes)
-    run_cusparse = not args.no_cusparse
+    run_hipsparse = not args.no_hipsparse
     work_cases = _parse_cases(args.cases)
 
     print("=" * 180)
@@ -364,7 +203,8 @@ def run_cli(args):
     print("=" * 180)
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(
-        f"Warmup: {args.warmup} | Iterations: {args.iters} | HS(ms): direct hipSPARSE backend steady-state time"
+        f"Warmup: {args.warmup} | Iterations: {args.iters} | "
+        "HS(ms): direct hipSPARSE backend steady-state time"
     )
     print()
     _print_header()
@@ -376,7 +216,7 @@ def run_cli(args):
 
     for value_dtype in value_dtype_tokens:
         for index_name, index_dtype in index_dtype_pairs:
-            if not _is_supported_extra_gather_combo(value_dtype, index_dtype):
+            if not _is_supported_gather_combo(index_dtype):
                 continue
             for dense_size, nnz in work_cases:
                 dense_size = int(dense_size)
@@ -386,14 +226,16 @@ def run_cli(args):
                 )
                 total_cases += 1
                 try:
-                    result = _benchmark_gather_case(
-                        value_dtype_req=value_dtype,
+                    _check_dtype_supported(value_dtype)
+                    value_dtype_t = _resolve_value_dtype(value_dtype)
+                    result = ast.benchmark_gather_case(
                         index_dtype=index_dtype,
                         dense_size=dense_size,
                         nnz=nnz,
+                        value_dtype=value_dtype_t,
                         warmup=args.warmup,
                         iters=args.iters,
-                        run_cusparse=run_cusparse,
+                        run_cusparse=run_hipsparse,
                     )
                     perf = result["performance"]
                     verify = result["verification"]
@@ -405,22 +247,27 @@ def run_cli(args):
                     row = {
                         "case_id": case_id,
                         "gpu": torch.cuda.get_device_name(0),
-                        "value_dtype_req": params.get("value_dtype"),
-                        "value_dtype_compute": str(params.get("effective_value_dtype")),
+                        "value_dtype_req": value_dtype,
+                        "value_dtype_compute": str(params.get("value_dtype")).replace(
+                            "torch.", ""
+                        ),
                         "index_dtype": str(params.get("index_dtype")).replace("torch.", ""),
                         "dense_size": int(params.get("dense_size")),
                         "nnz": int(params.get("nnz")),
-                        "mode": params.get("mode"),
+                        "mode": "gather_triton",
+                        "index_fallback_policy": None,
+                        "index_fallback_applied": False,
                         "triton_ms": perf.get("triton_ms"),
                         "pytorch_ms": perf.get("pytorch_ms"),
-                        "cusparse_ms": perf.get("cusparse_ms"),
+                        "hipsparse_ms": perf.get("hipsparse_ms"),
                         "triton_speedup_vs_pytorch": perf.get("triton_speedup_vs_pytorch"),
-                        "triton_speedup_vs_cusparse": perf.get("triton_speedup_vs_cusparse"),
+                        "triton_speedup_vs_hipsparse": perf.get("triton_speedup_vs_hipsparse"),
                         "triton_match_pytorch": verify.get("triton_match_pytorch"),
-                        "cusparse_match_pytorch": verify.get("cusparse_match_pytorch"),
+                        "hipsparse_match_pytorch": verify.get("hipsparse_match_pytorch"),
                         "triton_max_error": verify.get("triton_max_error"),
-                        "cusparse_max_error": verify.get("cusparse_max_error"),
-                        "cusparse_unavailable_reason": backend.get("cusparse_unavailable_reason"),
+                        "hipsparse_max_error": verify.get("hipsparse_max_error"),
+                        "hipsparse_unavailable_reason": backend.get("hipsparse_unavailable_reason"),
+                        "index_fallback_reason": None,
                         "status": status,
                     }
                     summary_rows.append(row)
@@ -445,17 +292,20 @@ def run_cli(args):
                         "index_dtype": index_name,
                         "dense_size": dense_size,
                         "nnz": nnz,
-                        "mode": _dtype_mode(value_dtype),
+                        "mode": "gather_triton",
+                        "index_fallback_policy": None,
+                        "index_fallback_applied": False,
                         "triton_ms": None,
                         "pytorch_ms": None,
-                        "cusparse_ms": None,
+                        "hipsparse_ms": None,
                         "triton_speedup_vs_pytorch": None,
-                        "triton_speedup_vs_cusparse": None,
+                        "triton_speedup_vs_hipsparse": None,
                         "triton_match_pytorch": None,
-                        "cusparse_match_pytorch": None,
+                        "hipsparse_match_pytorch": None,
                         "triton_max_error": None,
-                        "cusparse_max_error": None,
-                        "cusparse_unavailable_reason": str(exc),
+                        "hipsparse_max_error": None,
+                        "hipsparse_unavailable_reason": str(exc),
+                        "index_fallback_reason": str(exc),
                         "status": "ERROR",
                     }
                     summary_rows.append(row)
@@ -476,16 +326,19 @@ def run_cli(args):
             "dense_size",
             "nnz",
             "mode",
+            "index_fallback_policy",
+            "index_fallback_applied",
             "triton_ms",
             "pytorch_ms",
-            "cusparse_ms",
+            "hipsparse_ms",
             "triton_speedup_vs_pytorch",
-            "triton_speedup_vs_cusparse",
+            "triton_speedup_vs_hipsparse",
             "triton_match_pytorch",
-            "cusparse_match_pytorch",
+            "hipsparse_match_pytorch",
             "triton_max_error",
-            "cusparse_max_error",
-            "cusparse_unavailable_reason",
+            "hipsparse_max_error",
+            "hipsparse_unavailable_reason",
+            "index_fallback_reason",
             "status",
         ]
         _write_csv(args.csv_summary, summary_rows, summary_fields)
@@ -518,8 +371,9 @@ def build_parser():
     )
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
-    parser.add_argument("--no-hipsparse", action="store_true", dest="no_cusparse")
-    parser.add_argument("--no-cusparse", action="store_true", dest="no_cusparse", help=argparse.SUPPRESS)
+    parser.add_argument("--no-hipsparse", action="store_true", dest="no_hipsparse")
+    parser.add_argument("--no-cusparse", action="store_true", dest="no_hipsparse", help=argparse.SUPPRESS)
+    parser.add_argument("--index-fallback-policy", choices=["auto", "strict"], default="auto", help=argparse.SUPPRESS)
     parser.add_argument("--csv-summary", default=None)
     parser.add_argument("--csv-samples", default=None)
     parser.add_argument("--sample-limit", type=int, default=32)

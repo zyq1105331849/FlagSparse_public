@@ -109,31 +109,31 @@ def benchmark_gather_case(
         else 0.0
     )
 
-    cusparse_ms = None
-    cusparse_match = None
-    cusparse_max_error = None
-    cusparse_reason = None
+    hipsparse_ms = None
+    hipsparse_match = None
+    hipsparse_max_error = None
+    hipsparse_reason = None
     sparse_ref_backend = None
     if run_cusparse:
         if _is_rocm_runtime():
             try:
-                cusparse_values, cusparse_ms = benchmark_hipsparse_gather(
+                hipsparse_values, hipsparse_ms = benchmark_hipsparse_gather(
                     dense_vector,
                     indices,
                     warmup=warmup,
                     iters=iters,
                 )
                 sparse_ref_backend = "hipsparse"
-                cusparse_match = torch.allclose(
-                    cusparse_values, expected, atol=atol, rtol=rtol
+                hipsparse_match = torch.allclose(
+                    hipsparse_values, expected, atol=atol, rtol=rtol
                 )
-                cusparse_max_error = (
-                    float(torch.max(torch.abs(cusparse_values - expected)).item())
+                hipsparse_max_error = (
+                    float(torch.max(torch.abs(hipsparse_values - expected)).item())
                     if nnz > 0
                     else 0.0
                 )
             except Exception as exc:
-                cusparse_reason = str(exc)
+                hipsparse_reason = str(exc)
         else:
             selector_data, selector_indices, selector_indptr, selector_shape = (
                 _build_gather_selector_csr(indices, dense_vector.numel(), dense_vector.dtype)
@@ -151,27 +151,27 @@ def benchmark_gather_case(
                 )
                 sparse_ref_backend = sparse_ref["backend"]
                 if sparse_ref_backend is not None:
-                    cusparse_values = sparse_ref["values"]
-                    cusparse_ms = sparse_ref["ms"]
-                    cusparse_match = torch.allclose(
-                        cusparse_values, expected, atol=atol, rtol=rtol
+                    hipsparse_values = sparse_ref["values"]
+                    hipsparse_ms = sparse_ref["ms"]
+                    hipsparse_match = torch.allclose(
+                        hipsparse_values, expected, atol=atol, rtol=rtol
                     )
-                    cusparse_max_error = (
-                        float(torch.max(torch.abs(cusparse_values - expected)).item())
+                    hipsparse_max_error = (
+                        float(torch.max(torch.abs(hipsparse_values - expected)).item())
                         if nnz > 0
                         else 0.0
                     )
                 else:
-                    cusparse_reason = sparse_ref["reason"]
+                    hipsparse_reason = sparse_ref["reason"]
             except Exception as exc:
-                cusparse_reason = str(exc)
+                hipsparse_reason = str(exc)
 
     triton_speedup_vs_pytorch = (
         pytorch_ms / triton_ms if triton_ms > 0 else float("inf")
     )
-    triton_speedup_vs_cusparse = (
-        cusparse_ms / triton_ms
-        if (cusparse_ms is not None and triton_ms > 0)
+    triton_speedup_vs_hipsparse = (
+        hipsparse_ms / triton_ms
+        if (hipsparse_ms is not None and triton_ms > 0)
         else None
     )
 
@@ -187,18 +187,18 @@ def benchmark_gather_case(
         "performance": {
             "pytorch_ms": pytorch_ms,
             "triton_ms": triton_ms,
-            "cusparse_ms": cusparse_ms,
+            "hipsparse_ms": hipsparse_ms,
             "triton_speedup_vs_pytorch": triton_speedup_vs_pytorch,
-            "triton_speedup_vs_cusparse": triton_speedup_vs_cusparse,
+            "triton_speedup_vs_hipsparse": triton_speedup_vs_hipsparse,
         },
         "verification": {
             "triton_match_pytorch": triton_match,
             "triton_max_error": triton_max_error,
-            "cusparse_match_pytorch": cusparse_match,
-            "cusparse_max_error": cusparse_max_error,
+            "hipsparse_match_pytorch": hipsparse_match,
+            "hipsparse_max_error": hipsparse_max_error,
         },
         "backend_status": {
-            "cusparse_unavailable_reason": cusparse_reason,
+            "hipsparse_unavailable_reason": hipsparse_reason,
             "sparse_ref_backend": sparse_ref_backend,
         },
         "samples": {

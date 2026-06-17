@@ -56,6 +56,45 @@ def _hipsparse_csrsm2_functions(value_dtype):
     )
 
 
+def _hipsparse_create_descriptor(attr_names, context, handle=None):
+    ptr_type = type(handle) if handle is not None else None
+    last_error = None
+    for attr_name in attr_names:
+        create_fn = getattr(hipsparse, attr_name, None) if hipsparse is not None else None
+        if create_fn is None:
+            continue
+        try:
+            raw = create_fn()
+            if ptr_type is not None and isinstance(raw, ptr_type):
+                return raw
+            if hasattr(raw, "createRef"):
+                return raw
+            payload = _hip_check_result(raw, context)
+            if payload is not None:
+                return payload
+        except TypeError as exc:
+            last_error = exc
+        except Exception as exc:
+            last_error = exc
+
+        if ptr_type is None:
+            continue
+        descr = ptr_type()
+        attempts = []
+        if hasattr(descr, "createRef"):
+            attempts.append((descr.createRef(),))
+        attempts.append((descr,))
+        for args in attempts:
+            try:
+                payload = _hip_check_result(create_fn(*args), context)
+                return payload if payload is not None else descr
+            except TypeError as exc:
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
+    raise RuntimeError(f"{context} failed: {last_error}") from last_error
+
+
 def _hipsparse_csrsm2_skip_reason(value_dtype, index_dtype, indptr_dtype=None):
     indptr_dtype = index_dtype if indptr_dtype is None else indptr_dtype
     if not _is_rocm_runtime():
@@ -257,11 +296,10 @@ def _prepare_spsm_csr_ref_hipsparse(
 
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
         state["handle"] = handle
-        ptr_type = type(handle)
-        descr = ptr_type()
-        _hip_check_result(
-            hipsparse.hipsparseCreateMatDescr(descr.createRef()),
+        descr = _hipsparse_create_descriptor(
+            ("hipsparseCreateMatDescr",),
             "hipsparseCreateMatDescr",
+            handle=handle,
         )
         state["descr"] = descr
         _hip_check_result(
@@ -306,9 +344,10 @@ def _prepare_spsm_csr_ref_hipsparse(
             ),
             "hipsparseSetMatDiagType",
         )
-        info = _hip_check_result(
-            hipsparse.hipsparseCreateCsrsm2Info(),
+        info = _hipsparse_create_descriptor(
+            ("hipsparseCreateCsrsm2Info",),
             "hipsparseCreateCsrsm2Info",
+            handle=handle,
         )
         state["info"] = info
 

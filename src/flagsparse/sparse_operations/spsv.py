@@ -118,6 +118,45 @@ def _hipsparse_call(attr_names, context):
     raise RuntimeError(f"{context} is unavailable: missing {names}")
 
 
+def _hipsparse_create_descriptor(attr_names, context, handle=None):
+    ptr_type = type(handle) if handle is not None else None
+    last_error = None
+    for attr_name in attr_names:
+        create_fn = getattr(hipsparse, attr_name, None) if hipsparse is not None else None
+        if create_fn is None:
+            continue
+        try:
+            raw = create_fn()
+            if ptr_type is not None and isinstance(raw, ptr_type):
+                return raw
+            if hasattr(raw, "createRef"):
+                return raw
+            payload = _hip_check_result(raw, context)
+            if payload is not None:
+                return payload
+        except TypeError as exc:
+            last_error = exc
+        except Exception as exc:
+            last_error = exc
+
+        if ptr_type is None:
+            continue
+        descr = ptr_type()
+        attempts = []
+        if hasattr(descr, "createRef"):
+            attempts.append((descr.createRef(),))
+        attempts.append((descr,))
+        for args in attempts:
+            try:
+                payload = _hip_check_result(create_fn(*args), context)
+                return payload if payload is not None else descr
+            except TypeError as exc:
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
+    raise RuntimeError(f"{context} failed: {last_error}") from last_error
+
+
 def _hipsparse_enum_storage(enum_value):
     try:
         raw_value = int(enum_value)
@@ -151,51 +190,11 @@ def _hipsparse_set_spmat_attribute(spmat, attr_name, enum_value):
 
 
 def _hipsparse_create_spsv_descr(handle):
-    ptr_type = type(handle)
-    last_error = None
-    status_only_success = False
-    for attr_name in ("hipsparseSpSV_createDescr", "hipsparseCreateSpSVDescr"):
-        create_fn = getattr(hipsparse, attr_name, None) if hipsparse is not None else None
-        if create_fn is None:
-            continue
-        no_arg_succeeded = False
-        try:
-            raw = create_fn()
-            if isinstance(raw, ptr_type) or hasattr(raw, "createRef"):
-                return raw
-            payload = _hip_check_result(raw, "hipsparseSpSV_createDescr")
-            if payload is not None:
-                return payload
-            status_only_success = True
-            no_arg_succeeded = True
-        except TypeError as exc:
-            last_error = exc
-        except Exception as exc:
-            last_error = exc
-
-        if no_arg_succeeded:
-            continue
-
-        descr = ptr_type()
-        attempts = []
-        if hasattr(descr, "createRef"):
-            attempts.append((descr.createRef(),))
-        attempts.append((descr,))
-        for args in attempts:
-            try:
-                _hip_check_result(create_fn(*args), "hipsparseSpSV_createDescr")
-                return descr
-            except TypeError as exc:
-                last_error = exc
-            except Exception as exc:
-                last_error = exc
-
-    if status_only_success and last_error is None:
-        raise RuntimeError(
-            "hipsparseSpSV_createDescr succeeded without returning a descriptor, "
-            "and no compatible output-argument wrapper was found"
-        )
-    raise RuntimeError(f"hipsparseSpSV_createDescr failed: {last_error}") from last_error
+    return _hipsparse_create_descriptor(
+        ("hipsparseSpSV_createDescr", "hipsparseCreateSpSVDescr"),
+        "hipsparseSpSV_createDescr",
+        handle=handle,
+    )
 
 
 def _hipsparse_destroy_spsv_descr(descr):
@@ -737,19 +736,8 @@ def _run_spsv_csr_ref_hipsparse_prepared(state):
         ("hipsparseSpSV_solve",),
         "hipsparseSpSV_solve",
     )
-    attempts = (
-        (
-            state["handle"],
-            state["op_enum"],
-            state["alpha"],
-            state["spmat"],
-            state["rhs_desc"],
-            state["sol_desc"],
-            state["value_type"],
-            state["alg"],
-            state["spsv_descr"],
-        ),
-        (
+    _hip_check_result(
+        solve_fn(
             state["handle"],
             state["op_enum"],
             state["alpha"],
@@ -761,15 +749,9 @@ def _run_spsv_csr_ref_hipsparse_prepared(state):
             state["spsv_descr"],
             state["workspace"],
         ),
+        "hipsparseSpSV_solve",
     )
-    last_error = None
-    for args in attempts:
-        try:
-            _hip_check_result(solve_fn(*args), "hipsparseSpSV_solve")
-            return state["solution"]
-        except Exception as exc:
-            last_error = exc
-    raise RuntimeError(f"hipsparseSpSV_solve failed: {last_error}") from last_error
+    return state["solution"]
 
 
 def _destroy_spsv_csr_ref_hipsparse_prepared(state):
