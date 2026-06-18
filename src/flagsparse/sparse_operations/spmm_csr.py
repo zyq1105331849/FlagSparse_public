@@ -572,6 +572,8 @@ def _normalize_spmm_csr_alg(alg):
         return "spmm_csr_alg1"
     if token in ("alg2", "csr_alg2", "spmm_csr_alg2"):
         return "spmm_csr_alg2"
+    if token in ("alg2_accuracy", "csr_alg2_accuracy", "spmm_csr_alg2_accuracy"):
+        return "spmm_csr_alg2_accuracy"
     if token == "auto":
         return "auto"
     return token
@@ -1807,7 +1809,7 @@ def _spmm_csr_alg2_acc_dtype(dtype):
     return tl.float64 if dtype == torch.float64 else tl.float32
 
 
-def _spmm_csr_alg2_run_bucket(plan, bucket, B, C_out, device_props, kernels):
+def _spmm_csr_alg2_run_bucket(plan, bucket, B, C_out, device_props, kernels, *, accuracy=False):
     launch = _resolve_spmm_csr_alg2_launch(
         bucket,
         int(B.shape[1]),
@@ -1849,6 +1851,7 @@ def _spmm_csr_alg2_run_bucket(plan, bucket, B, C_out, device_props, kernels):
             BLOCK_K=launch["block_k"],
             ACC_DTYPE=acc_dtype,
             OUT_DTYPE=out_dtype,
+            ACCURACY=bool(accuracy),
             **common_kwargs,
         )
     elif bucket["kind"] == "row2d":
@@ -1870,6 +1873,7 @@ def _spmm_csr_alg2_run_bucket(plan, bucket, B, C_out, device_props, kernels):
             BLOCK_K=launch["block_k"],
             ACC_DTYPE=acc_dtype,
             OUT_DTYPE=out_dtype,
+            ACCURACY=bool(accuracy),
             **common_kwargs,
         )
     else:
@@ -1892,6 +1896,7 @@ def _spmm_csr_alg2_run_bucket(plan, bucket, B, C_out, device_props, kernels):
             SEGMENTS=launch["segments"],
             ACC_DTYPE=acc_dtype,
             OUT_DTYPE=out_dtype,
+            ACCURACY=bool(accuracy),
             **common_kwargs,
         )
 
@@ -1900,7 +1905,7 @@ def _spmm_csr_alg2_run_bucket(plan, bucket, B, C_out, device_props, kernels):
     return launch
 
 
-def _spmm_csr_alg2_compute(plan, B):
+def _spmm_csr_alg2_compute(plan, B, *, accuracy=False):
     if B.ndim != 2:
         raise ValueError("B must be a 2D dense tensor")
     if not B.is_cuda:
@@ -1918,7 +1923,7 @@ def _spmm_csr_alg2_compute(plan, B):
     kernels = _spmm_csr_alg2_kernel_bundle()
     plan.launch_configs.clear()
     for bucket in plan.row_buckets:
-        launch = _spmm_csr_alg2_run_bucket(plan, bucket, B, C_out, device_props, kernels)
+        launch = _spmm_csr_alg2_run_bucket(plan, bucket, B, C_out, device_props, kernels, accuracy=accuracy)
         plan.launch_configs.append(launch)
     return C_out
 
@@ -1953,6 +1958,50 @@ def _run_spmm_csr_alg2_route(prepared, B, *, timing=False, diagnostics=False):
             "long_row_count": plan.long_row_count,
             "long_part_count": 0,
             "launch_version": "spmm_csr_alg2_v1",
+            "block_n": first_launch.get("block_n"),
+            "block_nnz": first_launch.get("block_k"),
+            "num_warps": first_launch.get("num_warps"),
+            "num_stages": first_launch.get("num_stages"),
+            "grid_m": first_launch.get("grid_m"),
+            "grid_n": first_launch.get("grid_n"),
+        }
+    return C, meta
+
+
+def _run_spmm_csr_alg2_accuracy_route(prepared, B, *, timing=False, diagnostics=False):
+    if prepared.op != "non":
+        raise SpmmCsrAlgorithmUnavailable("spmm_csr_alg2_accuracy currently supports op=non only")
+    if prepared.data.dtype != torch.float32:
+        raise SpmmCsrAlgorithmUnavailable("spmm_csr_alg2_accuracy currently supports float32 only")
+    B = _validate_spmm_route_runtime_inputs(prepared, B)
+    plan = _spmm_csr_alg2_build_process_plan(prepared, timing=bool(timing))
+    compute_ms = None
+    if timing:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+    C = _spmm_csr_alg2_compute(plan, B, accuracy=True)
+    if timing:
+        end.record()
+        torch.cuda.synchronize()
+        compute_ms = start.elapsed_time(end)
+    meta = {
+        "alg": "spmm_csr_alg2_accuracy",
+        "display_name": "Alg2Accuracy",
+        "op": prepared.op,
+        "process_cpu_ms": plan.process_cpu_ms,
+        "process_gpu_ms": plan.process_gpu_ms if timing else None,
+        "compute_ms": compute_ms,
+    }
+    if diagnostics:
+        first_launch = plan.launch_configs[0] if plan.launch_configs else {}
+        meta["diagnostics"] = {
+            "launch_config_scope": "bucket",
+            "launch_config_count": len(plan.launch_configs),
+            "bucket_count": plan.bucket_count,
+            "long_row_count": plan.long_row_count,
+            "long_part_count": 0,
+            "launch_version": "spmm_csr_alg2_accuracy_v1",
             "block_n": first_launch.get("block_n"),
             "block_nnz": first_launch.get("block_k"),
             "num_warps": first_launch.get("num_warps"),
@@ -1998,6 +2047,13 @@ SPMM_CSR_ALGORITHMS = {
         supported_ops=tuple(SPMM_OP_NAMES.values()),
         supported_dtypes=(torch.float32, torch.float64),
         run=_run_spmm_csr_alg2_route,
+    ),
+    "spmm_csr_alg2_accuracy": SpmmCsrAlgorithm(
+        name="spmm_csr_alg2_accuracy",
+        display_name="Alg2Accuracy",
+        supported_ops=("non",),
+        supported_dtypes=(torch.float32,),
+        run=_run_spmm_csr_alg2_accuracy_route,
     ),
 }
 
@@ -2710,10 +2766,6 @@ def _triton_spmm_csr_impl(
             compute_dtype = torch.float32
             data_in = data.to(torch.float32)
             B_in = _materialize_dense_layout(B.to(torch.float32), dense_layout)
-        elif dtype == torch.float32:
-            compute_dtype = torch.float64
-            data_in = data.to(torch.float64)
-            B_in = _materialize_dense_layout(B.to(torch.float64), dense_layout)
 
         C_compute = (
             out
