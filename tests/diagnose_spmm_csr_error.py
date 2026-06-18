@@ -57,6 +57,7 @@ SUMMARY_FIELDS = [
     "process_cpu_ms",
     "process_gpu_ms",
     "compute_ms",
+    "torch_ms",
     "primary_ref_kind",
     "cpu_ref_kind",
     "cpu_ref_status",
@@ -82,6 +83,20 @@ SUMMARY_FIELDS = [
     "alpha_cusparse_ref_status_vs_cpu_ref",
     "alpha_err_vs_cpu_f64_ref_primary",
     "alpha_status_vs_cpu_f64_ref_primary",
+    "column_alpha_err_vs_cpu_f64_ref_primary",
+    "column_alpha_status_vs_cpu_f64_ref_primary",
+    "column_alpha_p50_vs_cpu_f64_ref_primary",
+    "column_alpha_p90_vs_cpu_f64_ref_primary",
+    "column_alpha_p99_vs_cpu_f64_ref_primary",
+    "column_alpha_fail_cols_vs_cpu_f64_ref_primary",
+    "column_alpha_err_vs_torch_native_ref",
+    "column_alpha_status_vs_torch_native_ref",
+    "column_alpha_err_vs_cusparse_ref",
+    "column_alpha_status_vs_cusparse_ref",
+    "column_alpha_torch_native_ref_err_vs_cpu_ref",
+    "column_alpha_torch_native_ref_status_vs_cpu_ref",
+    "column_alpha_cusparse_ref_err_vs_cpu_ref",
+    "column_alpha_cusparse_ref_status_vs_cpu_ref",
     "fp_bound_err_vs_cpu_f64_ref",
     "fp_bound_status_vs_cpu_f64_ref",
     "fp_bound_gamma_n",
@@ -347,21 +362,27 @@ def _status_from_threshold(error_value, threshold):
     return "PASS" if float(error_value) <= float(threshold) else "FAIL"
 
 
-def _float32_unit_roundoff():
-    return float(torch.finfo(torch.float32).eps) / 2.0
+# The shared balanced-tree quality envelope is used directly, without another
+# implementation-specific or empirical multiplier.
+FP_BOUND_THRESHOLD = 1.0
 
 
-def _gamma_factor(n_terms):
+def _unit_roundoff(dtype):
+    return float(torch.finfo(dtype).eps) / 2.0
+
+
+def _gamma_factor(n_terms, dtype=torch.float32):
     n = torch.as_tensor(n_terms, dtype=torch.float64)
-    u = _float32_unit_roundoff()
+    u = _unit_roundoff(dtype)
     nu = n * u
     return torch.where(nu < 1.0, nu / torch.clamp(1.0 - nu, min=torch.finfo(torch.float64).tiny), torch.full_like(nu, float("inf")))
 
 
-def _gamma_tree_factor(n_terms):
+def _gamma_tree_factor(n_terms, dtype=torch.float32):
     n = torch.clamp(torch.as_tensor(n_terms, dtype=torch.float64), min=1.0)
-    levels = torch.ceil(torch.log2(n))
-    return _gamma_factor(levels)
+    # One rounded product/FMA level plus a balanced pairwise reduction tree.
+    levels = 1.0 + torch.ceil(torch.log2(n))
+    return _gamma_factor(levels, dtype)
 
 
 def _resolve_input_paths(input_paths):
@@ -568,6 +589,45 @@ def _alphasparse_error_profile(candidate, reference, threshold=1.3e-6):
     }
 
 
+def _columnwise_alphasparse_error_profile(candidate, reference, threshold=1.3e-6):
+    """AlphaSparse max-relative check applied independently to every dense column."""
+    empty = {
+        "global_err": None,
+        "status": "SKIP",
+        "col_p50": None,
+        "col_p90": None,
+        "col_p99": None,
+        "fail_cols": None,
+        "threshold": threshold,
+    }
+    if candidate is None or reference is None:
+        return empty
+    candidate = candidate.to(torch.float64)
+    reference = reference.to(torch.float64)
+    if candidate.shape != reference.shape:
+        raise ValueError(f"shape mismatch: {candidate.shape} vs {reference.shape}")
+    if candidate.numel() == 0 or candidate.shape[1] == 0:
+        return {**empty, "global_err": 0.0, "status": "PASS", "col_p50": 0.0, "col_p90": 0.0, "col_p99": 0.0, "fail_cols": 0}
+
+    col_max_diff = torch.max(torch.abs(candidate - reference), dim=0).values
+    col_ref_scale = torch.max(torch.abs(reference), dim=0).values
+    col_error = torch.where(
+        col_ref_scale > 0,
+        col_max_diff / col_ref_scale,
+        torch.where(col_max_diff == 0, torch.zeros_like(col_max_diff), torch.full_like(col_max_diff, float("inf"))),
+    )
+    global_err = float(torch.max(col_error).item())
+    return {
+        "global_err": global_err,
+        "status": _status_from_threshold(global_err, threshold),
+        "col_p50": float(torch.quantile(col_error, 0.50).item()),
+        "col_p90": float(torch.quantile(col_error, 0.90).item()),
+        "col_p99": float(torch.quantile(col_error, 0.99).item()),
+        "fail_cols": int(torch.sum(col_error > threshold).item()),
+        "threshold": threshold,
+    }
+
+
 def _fp_bound_error_profile(candidate, reference, dtype, sum_abs_products, contribution_counts):
     if candidate is None or reference is None or sum_abs_products is None or contribution_counts is None:
         return {
@@ -591,15 +651,19 @@ def _fp_bound_error_profile(candidate, reference, dtype, sum_abs_products, contr
             "gamma_tree_max": 0.0,
             "sum_abs_products_max": 0.0,
         }
-    atol, rtol = _reference_tolerance(dtype)
-    gamma_n = _gamma_factor(contribution_counts)
-    gamma_tree = _gamma_tree_factor(contribution_counts)
-    denom = atol + rtol * torch.abs(reference) + gamma_n * sum_abs_products
+    atol, _ = _reference_tolerance(dtype)
+    gamma_dtype = torch.float64 if dtype in (torch.float64, torch.complex128) else torch.float32
+    gamma_n = _gamma_factor(contribution_counts, gamma_dtype)
+    gamma_tree = _gamma_tree_factor(contribution_counts, gamma_dtype)
+    # One common numerical-quality target for every implementation: the error
+    # envelope of a balanced pairwise dot-product reduction.  This is not a
+    # proof of the implementation's exact operation order.
+    denom = atol + gamma_tree * sum_abs_products
     ratio = torch.abs(candidate - reference) / denom
     global_err = float(torch.max(ratio).item()) if ratio.numel() else 0.0
     return {
         "global_err": global_err,
-        "status": _status_from_error(global_err),
+        "status": _status_from_threshold(global_err, FP_BOUND_THRESHOLD),
         "gamma_n_max": float(torch.max(gamma_n).item()) if gamma_n.numel() else 0.0,
         "gamma_tree_max": float(torch.max(gamma_tree).item()) if gamma_tree.numel() else 0.0,
         "sum_abs_products_max": float(torch.max(sum_abs_products).item()) if sum_abs_products.numel() else 0.0,
@@ -1000,9 +1064,10 @@ def _contrib_metrics_for_value(
     atol, rtol = _reference_tolerance(dtype)
     denom = atol + rtol * abs(cpu_ref_value)
     cpu_f64_denom = atol + rtol * abs(cpu_f64_ref_value)
-    gamma_n = float(_gamma_factor(int(products64.numel())).item())
-    gamma_tree = float(_gamma_tree_factor(int(products64.numel())).item())
-    fp_bound_denom = cpu_f64_denom + gamma_n * sum_abs
+    gamma_dtype = torch.float64 if dtype in (torch.float64, torch.complex128) else torch.float32
+    gamma_n = float(_gamma_factor(int(products64.numel()), gamma_dtype).item())
+    gamma_tree = float(_gamma_tree_factor(int(products64.numel()), gamma_dtype).item())
+    fp_bound_denom = atol + gamma_tree * sum_abs
 
     def scaled(value):
         return abs(float(value) - cpu_ref_value) / denom if denom != 0 else 0.0
@@ -1120,7 +1185,10 @@ def _build_accuracy_summary_rows(summary_rows):
         ("alphasparse_global_relative", "cpu_f64", "alpha_err_vs_cpu_f64_ref_primary", "alpha_status_vs_cpu_f64_ref_primary", 1.3e-6),
         ("alphasparse_global_relative", "torch.gpu", "alpha_err_vs_torch_native_ref", "alpha_status_vs_torch_native_ref", 1.3e-6),
         ("alphasparse_global_relative", "cusparse", "alpha_err_vs_cusparse_ref", "alpha_status_vs_cusparse_ref", 1.3e-6),
-        ("fp_bound_scaled", "cpu_f64", "fp_bound_err_vs_cpu_f64_ref", "fp_bound_status_vs_cpu_f64_ref", 1.0),
+        ("alphasparse_columnwise_max_relative", "cpu_f64", "column_alpha_err_vs_cpu_f64_ref_primary", "column_alpha_status_vs_cpu_f64_ref_primary", 1.3e-6),
+        ("alphasparse_columnwise_max_relative", "torch.gpu", "column_alpha_err_vs_torch_native_ref", "column_alpha_status_vs_torch_native_ref", 1.3e-6),
+        ("alphasparse_columnwise_max_relative", "cusparse", "column_alpha_err_vs_cusparse_ref", "column_alpha_status_vs_cusparse_ref", 1.3e-6),
+        ("fp_bound_balanced_tree_scaled", "cpu_f64", "fp_bound_err_vs_cpu_f64_ref", "fp_bound_status_vs_cpu_f64_ref", FP_BOUND_THRESHOLD),
     ]
 
     def as_float(value):
@@ -1162,6 +1230,12 @@ def _build_accuracy_summary_rows(summary_rows):
             "alpha_status_vs_torch_native_ref": "PASS",
             "alpha_err_vs_cusparse_ref": None,
             "alpha_status_vs_cusparse_ref": "SKIP",
+            "column_alpha_err_vs_cpu_f64_ref_primary": row.get("column_alpha_torch_native_ref_err_vs_cpu_ref"),
+            "column_alpha_status_vs_cpu_f64_ref_primary": row.get("column_alpha_torch_native_ref_status_vs_cpu_ref"),
+            "column_alpha_err_vs_torch_native_ref": 0.0,
+            "column_alpha_status_vs_torch_native_ref": "PASS",
+            "column_alpha_err_vs_cusparse_ref": None,
+            "column_alpha_status_vs_cusparse_ref": "SKIP",
             "fp_bound_err_vs_cpu_f64_ref": None,
             "fp_bound_status_vs_cpu_f64_ref": "SKIP",
             "status": "",
@@ -1178,6 +1252,12 @@ def _build_accuracy_summary_rows(summary_rows):
             "alpha_status_vs_torch_native_ref": "SKIP",
             "alpha_err_vs_cusparse_ref": 0.0,
             "alpha_status_vs_cusparse_ref": "PASS",
+            "column_alpha_err_vs_cpu_f64_ref_primary": row.get("column_alpha_cusparse_ref_err_vs_cpu_ref"),
+            "column_alpha_status_vs_cpu_f64_ref_primary": row.get("column_alpha_cusparse_ref_status_vs_cpu_ref"),
+            "column_alpha_err_vs_torch_native_ref": None,
+            "column_alpha_status_vs_torch_native_ref": "SKIP",
+            "column_alpha_err_vs_cusparse_ref": 0.0,
+            "column_alpha_status_vs_cusparse_ref": "PASS",
             "fp_bound_err_vs_cpu_f64_ref": None,
             "fp_bound_status_vs_cpu_f64_ref": "SKIP",
             "status": "",
@@ -1310,6 +1390,7 @@ def _run_one_case(args, path, dtype, op, alg_names):
         "cpu_f64_reason": "",
         "torch_f64_cast": None,
         "torch_native": None,
+        "torch_ms": None,
         "cusparse": None,
     }
     sum_abs_products = None
@@ -1330,13 +1411,14 @@ def _run_one_case(args, path, dtype, op, alg_names):
         except Exception as exc:
             refs["cpu_reason"] = str(exc)
     try:
-        torch_f64_cast, _, _ = _build_pytorch_reference(data, indices, indptr, shape, B, op=op)
+        torch_f64_cast, torch_timing_op, _ = _build_pytorch_reference(data, indices, indptr, shape, B, op=op)
         refs["torch_f64_cast"] = _to_cpu_compare(torch_f64_cast)
+        torch_native_out, refs["torch_ms"] = _cuda_event_benchmark(
+            torch_timing_op, args.warmup, args.iters
+        )
+        refs["torch_native"] = _to_cpu_compare(torch_native_out)
     except Exception as exc:
         refs["torch_f64_cast_reason"] = str(exc)
-    try:
-        refs["torch_native"] = _to_cpu_compare(_torch_native_reference(data, indices, indptr, shape, B, op))
-    except Exception as exc:
         refs["torch_native_reason"] = str(exc)
 
     cusparse_ms = None
@@ -1371,6 +1453,8 @@ def _run_one_case(args, path, dtype, op, alg_names):
         if cpu_ref is not None
         else {"global_err": None, "status": "SKIP"}
     )
+    column_alpha_torch_native_vs_cpu = _columnwise_alphasparse_error_profile(refs["torch_native"], cpu_ref)
+    column_alpha_cusparse_vs_cpu = _columnwise_alphasparse_error_profile(refs["cusparse"], cpu_ref)
 
     prepared = fs.prepare_spmm_csr_route(data, indices, indptr, shape, op=op, alg="auto")
     algs = _expand_algs(alg_names, op, dtype)
@@ -1408,6 +1492,12 @@ def _run_one_case(args, path, dtype, op, alg_names):
             base_out = _to_cpu_compare(out)
         out_cpu = _to_cpu_compare(out)
         diagnostics = meta.get("diagnostics", {})
+        process_cpu_ms = float(meta.get("process_cpu_ms", 0.0) or 0.0)
+        process_gpu_ms = meta.get("process_gpu_ms")
+        compute_ms = meta.get("compute_ms")
+        if meta.get("alg", alg) == "csr_base":
+            process_gpu_ms = 0.0 if process_gpu_ms is None else process_gpu_ms
+            compute_ms = gpu_ms if compute_ms is None else compute_ms
         buckets = _build_row_bucket_map(int(out_cpu.shape[0]), diagnostics)
         cpu_profile = _error_profile(out_cpu, cpu_ref, dtype)
         cpu_native_profile = _error_profile(out_cpu, refs["cpu_native"], dtype)
@@ -1433,6 +1523,9 @@ def _run_one_case(args, path, dtype, op, alg_names):
             if base_out is not None
             else {"global_err": None, "status": "SKIP"}
         )
+        column_alpha_cpu_f64_profile = _columnwise_alphasparse_error_profile(out_cpu, refs["cpu_f64"])
+        column_alpha_torch_native_profile = _columnwise_alphasparse_error_profile(out_cpu, refs["torch_native"])
+        column_alpha_cusparse_profile = _columnwise_alphasparse_error_profile(out_cpu, refs["cusparse"])
         worst_row = cpu_profile["worst_row"]
         worst_bucket = buckets[worst_row] if worst_row is not None and worst_row < len(buckets) else ""
         summary_row = {
@@ -1449,11 +1542,12 @@ def _run_one_case(args, path, dtype, op, alg_names):
             "dense_cols": args.dense_cols,
             "b_stride": b_stride,
             "c_stride": _stride_string(out),
-            "ms": meta.get("operator_ms"),
+            "ms": process_cpu_ms + gpu_ms,
             "gpu_ms": gpu_ms,
-            "process_cpu_ms": meta.get("process_cpu_ms"),
-            "process_gpu_ms": meta.get("process_gpu_ms"),
-            "compute_ms": meta.get("compute_ms"),
+            "process_cpu_ms": process_cpu_ms,
+            "process_gpu_ms": process_gpu_ms,
+            "compute_ms": compute_ms,
+            "torch_ms": refs.get("torch_ms"),
             "primary_ref_kind": "cpu_f64_native",
             "cpu_ref_kind": refs.get("cpu_kind") or "",
             "cpu_ref_status": "SKIP" if cpu_ref is None else "PASS",
@@ -1479,6 +1573,20 @@ def _run_one_case(args, path, dtype, op, alg_names):
             "alpha_cusparse_ref_status_vs_cpu_ref": alpha_cusparse_vs_cpu["status"],
             "alpha_err_vs_cpu_f64_ref_primary": alpha_cpu_f64_profile["global_err"],
             "alpha_status_vs_cpu_f64_ref_primary": alpha_cpu_f64_profile["status"],
+            "column_alpha_err_vs_cpu_f64_ref_primary": column_alpha_cpu_f64_profile["global_err"],
+            "column_alpha_status_vs_cpu_f64_ref_primary": column_alpha_cpu_f64_profile["status"],
+            "column_alpha_p50_vs_cpu_f64_ref_primary": column_alpha_cpu_f64_profile["col_p50"],
+            "column_alpha_p90_vs_cpu_f64_ref_primary": column_alpha_cpu_f64_profile["col_p90"],
+            "column_alpha_p99_vs_cpu_f64_ref_primary": column_alpha_cpu_f64_profile["col_p99"],
+            "column_alpha_fail_cols_vs_cpu_f64_ref_primary": column_alpha_cpu_f64_profile["fail_cols"],
+            "column_alpha_err_vs_torch_native_ref": column_alpha_torch_native_profile["global_err"],
+            "column_alpha_status_vs_torch_native_ref": column_alpha_torch_native_profile["status"],
+            "column_alpha_err_vs_cusparse_ref": column_alpha_cusparse_profile["global_err"],
+            "column_alpha_status_vs_cusparse_ref": column_alpha_cusparse_profile["status"],
+            "column_alpha_torch_native_ref_err_vs_cpu_ref": column_alpha_torch_native_vs_cpu["global_err"],
+            "column_alpha_torch_native_ref_status_vs_cpu_ref": column_alpha_torch_native_vs_cpu["status"],
+            "column_alpha_cusparse_ref_err_vs_cpu_ref": column_alpha_cusparse_vs_cpu["global_err"],
+            "column_alpha_cusparse_ref_status_vs_cpu_ref": column_alpha_cusparse_vs_cpu["status"],
             "fp_bound_err_vs_cpu_f64_ref": fp_bound_profile["global_err"],
             "fp_bound_status_vs_cpu_f64_ref": fp_bound_profile["status"],
             "fp_bound_gamma_n": fp_bound_profile["gamma_n_max"],
@@ -1590,6 +1698,8 @@ def _run_one_case(args, path, dtype, op, alg_names):
         print(
             f"{matrix_name:<28} {dtype_name:<8} {op:<5} {meta.get('alg', alg):<18} "
             f"err_cpu={_fmt(cpu_profile['global_err'], 4):>10} "
+            f"col_alpha={_fmt(column_alpha_cpu_f64_profile['global_err'], 3):>10} "
+            f"fp_topo={_fmt(fp_bound_profile['global_err'], 3):>9} "
             f"rows>1={_fmt(cpu_profile['rows_gt_1'], 0):>7} "
             f"status={cpu_profile['status']}"
         )

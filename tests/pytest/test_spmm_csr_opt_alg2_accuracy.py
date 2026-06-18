@@ -129,3 +129,4 @@ def test_spmm_csr_opt_alg2_return_time_and_meta_shapes():
     assert out.shape == (M, N)
     assert isinstance(elapsed_ms, float)
     assert meta["n_dense_cols"] == N
+

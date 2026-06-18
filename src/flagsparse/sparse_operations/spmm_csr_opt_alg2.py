@@ -481,7 +481,9 @@ def _spmm_csr_alg2_batched_rows_kernel(
                     mask=valid_k[:, None] & mask_n[None, :],
                     other=0.0,
                 ).to(ACC_DTYPE)
-                acc = acc + tl.sum(a_vals[:, None] * b_vals, axis=0)
+                # HP routes widen only after the requested f32 multiplication.
+                products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+                acc = acc + tl.sum(products_f32.to(ACC_DTYPE), axis=0)
             else:
                 for kk in tl.static_range(0, BLOCK_K):
                     scalar_idx = start + chunk_start + kk
@@ -545,7 +547,8 @@ def _spmm_csr_alg2_row_rows_kernel(
                 mask=valid_k[:, None] & mask_n[None, :],
                 other=0.0,
             ).to(ACC_DTYPE)
-            acc = acc + tl.sum(a_vals[:, None] * b_vals, axis=0)
+            products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+            acc = acc + tl.sum(products_f32.to(ACC_DTYPE), axis=0)
         else:
             for kk in tl.static_range(0, BLOCK_K):
                 scalar_idx = start + chunk_start + kk
@@ -619,7 +622,9 @@ def _spmm_csr_alg2_segmented_rows_kernel(
                     mask=valid_k[:, None] & mask_n[None, :],
                     other=0.0,
                 ).to(ACC_DTYPE)
-                chunk_acc = tl.sum(a_vals[:, None] * b_vals, axis=0)
+                # HP routes widen the rounded f32 products before reduction.
+                products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+                chunk_acc = tl.sum(products_f32.to(ACC_DTYPE), axis=0)
             else:
                 for kk in tl.static_range(0, BLOCK_K):
                     scalar_idx = seg_start + chunk_offset + kk
@@ -650,7 +655,8 @@ def _spmm_csr_alg2_segmented_rows_kernel(
                     mask=valid_k[:, None] & mask_n[None, :],
                     other=0.0,
                 ).to(ACC_DTYPE)
-                chunk_acc = tl.sum(a_vals[:, None] * b_vals, axis=0)
+                products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+                chunk_acc = tl.sum(products_f32.to(ACC_DTYPE), axis=0)
             else:
                 for kk in tl.static_range(0, BLOCK_K):
                     scalar_idx = seg_start + chunk_offset + kk
@@ -681,7 +687,8 @@ def _spmm_csr_alg2_segmented_rows_kernel(
                     mask=valid_k[:, None] & mask_n[None, :],
                     other=0.0,
                 ).to(ACC_DTYPE)
-                chunk_acc = tl.sum(a_vals[:, None] * b_vals, axis=0)
+                products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+                chunk_acc = tl.sum(products_f32.to(ACC_DTYPE), axis=0)
             else:
                 for kk in tl.static_range(0, BLOCK_K):
                     scalar_idx = seg_start + chunk_offset + kk
@@ -712,7 +719,8 @@ def _spmm_csr_alg2_segmented_rows_kernel(
                     mask=valid_k[:, None] & mask_n[None, :],
                     other=0.0,
                 ).to(ACC_DTYPE)
-                chunk_acc = tl.sum(a_vals[:, None] * b_vals, axis=0)
+                products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+                chunk_acc = tl.sum(products_f32.to(ACC_DTYPE), axis=0)
             else:
                 for kk in tl.static_range(0, BLOCK_K):
                     scalar_idx = seg_start + chunk_offset + kk
@@ -743,7 +751,8 @@ def _spmm_csr_alg2_segmented_rows_kernel(
                     mask=valid_k[:, None] & mask_n[None, :],
                     other=0.0,
                 ).to(ACC_DTYPE)
-                chunk_acc = tl.sum(a_vals[:, None] * b_vals, axis=0)
+                products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+                chunk_acc = tl.sum(products_f32.to(ACC_DTYPE), axis=0)
             else:
                 for kk in tl.static_range(0, BLOCK_K):
                     scalar_idx = seg_start + chunk_offset + kk
@@ -774,7 +783,8 @@ def _spmm_csr_alg2_segmented_rows_kernel(
                     mask=valid_k[:, None] & mask_n[None, :],
                     other=0.0,
                 ).to(ACC_DTYPE)
-                chunk_acc = tl.sum(a_vals[:, None] * b_vals, axis=0)
+                products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+                chunk_acc = tl.sum(products_f32.to(ACC_DTYPE), axis=0)
             else:
                 for kk in tl.static_range(0, BLOCK_K):
                     scalar_idx = seg_start + chunk_offset + kk
@@ -805,7 +815,8 @@ def _spmm_csr_alg2_segmented_rows_kernel(
                     mask=valid_k[:, None] & mask_n[None, :],
                     other=0.0,
                 ).to(ACC_DTYPE)
-                chunk_acc = tl.sum(a_vals[:, None] * b_vals, axis=0)
+                products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+                chunk_acc = tl.sum(products_f32.to(ACC_DTYPE), axis=0)
             else:
                 for kk in tl.static_range(0, BLOCK_K):
                     scalar_idx = seg_start + chunk_offset + kk
@@ -836,7 +847,8 @@ def _spmm_csr_alg2_segmented_rows_kernel(
                     mask=valid_k[:, None] & mask_n[None, :],
                     other=0.0,
                 ).to(ACC_DTYPE)
-                chunk_acc = tl.sum(a_vals[:, None] * b_vals, axis=0)
+                products_f32 = a_vals[:, None].to(tl.float32) * b_vals.to(tl.float32)
+                chunk_acc = tl.sum(products_f32.to(ACC_DTYPE), axis=0)
             else:
                 for kk in tl.static_range(0, BLOCK_K):
                     scalar_idx = seg_start + chunk_offset + kk

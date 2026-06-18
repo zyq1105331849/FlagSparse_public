@@ -142,6 +142,7 @@ def _spmm_csr_real_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_NNZ: tl.constexpr,
     ACC_DTYPE: tl.constexpr,
+    ACCURACY: tl.constexpr,
 ):
     row = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -156,17 +157,30 @@ def _spmm_csr_real_kernel(
     acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
 
     for chunk_start in tl.range(0, row_nnz, BLOCK_NNZ):
-        for kk in tl.static_range(0, BLOCK_NNZ):
-            idx = start + chunk_start + kk
-            valid = idx < end
-            a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
-            a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+        if ACCURACY:
+            offs_k = tl.arange(0, BLOCK_NNZ)
+            idx = start + chunk_start + offs_k
+            valid_k = idx < end
+            a_vals = tl.load(data_ptr + idx, mask=valid_k, other=0.0).to(ACC_DTYPE)
+            a_cols = tl.load(indices_ptr + idx, mask=valid_k, other=0)
             b_vals = tl.load(
-                b_ptr + a_col * stride_bk + offs_n * stride_bn,
-                mask=mask_n & valid,
+                b_ptr + a_cols[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+                mask=valid_k[:, None] & mask_n[None, :],
                 other=0.0,
-            )
-            acc = acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
+            ).to(ACC_DTYPE)
+            acc = acc + tl.sum(a_vals[:, None] * b_vals, axis=0)
+        else:
+            for kk in tl.static_range(0, BLOCK_NNZ):
+                idx = start + chunk_start + kk
+                valid = idx < end
+                a_val = tl.load(data_ptr + idx, mask=valid, other=0.0)
+                a_col = tl.load(indices_ptr + idx, mask=valid, other=0)
+                b_vals = tl.load(
+                    b_ptr + a_col * stride_bk + offs_n * stride_bn,
+                    mask=mask_n & valid,
+                    other=0.0,
+                )
+                acc = acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
 
     tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n)
 
@@ -568,12 +582,16 @@ def _normalize_spmm_csr_alg(alg):
     token = "auto" if alg is None else str(alg).strip().lower()
     if token in ("base", "csr", "csr_base"):
         return "csr_base"
+    if token in ("base_accuracy", "csr_base_accuracy"):
+        return "csr_base_accuracy"
     if token in ("alg1", "csr_alg1", "spmm_csr_alg1"):
         return "spmm_csr_alg1"
     if token in ("alg2", "csr_alg2", "spmm_csr_alg2"):
         return "spmm_csr_alg2"
     if token in ("alg2_accuracy", "csr_alg2_accuracy", "spmm_csr_alg2_accuracy"):
         return "spmm_csr_alg2_accuracy"
+    if token in ("alg2_accuracy_hp", "csr_alg2_accuracy_hp", "spmm_csr_alg2_accuracy_hp"):
+        return "spmm_csr_alg2_accuracy_hp"
     if token == "auto":
         return "auto"
     return token
@@ -708,6 +726,27 @@ def _materialize_spmm_csr_route_op(prepared, op_name, *, timing=False):
 
 
 def _run_spmm_csr_base_route(prepared, B, *, timing=False, diagnostics=False, dense_layout="row"):
+    return _run_spmm_csr_base_route_impl(
+        prepared, B, timing=timing, diagnostics=diagnostics,
+        dense_layout=dense_layout, accuracy=False, route_name="csr_base",
+    )
+
+
+def _run_spmm_csr_base_accuracy_route(prepared, B, *, timing=False, diagnostics=False):
+    if prepared.op != "non":
+        raise SpmmCsrAlgorithmUnavailable("csr_base_accuracy currently supports op=non only")
+    if prepared.data.dtype != torch.float32:
+        raise SpmmCsrAlgorithmUnavailable("csr_base_accuracy currently supports float32 only")
+    return _run_spmm_csr_base_route_impl(
+        prepared, B, timing=timing, diagnostics=diagnostics,
+        dense_layout="row", accuracy=True, route_name="csr_base_accuracy",
+    )
+
+
+def _run_spmm_csr_base_route_impl(
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row",
+    accuracy=False, route_name="csr_base",
+):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     dense_layout = _normalize_dense_layout(dense_layout)
     B = _materialize_dense_layout(B, dense_layout)
@@ -744,14 +783,15 @@ def _run_spmm_csr_base_route(prepared, B, *, timing=False, diagnostics=False, de
         num_stages=launch["num_stages"],
         out=C_out,
         dense_layout=dense_layout,
+        accuracy=accuracy,
     )
     if timing:
         end.record()
         torch.cuda.synchronize()
         compute_ms = start.elapsed_time(end)
     meta = {
-        "alg": "csr_base",
-        "display_name": "Base",
+        "alg": route_name,
+        "display_name": "BaseAccuracy" if accuracy else "Base",
         "op": prepared.op,
         "process_cpu_ms": process_cpu_ms,
         "process_gpu_ms": process_gpu_ms,
@@ -767,7 +807,7 @@ def _run_spmm_csr_base_route(prepared, B, *, timing=False, diagnostics=False, de
             "launch_config_count": 1,
             "bucket_count": 0,
             "long_row_count": 0,
-            "launch_version": "csr_base_v1",
+            "launch_version": "csr_base_accuracy_v1" if accuracy else "csr_base_v1",
             "block_n": launch["block_n"],
             "block_nnz": launch["block_nnz"],
             "num_warps": launch["num_warps"],
@@ -1809,7 +1849,9 @@ def _spmm_csr_alg2_acc_dtype(dtype):
     return tl.float64 if dtype == torch.float64 else tl.float32
 
 
-def _spmm_csr_alg2_run_bucket(plan, bucket, B, C_out, device_props, kernels, *, accuracy=False):
+def _spmm_csr_alg2_run_bucket(
+    plan, bucket, B, C_out, device_props, kernels, *, accuracy=False, high_precision=False
+):
     launch = _resolve_spmm_csr_alg2_launch(
         bucket,
         int(B.shape[1]),
@@ -1821,7 +1863,7 @@ def _spmm_csr_alg2_run_bucket(plan, bucket, B, C_out, device_props, kernels, *, 
         return launch
 
     batched_kernel, row_kernel, segmented_kernel = kernels
-    acc_dtype = _spmm_csr_alg2_acc_dtype(plan.data.dtype)
+    acc_dtype = tl.float64 if high_precision else _spmm_csr_alg2_acc_dtype(plan.data.dtype)
     out_dtype = tl.float64 if plan.data.dtype == torch.float64 else tl.float32
     common_kwargs = {
         "num_warps": launch["num_warps"],
@@ -1905,7 +1947,7 @@ def _spmm_csr_alg2_run_bucket(plan, bucket, B, C_out, device_props, kernels, *, 
     return launch
 
 
-def _spmm_csr_alg2_compute(plan, B, *, accuracy=False):
+def _spmm_csr_alg2_compute(plan, B, *, accuracy=False, high_precision=False):
     if B.ndim != 2:
         raise ValueError("B must be a 2D dense tensor")
     if not B.is_cuda:
@@ -1923,7 +1965,10 @@ def _spmm_csr_alg2_compute(plan, B, *, accuracy=False):
     kernels = _spmm_csr_alg2_kernel_bundle()
     plan.launch_configs.clear()
     for bucket in plan.row_buckets:
-        launch = _spmm_csr_alg2_run_bucket(plan, bucket, B, C_out, device_props, kernels, accuracy=accuracy)
+        launch = _spmm_csr_alg2_run_bucket(
+            plan, bucket, B, C_out, device_props, kernels,
+            accuracy=accuracy, high_precision=high_precision,
+        )
         plan.launch_configs.append(launch)
     return C_out
 
@@ -1969,10 +2014,27 @@ def _run_spmm_csr_alg2_route(prepared, B, *, timing=False, diagnostics=False):
 
 
 def _run_spmm_csr_alg2_accuracy_route(prepared, B, *, timing=False, diagnostics=False):
+    return _run_spmm_csr_alg2_accuracy_impl(
+        prepared, B, timing=timing, diagnostics=diagnostics,
+        high_precision=False, route_name="spmm_csr_alg2_accuracy",
+    )
+
+
+def _run_spmm_csr_alg2_accuracy_hp_route(prepared, B, *, timing=False, diagnostics=False):
+    return _run_spmm_csr_alg2_accuracy_impl(
+        prepared, B, timing=timing, diagnostics=diagnostics,
+        high_precision=True, route_name="spmm_csr_alg2_accuracy_hp",
+    )
+
+
+def _run_spmm_csr_alg2_accuracy_impl(
+    prepared, B, *, timing=False, diagnostics=False,
+    high_precision=False, route_name="spmm_csr_alg2_accuracy",
+):
     if prepared.op != "non":
-        raise SpmmCsrAlgorithmUnavailable("spmm_csr_alg2_accuracy currently supports op=non only")
+        raise SpmmCsrAlgorithmUnavailable(f"{route_name} currently supports op=non only")
     if prepared.data.dtype != torch.float32:
-        raise SpmmCsrAlgorithmUnavailable("spmm_csr_alg2_accuracy currently supports float32 only")
+        raise SpmmCsrAlgorithmUnavailable(f"{route_name} currently supports float32 only")
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     plan = _spmm_csr_alg2_build_process_plan(prepared, timing=bool(timing))
     compute_ms = None
@@ -1980,14 +2042,14 @@ def _run_spmm_csr_alg2_accuracy_route(prepared, B, *, timing=False, diagnostics=
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-    C = _spmm_csr_alg2_compute(plan, B, accuracy=True)
+    C = _spmm_csr_alg2_compute(plan, B, accuracy=True, high_precision=high_precision)
     if timing:
         end.record()
         torch.cuda.synchronize()
         compute_ms = start.elapsed_time(end)
     meta = {
-        "alg": "spmm_csr_alg2_accuracy",
-        "display_name": "Alg2Accuracy",
+        "alg": route_name,
+        "display_name": "Alg2AccuracyHP" if high_precision else "Alg2Accuracy",
         "op": prepared.op,
         "process_cpu_ms": plan.process_cpu_ms,
         "process_gpu_ms": plan.process_gpu_ms if timing else None,
@@ -2001,7 +2063,10 @@ def _run_spmm_csr_alg2_accuracy_route(prepared, B, *, timing=False, diagnostics=
             "bucket_count": plan.bucket_count,
             "long_row_count": plan.long_row_count,
             "long_part_count": 0,
-            "launch_version": "spmm_csr_alg2_accuracy_v1",
+            "launch_version": (
+                "spmm_csr_alg2_accuracy_hp_v1"
+                if high_precision else "spmm_csr_alg2_accuracy_v1"
+            ),
             "block_n": first_launch.get("block_n"),
             "block_nnz": first_launch.get("block_k"),
             "num_warps": first_launch.get("num_warps"),
@@ -2019,6 +2084,13 @@ SPMM_CSR_ALGORITHMS = {
         supported_ops=tuple(SPMM_OP_NAMES.values()),
         supported_dtypes=SUPPORTED_SPMM_VALUE_DTYPES,
         run=_run_spmm_csr_base_route,
+    ),
+    "csr_base_accuracy": SpmmCsrAlgorithm(
+        name="csr_base_accuracy",
+        display_name="BaseAccuracy",
+        supported_ops=("non",),
+        supported_dtypes=(torch.float32,),
+        run=_run_spmm_csr_base_accuracy_route,
     ),
     "alpha_alg1_tle_opt": SpmmCsrAlgorithm(
         name="alpha_alg1_tle_opt",
@@ -2054,6 +2126,13 @@ SPMM_CSR_ALGORITHMS = {
         supported_ops=("non",),
         supported_dtypes=(torch.float32,),
         run=_run_spmm_csr_alg2_accuracy_route,
+    ),
+    "spmm_csr_alg2_accuracy_hp": SpmmCsrAlgorithm(
+        name="spmm_csr_alg2_accuracy_hp",
+        display_name="Alg2AccuracyHP",
+        supported_ops=("non",),
+        supported_dtypes=(torch.float32,),
+        run=_run_spmm_csr_alg2_accuracy_hp_route,
     ),
 }
 
@@ -2743,6 +2822,7 @@ def _triton_spmm_csr_impl(
     num_stages,
     out=None,
     dense_layout="row",
+    accuracy=False,
 ):
     device = data.device
     dtype = data.dtype
@@ -2789,6 +2869,7 @@ def _triton_spmm_csr_impl(
             BLOCK_N=block_n,
             BLOCK_NNZ=block_nnz,
             ACC_DTYPE=acc_dtype,
+            ACCURACY=bool(accuracy),
             num_warps=num_warps,
             num_stages=num_stages,
         )
