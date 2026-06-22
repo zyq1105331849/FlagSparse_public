@@ -24,6 +24,9 @@ SUPPORTED_SCATTER_VALUE_DTYPES = (
     torch.complex64,
     torch.complex128,
 )
+DEFAULT_GATHER_BLOCK_SIZE = 256
+DEFAULT_GATHER_MAX_PROGRAMS = 2
+DEFAULT_GATHER_NUM_WARPS = 8
 
 
 def _scatter_dtype_error_message():
@@ -46,12 +49,13 @@ def _gather_real_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < nnz
-    indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
-    gathered_values = tl.load(dense_values_ptr + indices, mask=mask, other=0.0)
-    tl.store(sparse_values_ptr + offsets, gathered_values, mask=mask)
+    num_programs = tl.num_programs(axis=0)
+    for block_start in tl.range(pid * BLOCK_SIZE, nnz, num_programs * BLOCK_SIZE):
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < nnz
+        indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
+        gathered_values = tl.load(dense_values_ptr + indices, mask=mask, other=0.0)
+        tl.store(sparse_values_ptr + offsets, gathered_values, mask=mask)
 
 
 @triton.jit
@@ -63,19 +67,24 @@ def _gather_complex_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < nnz
-    indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
+    num_programs = tl.num_programs(axis=0)
+    for block_start in tl.range(pid * BLOCK_SIZE, nnz, num_programs * BLOCK_SIZE):
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < nnz
+        indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
 
-    dense_offsets = indices * 2
-    sparse_offsets = offsets * 2
+        dense_offsets = indices * 2
+        sparse_offsets = offsets * 2
 
-    gathered_real = tl.load(dense_values_ri_ptr + dense_offsets, mask=mask, other=0.0)
-    gathered_imag = tl.load(dense_values_ri_ptr + dense_offsets + 1, mask=mask, other=0.0)
+        gathered_real = tl.load(
+            dense_values_ri_ptr + dense_offsets, mask=mask, other=0.0
+        )
+        gathered_imag = tl.load(
+            dense_values_ri_ptr + dense_offsets + 1, mask=mask, other=0.0
+        )
 
-    tl.store(sparse_values_ri_ptr + sparse_offsets, gathered_real, mask=mask)
-    tl.store(sparse_values_ri_ptr + sparse_offsets + 1, gathered_imag, mask=mask)
+        tl.store(sparse_values_ri_ptr + sparse_offsets, gathered_real, mask=mask)
+        tl.store(sparse_values_ri_ptr + sparse_offsets + 1, gathered_imag, mask=mask)
 
 
 @triton.jit
@@ -120,25 +129,55 @@ def _scatter_complex_kernel(
     tl.store(dense_values_ri_ptr + dense_offsets + 1, values_imag, mask=mask)
 
 
-def _triton_gather_impl(dense_vector, kernel_indices, block_size=1024):
+def _triton_gather_impl(
+    dense_vector,
+    kernel_indices,
+    out=None,
+    block_size=DEFAULT_GATHER_BLOCK_SIZE,
+):
     nnz = kernel_indices.numel()
     if nnz == 0:
-        return torch.empty(0, dtype=dense_vector.dtype, device=dense_vector.device)
+        if out is None:
+            return torch.empty(0, dtype=dense_vector.dtype, device=dense_vector.device)
+        if out.shape != (0,):
+            raise ValueError("out shape must match gather output shape")
+        if out.dtype != dense_vector.dtype:
+            raise TypeError("out dtype must match gather output dtype")
+        return out
 
-    grid = lambda meta: (triton.cdiv(nnz, meta["BLOCK_SIZE"]),)
+    grid = lambda meta: (
+        min(DEFAULT_GATHER_MAX_PROGRAMS, triton.cdiv(nnz, meta["BLOCK_SIZE"])),
+    )
 
     if not _is_complex_dtype(dense_vector.dtype):
-        sparse_values = torch.empty(nnz, dtype=dense_vector.dtype, device=dense_vector.device)
+        sparse_values = out
+        if sparse_values is None:
+            sparse_values = torch.empty(
+                nnz, dtype=dense_vector.dtype, device=dense_vector.device
+            )
+        else:
+            if sparse_values.shape != (nnz,):
+                raise ValueError("out shape must match gather output shape")
+            if sparse_values.dtype != dense_vector.dtype:
+                raise TypeError("out dtype must match gather output dtype")
         _gather_real_kernel[grid](
             sparse_values,
             dense_vector,
             kernel_indices,
             nnz,
             BLOCK_SIZE=block_size,
+            num_warps=DEFAULT_GATHER_NUM_WARPS,
         )
         return sparse_values
 
-    sparse_values = torch.empty(nnz, dtype=dense_vector.dtype, device=dense_vector.device)
+    sparse_values = out
+    if sparse_values is None:
+        sparse_values = torch.empty(nnz, dtype=dense_vector.dtype, device=dense_vector.device)
+    else:
+        if sparse_values.shape != (nnz,):
+            raise ValueError("out shape must match gather output shape")
+        if sparse_values.dtype != dense_vector.dtype:
+            raise TypeError("out dtype must match gather output dtype")
     dense_values_ri = torch.view_as_real(dense_vector).reshape(-1)
     sparse_values_ri = torch.view_as_real(sparse_values).reshape(-1)
 
@@ -148,8 +187,14 @@ def _triton_gather_impl(dense_vector, kernel_indices, block_size=1024):
         kernel_indices,
         nnz,
         BLOCK_SIZE=block_size,
+        num_warps=DEFAULT_GATHER_NUM_WARPS,
     )
     return sparse_values
+
+
+def _validate_gather_value_dtype(dense_vector, op_name):
+    del dense_vector, op_name
+    return None
 
 
 def _triton_scatter_impl(
@@ -376,6 +421,7 @@ def _prepare_hipsparse_gather(dense_vector, indices, out=None):
     handle = None
     spvec = None
     dnvec = None
+    success = False
     try:
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
         ptr_type = type(handle)
@@ -397,6 +443,7 @@ def _prepare_hipsparse_gather(dense_vector, indices, out=None):
             dense_vector,
             value_type,
         )
+        success = True
         return {
             "backend": "hipsparse",
             "handle": handle,
@@ -405,16 +452,22 @@ def _prepare_hipsparse_gather(dense_vector, indices, out=None):
             "values": sparse_values,
         }
     finally:
-        if handle is None and dnvec is not None:
-            try:
-                _hip_check_result(hipsparse.hipsparseDestroyDnVec(dnvec), "hipsparseDestroyDnVec")
-            except Exception:
-                pass
-        if handle is None and spvec is not None:
-            try:
-                _hip_check_result(hipsparse.hipsparseDestroySpVec(spvec), "hipsparseDestroySpVec")
-            except Exception:
-                pass
+        if not success:
+            if dnvec is not None:
+                try:
+                    _hip_check_result(hipsparse.hipsparseDestroyDnVec(dnvec), "hipsparseDestroyDnVec")
+                except Exception:
+                    pass
+            if spvec is not None:
+                try:
+                    _hip_check_result(hipsparse.hipsparseDestroySpVec(spvec), "hipsparseDestroySpVec")
+                except Exception:
+                    pass
+            if handle is not None:
+                try:
+                    _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+                except Exception:
+                    pass
  
 
 def _run_hipsparse_gather_prepared(state):
@@ -513,6 +566,7 @@ def _prepare_hipsparse_scatter(
     handle = None
     spvec = None
     dnvec = None
+    success = False
     try:
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
         ptr_type = type(handle)
@@ -534,6 +588,7 @@ def _prepare_hipsparse_scatter(
             dense_values,
             value_type,
         )
+        success = True
         return {
             "backend": "hipsparse",
             "handle": handle,
@@ -542,16 +597,22 @@ def _prepare_hipsparse_scatter(
             "values": dense_values,
         }
     finally:
-        if handle is None and dnvec is not None:
-            try:
-                _hip_check_result(hipsparse.hipsparseDestroyDnVec(dnvec), "hipsparseDestroyDnVec")
-            except Exception:
-                pass
-        if handle is None and spvec is not None:
-            try:
-                _hip_check_result(hipsparse.hipsparseDestroySpVec(spvec), "hipsparseDestroySpVec")
-            except Exception:
-                pass
+        if not success:
+            if dnvec is not None:
+                try:
+                    _hip_check_result(hipsparse.hipsparseDestroyDnVec(dnvec), "hipsparseDestroyDnVec")
+                except Exception:
+                    pass
+            if spvec is not None:
+                try:
+                    _hip_check_result(hipsparse.hipsparseDestroySpVec(spvec), "hipsparseDestroySpVec")
+                except Exception:
+                    pass
+            if handle is not None:
+                try:
+                    _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+                except Exception:
+                    pass
  
 
 def _run_hipsparse_scatter_prepared(state):
@@ -731,7 +792,14 @@ def _pytorch_scatter_impl(sparse_values, indices, dense_size, out=None, reset_ou
     return dense_values
 
 
-def flagsparse_gather(a, indices, out=None, mode="raise", block_size=1024, return_time=False):
+def flagsparse_gather(
+    a,
+    indices,
+    out=None,
+    mode="raise",
+    block_size=DEFAULT_GATHER_BLOCK_SIZE,
+    return_time=False,
+):
     """CuPy-style gather (take): out = a[indices]."""
     if mode != "raise":
         raise NotImplementedError("Only mode='raise' is currently supported")
@@ -739,20 +807,27 @@ def flagsparse_gather(a, indices, out=None, mode="raise", block_size=1024, retur
     dense_vector, dense_backend = _to_torch_tensor(a, "a")
     indices_tensor, _ = _to_torch_tensor(indices, "indices")
     dense_vector, indices_tensor, kernel_indices = _prepare_inputs(dense_vector, indices_tensor)
+    _validate_gather_value_dtype(dense_vector, "flagsparse_gather")
+    out_tensor = None
+    if out is not None:
+        out_tensor, _ = _to_torch_tensor(out, "out")
+        if out_tensor.shape != (int(indices_tensor.numel()),):
+            raise ValueError("out shape must match gather output shape")
+        if out_tensor.dtype != dense_vector.dtype:
+            raise TypeError("out dtype must match gather output dtype")
 
     torch.cuda.synchronize()
     start_time = time.perf_counter()
-    sparse_values = _triton_gather_impl(dense_vector, kernel_indices, block_size=block_size)
+    sparse_values = _triton_gather_impl(
+        dense_vector,
+        kernel_indices,
+        out=out_tensor,
+        block_size=block_size,
+    )
     torch.cuda.synchronize()
     execution_time_ms = (time.perf_counter() - start_time) * 1000.0
 
     if out is not None:
-        out_tensor, _ = _to_torch_tensor(out, "out")
-        if out_tensor.shape != sparse_values.shape:
-            raise ValueError("out shape must match gather output shape")
-        if out_tensor.dtype != sparse_values.dtype:
-            raise TypeError("out dtype must match gather output dtype")
-        out_tensor.copy_(sparse_values)
         result = out if dense_backend == "cupy" else out_tensor
     else:
         result = _to_backend_like(sparse_values, a)
@@ -885,6 +960,3 @@ def cusparse_spmv_scatter(
         iters=200,
     )
     return dense_values, execution_time_ms, None
-
-
-

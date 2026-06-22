@@ -118,6 +118,45 @@ def _hipsparse_call(attr_names, context):
     raise RuntimeError(f"{context} is unavailable: missing {names}")
 
 
+def _hipsparse_create_descriptor(attr_names, context, handle=None):
+    ptr_type = type(handle) if handle is not None else None
+    last_error = None
+    for attr_name in attr_names:
+        create_fn = getattr(hipsparse, attr_name, None) if hipsparse is not None else None
+        if create_fn is None:
+            continue
+        try:
+            raw = create_fn()
+            if ptr_type is not None and isinstance(raw, ptr_type):
+                return raw
+            if hasattr(raw, "createRef"):
+                return raw
+            payload = _hip_check_result(raw, context)
+            if payload is not None:
+                return payload
+        except TypeError as exc:
+            last_error = exc
+        except Exception as exc:
+            last_error = exc
+
+        if ptr_type is None:
+            continue
+        descr = ptr_type()
+        attempts = []
+        if hasattr(descr, "createRef"):
+            attempts.append((descr.createRef(),))
+        attempts.append((descr,))
+        for args in attempts:
+            try:
+                payload = _hip_check_result(create_fn(*args), context)
+                return payload if payload is not None else descr
+            except TypeError as exc:
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
+    raise RuntimeError(f"{context} failed: {last_error}") from last_error
+
+
 def _hipsparse_enum_storage(enum_value):
     try:
         raw_value = int(enum_value)
@@ -151,51 +190,11 @@ def _hipsparse_set_spmat_attribute(spmat, attr_name, enum_value):
 
 
 def _hipsparse_create_spsv_descr(handle):
-    ptr_type = type(handle)
-    last_error = None
-    status_only_success = False
-    for attr_name in ("hipsparseSpSV_createDescr", "hipsparseCreateSpSVDescr"):
-        create_fn = getattr(hipsparse, attr_name, None) if hipsparse is not None else None
-        if create_fn is None:
-            continue
-        no_arg_succeeded = False
-        try:
-            raw = create_fn()
-            if isinstance(raw, ptr_type) or hasattr(raw, "createRef"):
-                return raw
-            payload = _hip_check_result(raw, "hipsparseSpSV_createDescr")
-            if payload is not None:
-                return payload
-            status_only_success = True
-            no_arg_succeeded = True
-        except TypeError as exc:
-            last_error = exc
-        except Exception as exc:
-            last_error = exc
-
-        if no_arg_succeeded:
-            continue
-
-        descr = ptr_type()
-        attempts = []
-        if hasattr(descr, "createRef"):
-            attempts.append((descr.createRef(),))
-        attempts.append((descr,))
-        for args in attempts:
-            try:
-                _hip_check_result(create_fn(*args), "hipsparseSpSV_createDescr")
-                return descr
-            except TypeError as exc:
-                last_error = exc
-            except Exception as exc:
-                last_error = exc
-
-    if status_only_success and last_error is None:
-        raise RuntimeError(
-            "hipsparseSpSV_createDescr succeeded without returning a descriptor, "
-            "and no compatible output-argument wrapper was found"
-        )
-    raise RuntimeError(f"hipsparseSpSV_createDescr failed: {last_error}") from last_error
+    return _hipsparse_create_descriptor(
+        ("hipsparseSpSV_createDescr", "hipsparseCreateSpSVDescr"),
+        "hipsparseSpSV_createDescr",
+        handle=handle,
+    )
 
 
 def _hipsparse_destroy_spsv_descr(descr):
@@ -737,19 +736,8 @@ def _run_spsv_csr_ref_hipsparse_prepared(state):
         ("hipsparseSpSV_solve",),
         "hipsparseSpSV_solve",
     )
-    attempts = (
-        (
-            state["handle"],
-            state["op_enum"],
-            state["alpha"],
-            state["spmat"],
-            state["rhs_desc"],
-            state["sol_desc"],
-            state["value_type"],
-            state["alg"],
-            state["spsv_descr"],
-        ),
-        (
+    _hip_check_result(
+        solve_fn(
             state["handle"],
             state["op_enum"],
             state["alpha"],
@@ -761,15 +749,9 @@ def _run_spsv_csr_ref_hipsparse_prepared(state):
             state["spsv_descr"],
             state["workspace"],
         ),
+        "hipsparseSpSV_solve",
     )
-    last_error = None
-    for args in attempts:
-        try:
-            _hip_check_result(solve_fn(*args), "hipsparseSpSV_solve")
-            return state["solution"]
-        except Exception as exc:
-            last_error = exc
-    raise RuntimeError(f"hipsparseSpSV_solve failed: {last_error}") from last_error
+    return state["solution"]
 
 
 def _destroy_spsv_csr_ref_hipsparse_prepared(state):
@@ -1625,6 +1607,44 @@ def _supports_spsv_advanced_nontrans_routes(trans_mode, lower, unit_diagonal, va
     )
 
 
+def _choose_spsv_nontrans_auto_route(
+    n_rows,
+    matrix_stats,
+    *,
+    lower,
+    unit_diagonal,
+    value_dtype,
+):
+    """Heuristic route picker for NON_TRANS triangular solves.
+
+    This is an analysis-time auto selector, not a runtime autotuner.  The goal
+    is to keep default routing predictable while still steering obviously
+    serialized systems and wide-frontier systems onto more suitable kernels.
+    """
+    if bool(unit_diagonal):
+        return "csr_cw"
+    n_rows = int(n_rows)
+    if n_rows <= 0:
+        return "csr_cw"
+
+    # Upper NON sweeps consistently favor ALG4 (csr_smblk), so keep that as the
+    # unconditional AUTO route on the upper side.
+    if not lower:
+        if value_dtype in (torch.float32, torch.float64, torch.complex64, torch.complex128):
+            return "csr_smblk"
+        return "csr_cw"
+
+    # Keep lower NON AUTO predictable as well: default to ALG4 (csr_smblk) for
+    # supported dtypes instead of sending many SuiteSparse-derived cases through
+    # heuristic detours such as level scheduling.
+    if value_dtype in (torch.float32, torch.float64):
+        return "csr_smblk"
+
+    if value_dtype in (torch.complex64, torch.complex128):
+        return "csr_smblk"
+    return "csr_cw"
+
+
 @triton.jit
 def _spsv_levelschd_analysis_kernel(
     indices_ptr,
@@ -2066,14 +2086,37 @@ def _prepare_spsv_csr_system(
         level_meta = None
         nnz_meta = None
         auto_route = None
+        auto_matrix_stats = base_stats
         if requested_route is None and _supports_spsv_advanced_nontrans_routes(
             "N", lower, unit_diagonal, data.dtype
         ):
-            auto_route = "csr_smblk"
+            auto_route = _choose_spsv_nontrans_auto_route(
+                n_rows,
+                base_stats,
+                lower=lower,
+                unit_diagonal=unit_diagonal,
+                value_dtype=data.dtype,
+            )
+            if auto_route in ("csr_cw_levelschd", "csr_nnz_balance"):
+                level_meta = _build_spsv_level_schedule_metadata(
+                    indices64,
+                    indptr64,
+                    n_rows,
+                    lower=lower,
+                    unit_diagonal=unit_diagonal,
+                )
+                auto_matrix_stats = level_meta["matrix_stats"]
+            if auto_route == "csr_nnz_balance":
+                nnz_meta = _build_spsv_nnz_balance_metadata(
+                    indices64,
+                    indptr64,
+                    n_rows,
+                    lower=lower,
+                    unit_diagonal=unit_diagonal,
+                )
 
         effective_route = requested_route if requested_route is not None else auto_route
 
-        explicit_csr_cw = requested_route == "csr_cw"
         if effective_route == "csr_cw":
             default_solve_kind = "csr_cw"
             matrix_stats = base_stats
@@ -2088,6 +2131,7 @@ def _prepare_spsv_csr_system(
                     n_rows,
                     lower=lower,
                     unit_diagonal=unit_diagonal,
+                    minimal=True,
                 )
             elif int(level_meta["level_ptr32"].numel()) > 1 or int(level_meta["indegree_init32"].numel()) > 0:
                 level_meta = _build_spsv_level_schedule_metadata(
@@ -2096,6 +2140,7 @@ def _prepare_spsv_csr_system(
                     n_rows,
                     lower=lower,
                     unit_diagonal=unit_diagonal,
+                    minimal=True,
                 )
             matrix_stats = level_meta["matrix_stats"]
             default_solve_kind = "csr_roc"
@@ -2103,7 +2148,7 @@ def _prepare_spsv_csr_system(
         elif effective_route == "csr_smblk":
             if bool(unit_diagonal):
                 raise ValueError("solve_kind='csr_smblk' currently supports non-unit diagonal only")
-            matrix_stats = base_stats
+            matrix_stats = auto_matrix_stats if requested_route is None else base_stats
             default_solve_kind = "csr_smblk"
             supported_solve_kinds = ("csr_smblk",)
         elif effective_route == "csr_cw_levelschd":
@@ -2127,15 +2172,7 @@ def _prepare_spsv_csr_system(
                     lower=lower,
                     unit_diagonal=unit_diagonal,
                 )
-            if level_meta is None:
-                level_meta = _build_spsv_level_schedule_metadata(
-                    indices64,
-                    indptr64,
-                    n_rows,
-                    lower=lower,
-                    unit_diagonal=unit_diagonal,
-                )
-            matrix_stats = nnz_meta["matrix_stats"]
+            matrix_stats = auto_matrix_stats if requested_route is None else nnz_meta["matrix_stats"]
             default_solve_kind = "csr_nnz_balance"
             supported_solve_kinds = ("csr_nnz_balance",)
         else:
@@ -2146,7 +2183,7 @@ def _prepare_spsv_csr_system(
                 default_solve_kind = "csr_cw"
                 supported_solve_kinds = ("csr_cw",)
             else:
-                matrix_stats = base_stats
+                matrix_stats = auto_matrix_stats
                 default_solve_kind = auto_route if auto_route is not None else "csr_smblk"
                 supported_solve_kinds = (default_solve_kind,)
         route_name = nontrans_variant
@@ -2170,12 +2207,8 @@ def _prepare_spsv_csr_system(
             "default_block_nnz": default_block_nnz,
             "default_max_segments": default_max_segments,
             "storage_view": "csr",
-            "cw_worker_count": (
-                1
-                if explicit_csr_cw
-                else _cw_worker_count(
-                    n_rows, matrix_stats["max_frontier"], matrix_stats["avg_nnz_per_row"], 1
-                )
+            "cw_worker_count": _cw_worker_count(
+                n_rows, matrix_stats["max_frontier"], matrix_stats["avg_nnz_per_row"], 1
             ),
             "matrix_stats": matrix_stats,
             "route_name": route_name,
@@ -2212,39 +2245,26 @@ def _prepare_spsv_csr_system(
     storage_view = _normalize_spsv_storage_view(storage_view)
     if storage_view != "csr_as_csc":
         raise ValueError("TRANS/CONJ SpSV only supports storage_view='csr_as_csc'")
-    data_t, indices_t64, indptr_t64 = _csr_transpose(
-        data,
-        indices64,
-        indptr64,
-        n_rows,
-        n_cols,
-        conjugate=(trans_mode == "C"),
+    matrix_stats = _build_spsv_cw_matrix_stats(indptr64, n_rows)
+    default_block_nnz, default_max_segments = _choose_transpose_family_launch_config(
+        indptr64
     )
-    matrix_stats = _build_spsv_cw_matrix_stats(indptr_t64, n_cols)
-    default_block_nnz, default_max_segments = _auto_spsv_launch_config(
-        indptr_t64
-    )
-    if lower_eff:
-        nontrans_variant = "csr_u_lo_cw" if unit_diagonal else "csr_n_lo_cw"
-    else:
-        nontrans_variant = "csr_u_up_cw" if unit_diagonal else "csr_n_up_cw"
     cw_plan = {
-        "solve_kind": "csr_cw",
-        "default_solve_kind": "csr_cw",
-        "supported_solve_kinds": ("csr_cw",),
-        "nontrans_variant": nontrans_variant,
-        "kernel_data": data_t,
-        "kernel_indices32": indices_t64.to(torch.int32),
-        "kernel_indptr64": indptr_t64,
+        "solve_kind": "transpose_cw",
+        "default_solve_kind": "transpose_cw",
+        "supported_solve_kinds": ("transpose_cw",),
+        "kernel_data": data,
+        "kernel_indices32": indices64.to(torch.int32),
+        "kernel_indptr64": indptr64,
         "lower_eff": lower_eff,
         "default_block_nnz": default_block_nnz,
         "default_max_segments": default_max_segments,
         "cw_worker_count": _cw_worker_count(
-            n_cols, matrix_stats["max_frontier"], matrix_stats["avg_nnz_per_row"], 1
+            n_rows, matrix_stats["max_frontier"], matrix_stats["avg_nnz_per_row"], 1
         ),
         "matrix_stats": matrix_stats,
-        "storage_view": "csr_transpose_materialized",
-        "route_name": "transpose_materialized_cw",
+        "storage_view": storage_view,
+        "route_name": "transpose_cw",
     }
     _attach_spsv_complex_plan_views(cw_plan)
     return cw_plan
