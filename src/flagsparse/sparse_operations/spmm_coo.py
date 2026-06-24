@@ -4,6 +4,7 @@ import ctypes
 
 from . import _common as _common_mod
 from ._common import *
+from ._spmm_dcu_tuning import resolve_spmm_dcu_launch_strategy
 from .spmm_csr import (
     SUPPORTED_SPMM_VALUE_DTYPES,
     _select_spmm_alg1_warp_and_factor,
@@ -1097,6 +1098,7 @@ def _run_spmm_coo_route(
     route="rowrun",
     op=None,
     transpose=None,
+    launch_strategy=None,
 ):
     route = _normalize_spmm_coo_route(route)
     op_explicit = op is not None
@@ -1140,6 +1142,26 @@ def _run_spmm_coo_route(
         output_dtype,
         _,
     ) = _prepare_spmm_coo_canonical_inputs(data, row, col, B, shape)
+    if launch_strategy is not None:
+        counts = (
+            torch.bincount(canonical_row.to(torch.int64), minlength=int(n_rows))
+            if int(canonical_data.numel()) > 0 and int(n_rows) > 0
+            else None
+        )
+        max_row_nnz = int(torch.max(counts).item()) if counts is not None and counts.numel() else 0
+        strategy_launch = resolve_spmm_dcu_launch_strategy(
+            launch_strategy,
+            n_dense_cols=n_dense_cols,
+            max_row_nnz=max_row_nnz,
+            nnz=int(canonical_data.numel()),
+            fmt="coo",
+            dtype=canonical_data.dtype,
+            device=canonical_data.device,
+        )
+        block_n = strategy_launch.block_n if strategy_launch.block_n is not None else block_n
+        block_nnz = strategy_launch.block_nnz if strategy_launch.block_nnz is not None else block_nnz
+    else:
+        strategy_launch = None
 
     result = _run_spmm_coo_canonical_route(
         canonical_data,
@@ -1169,6 +1191,7 @@ def _run_spmm_coo_route(
             "symbolic_ms": symbolic_ms,
             "compute_ms": compute_ms,
             "op_total_ms": op_total_ms,
+            "launch_strategy": None if strategy_launch is None else strategy_launch.as_dict(),
         }
     if return_time and return_meta:
         return C, op_total_ms, meta
@@ -1191,6 +1214,7 @@ def flagsparse_spmm_coo(
     transpose=None,
     op=None,
     return_meta=False,
+    launch_strategy=None,
 ):
     """COO SpMM using a native Triton COO row-run kernel by default.
 
@@ -1211,6 +1235,7 @@ def flagsparse_spmm_coo(
         route="rowrun",
         op=op,
         transpose=transpose,
+        launch_strategy=launch_strategy,
     )
 
 

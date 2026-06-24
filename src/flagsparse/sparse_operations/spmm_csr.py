@@ -6,6 +6,7 @@ import math
 from . import _common as _common_mod
 from ._common import *
 from ._alpha_spmm_alg1_common import _select_alpha_spmm_alg1_warp_and_factor
+from ._spmm_dcu_tuning import resolve_spmm_dcu_launch_strategy
 from dataclasses import dataclass
 
 hip = _common_mod.hip
@@ -473,6 +474,8 @@ def _resolve_spmm_base_triton_launch(
     block_n=None,
     block_nnz=None,
     max_segments=None,
+    num_warps=None,
+    num_stages=None,
     device_props=None,
 ):
     launch = _resolve_spmm_alg1_launch_config(
@@ -512,18 +515,25 @@ def _resolve_spmm_base_triton_launch(
     elif dtype in (torch.float16, torch.bfloat16, torch.float32, torch.complex64):
         desired_warps = min(desired_warps, 16)
 
-    num_warps = _clip_spmm_base_num_warps(desired_warps, device_props)
+    resolved_num_warps = _clip_spmm_base_num_warps(desired_warps, device_props)
     if n_dense_cols > 64 or block_n >= 128:
-        num_stages = 1
+        resolved_num_stages = 1
     elif dtype in (torch.float64, torch.complex128) and max_row_nnz >= 512:
-        num_stages = 1
+        resolved_num_stages = 1
     else:
-        num_stages = 2
+        resolved_num_stages = 2
+
+    if num_warps is not None:
+        resolved_num_warps = _clip_spmm_base_num_warps(num_warps, device_props)
+    if num_stages is not None:
+        if int(num_stages) <= 0:
+            raise ValueError("num_stages must be positive when provided")
+        resolved_num_stages = int(num_stages)
 
     return {
         **launch,
-        "num_warps": int(num_warps),
-        "num_stages": int(num_stages),
+        "num_warps": int(resolved_num_warps),
+        "num_stages": int(resolved_num_stages),
     }
 
 
@@ -3316,6 +3326,9 @@ def flagsparse_spmm_csr(
     block_n=None,
     block_nnz=None,
     max_segments=None,
+    num_warps=None,
+    num_stages=None,
+    launch_strategy=None,
     out=None,
     return_time=False,
     transpose=None,
@@ -3344,6 +3357,10 @@ def flagsparse_spmm_csr(
         raise ValueError("block_nnz must be positive when provided")
     if max_segments is not None and max_segments <= 0:
         raise ValueError("max_segments must be positive when provided")
+    if num_warps is not None and num_warps <= 0:
+        raise ValueError("num_warps must be positive when provided")
+    if num_stages is not None and num_stages <= 0:
+        raise ValueError("num_stages must be positive when provided")
 
     (
         data,
@@ -3417,6 +3434,22 @@ def flagsparse_spmm_csr(
         else 0
     )
     device_props = _normalize_spmm_base_device_props(data.device)
+    if launch_strategy is not None:
+        strategy_launch = resolve_spmm_dcu_launch_strategy(
+            launch_strategy,
+            n_dense_cols=n_dense_cols,
+            max_row_nnz=max_row_nnz,
+            nnz=int(kernel_indptr[-1].item()) if kernel_indptr.numel() else 0,
+            fmt="csr",
+            dtype=data.dtype,
+            device=data.device,
+        )
+        block_n = strategy_launch.block_n if strategy_launch.block_n is not None else block_n
+        block_nnz = strategy_launch.block_nnz if strategy_launch.block_nnz is not None else block_nnz
+        num_warps = strategy_launch.num_warps if strategy_launch.num_warps is not None else num_warps
+        num_stages = strategy_launch.num_stages if strategy_launch.num_stages is not None else num_stages
+    else:
+        strategy_launch = None
     launch = _resolve_spmm_base_triton_launch(
         data.dtype,
         n_dense_cols,
@@ -3424,6 +3457,8 @@ def flagsparse_spmm_csr(
         block_n=block_n,
         block_nnz=block_nnz,
         max_segments=max_segments,
+        num_warps=num_warps,
+        num_stages=num_stages,
         device_props=device_props,
     )
 
@@ -3457,6 +3492,8 @@ def flagsparse_spmm_csr(
             "compute_ms": compute_ms,
             "op_total_ms": op_total_ms,
             "op": _spmm_op_to_name(op_code),
+            "launch": dict(launch),
+            "launch_strategy": None if strategy_launch is None else strategy_launch.as_dict(),
         }
         if return_time:
             return C, op_total_ms, meta

@@ -100,6 +100,11 @@ __all__ = [
     "SPMM_CSR_ALGORITHMS",
     "SpmmCsrAlgorithm",
     "SpmmCsrAlgorithmUnavailable",
+    "SPMM_DCU_TUNING_STRATEGIES",
+    "SpmmDcuLaunchStrategy",
+    "get_spmm_backend_info",
+    "normalize_spmm_dcu_strategy",
+    "resolve_spmm_dcu_launch_strategy",
     "create_csr_matrix",
     "create_coo_matrix",
     "create_csc_matrix",
@@ -219,6 +224,11 @@ _OPS_EXPORTS = {
     "SPMM_CSR_ALGORITHMS",
     "SpmmCsrAlgorithm",
     "SpmmCsrAlgorithmUnavailable",
+    "SPMM_DCU_TUNING_STRATEGIES",
+    "SpmmDcuLaunchStrategy",
+    "get_spmm_backend_info",
+    "normalize_spmm_dcu_strategy",
+    "resolve_spmm_dcu_launch_strategy",
 }
 
 _FORMAT_EXPORTS = {

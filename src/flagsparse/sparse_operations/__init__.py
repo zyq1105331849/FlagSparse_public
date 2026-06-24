@@ -1,6 +1,13 @@
 """FlagSparse sparse operations (gather, scatter, SpMV, SpMM, SpGEMM, SDDMM, SpSM)."""
 
 from ._common import SUPPORTED_INDEX_DTYPES, SUPPORTED_VALUE_DTYPES, cp, cpx_sparse
+from ._spmm_dcu_tuning import (
+    SPMM_DCU_TUNING_STRATEGIES,
+    SpmmDcuLaunchStrategy,
+    get_spmm_backend_info,
+    normalize_spmm_dcu_strategy,
+    resolve_spmm_dcu_launch_strategy,
+)
 from .alpha_spmm_alg1 import (
     PreparedAlphaSpmmAlg1,
     alpha_spmm_alg1_tle_opt_unavailable_reason,
@@ -127,6 +134,8 @@ __all__ = [
     "FlagSparseSpSVWorkspace",
     "SUPPORTED_INDEX_DTYPES",
     "SUPPORTED_VALUE_DTYPES",
+    "SPMM_DCU_TUNING_STRATEGIES",
+    "SpmmDcuLaunchStrategy",
     "benchmark_gather_case",
     "benchmark_hipsparse_gather",
     "benchmark_hipsparse_scatter",
@@ -144,6 +153,7 @@ __all__ = [
     "comprehensive_spmm_test",
     "comprehensive_spsm_test",
     "flagsparse_gather",
+    "get_spmm_backend_info",
     "flagsparse_alpha_spmm_alg1",
     "flagsparse_alpha_spmm_alg1_tle",
     "flagsparse_alpha_spmm_alg1_tle_opt",
@@ -205,6 +215,8 @@ __all__ = [
     "prepare_spmv_csr",
     "pytorch_index_gather",
     "pytorch_index_scatter",
+    "normalize_spmm_dcu_strategy",
+    "resolve_spmm_dcu_launch_strategy",
     "resolve_spmm_csr_algorithm",
     "SPMM_CSR_ALGORITHMS",
     "SpmmCsrAlgorithm",
