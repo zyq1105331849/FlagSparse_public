@@ -10,8 +10,7 @@ import triton.language as tl
 
 SUPPORTED_SCATTER_VALUE_DTYPES = SUPPORTED_VALUE_DTYPES
 DEFAULT_GATHER_BLOCK_SIZE = 256
-DEFAULT_GATHER_MAX_PROGRAMS = 2
-DEFAULT_GATHER_NUM_WARPS = 8
+DEFAULT_GATHER_NUM_WARPS = 4
 
 
 def _scatter_dtype_error_message():
@@ -33,13 +32,11 @@ def _gather_real_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    num_programs = tl.num_programs(axis=0)
-    for block_start in tl.range(pid * BLOCK_SIZE, nnz, num_programs * BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < nnz
-        indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
-        gathered_values = tl.load(dense_values_ptr + indices, mask=mask, other=0.0)
-        tl.store(sparse_values_ptr + offsets, gathered_values, mask=mask)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < nnz
+    indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
+    gathered_values = tl.load(dense_values_ptr + indices, mask=mask, other=0.0)
+    tl.store(sparse_values_ptr + offsets, gathered_values, mask=mask)
 
 
 @triton.jit
@@ -51,24 +48,22 @@ def _gather_complex_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    num_programs = tl.num_programs(axis=0)
-    for block_start in tl.range(pid * BLOCK_SIZE, nnz, num_programs * BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < nnz
-        indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < nnz
+    indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
 
-        dense_offsets = indices * 2
-        sparse_offsets = offsets * 2
+    dense_offsets = indices * 2
+    sparse_offsets = offsets * 2
 
-        gathered_real = tl.load(
-            dense_values_ri_ptr + dense_offsets, mask=mask, other=0.0
-        )
-        gathered_imag = tl.load(
-            dense_values_ri_ptr + dense_offsets + 1, mask=mask, other=0.0
-        )
+    gathered_real = tl.load(
+        dense_values_ri_ptr + dense_offsets, mask=mask, other=0.0
+    )
+    gathered_imag = tl.load(
+        dense_values_ri_ptr + dense_offsets + 1, mask=mask, other=0.0
+    )
 
-        tl.store(sparse_values_ri_ptr + sparse_offsets, gathered_real, mask=mask)
-        tl.store(sparse_values_ri_ptr + sparse_offsets + 1, gathered_imag, mask=mask)
+    tl.store(sparse_values_ri_ptr + sparse_offsets, gathered_real, mask=mask)
+    tl.store(sparse_values_ri_ptr + sparse_offsets + 1, gathered_imag, mask=mask)
 
 
 @triton.jit
@@ -129,9 +124,7 @@ def _triton_gather_impl(
             raise TypeError("out dtype must match gather output dtype")
         return out
 
-    grid = lambda meta: (
-        min(DEFAULT_GATHER_MAX_PROGRAMS, triton.cdiv(nnz, meta["BLOCK_SIZE"])),
-    )
+    grid = lambda meta: (triton.cdiv(nnz, meta["BLOCK_SIZE"]),)
 
     if not _is_complex_dtype(dense_vector.dtype):
         sparse_values = out
@@ -298,6 +291,12 @@ _CUSPARSE_LIB = None
 _CUSPARSE_LIB_LOAD_ERROR = None
 
 
+def _cusparse_native_gather_skip_reason(value_dtype):
+    if value_dtype == torch.bfloat16:
+        return "bfloat16 is not supported by native cusparseGather; skipped"
+    return None
+
+
 def _cuda_data_type_from_torch(torch_dtype):
     mapping = {
         torch.float16: _CUDA_R_16F,
@@ -388,19 +387,25 @@ def _check_cusparse_status(status, op_name):
         raise RuntimeError(f"{op_name} failed with cuSPARSE status {int(status)}")
 
 
-def _set_cusparse_stream(lib, handle):
+def _set_cusparse_stream(lib, handle, *, strict=False):
     if not hasattr(lib, "cusparseSetStream"):
+        if strict:
+            raise RuntimeError("Loaded cuSPARSE library does not export cusparseSetStream")
         return
     try:
         stream = torch.cuda.current_stream()
         stream_ptr = getattr(stream, "cuda_stream", None)
         if stream_ptr is None:
+            if strict:
+                raise RuntimeError("Could not obtain the current CUDA stream pointer")
             return
         _check_cusparse_status(
             lib.cusparseSetStream(handle, ctypes.c_void_p(int(stream_ptr))),
             "cusparseSetStream",
         )
     except Exception:
+        if strict:
+            raise
         return
 
 
@@ -408,7 +413,7 @@ class _PreparedCusparseNativeGather:
     def __init__(self, dense_vector, indices, out=None):
         dense_vector, indices, _ = _prepare_inputs(dense_vector, indices)
         _validate_gather_value_dtype(dense_vector, "cusparse_native_gather")
-        skip_reason = _cusparse_baseline_skip_reason(dense_vector.dtype)
+        skip_reason = _cusparse_native_gather_skip_reason(dense_vector.dtype)
         if skip_reason:
             raise RuntimeError(skip_reason)
 
