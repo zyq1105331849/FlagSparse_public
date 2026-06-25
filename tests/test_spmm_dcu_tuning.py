@@ -367,9 +367,6 @@ def _run_one_csr(path, value_dtype, index_dtype, dense_cols, alg, strategy, warm
         ok, reason = _tle_availability(alg)
         if not ok:
             return _empty_row(path, "csr", alg, route, strategy, value_dtype, index_dtype, dense_cols, shape, stats, launch, warmup, iters, "SKIP", reason or "TLE algorithm is unavailable")
-    if alg != "csr_base" and strategy != "default":
-        return _empty_row(path, "csr", alg, route, strategy, value_dtype, index_dtype, dense_cols, shape, stats, launch, warmup, iters, "SKIP", "strategy launch overrides are currently supported only by csr_base for CSR")
-
     B = _build_csr_dense_matrix(shape[1], dense_cols, value_dtype, data.device)
     ref = None
     ref_ms = None
@@ -383,7 +380,11 @@ def _run_one_csr(path, value_dtype, index_dtype, dense_cols, alg, strategy, warm
         process_ms = (time.perf_counter() - t0) * 1000.0 - gpu_ms
         max_error = _scaled_error(out, ref, value_dtype) if ref is not None else None
         status = "PASS" if max_error is None or max_error <= 1.0 else "FAIL"
-        reason = ""
+        reason = (
+            "strategy not injected into this CSR algorithm yet"
+            if alg != "csr_base" and strategy != "default"
+            else ""
+        )
     except Exception as exc:
         out = None
         gpu_ms = None
@@ -556,6 +557,15 @@ def main(argv=None):
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--no-ref", action="store_true", help="Skip PyTorch reference timing and correctness checks.")
+    parser.add_argument(
+        "--ref-mode",
+        default="baseline",
+        choices=("none", "baseline", "all"),
+        help=(
+            "Reference policy: none skips PyTorch reference; baseline checks only "
+            "default csr_base/coo_rowrun rows; all checks every row. Default: baseline."
+        ),
+    )
     args = parser.parse_args(argv)
 
     formats = list(FORMAT_NAMES) if args.format == "all" else [args.format]
@@ -572,14 +582,31 @@ def main(argv=None):
     paths = _resolve_paths(args.input)
     if not paths:
         raise FileNotFoundError(f"no .mtx files found from --input: {args.input}")
+    ref_mode = "none" if args.no_ref else args.ref_mode
 
     backend = get_spmm_backend_info()
+    planned_rows = 0
+    for alg in algs:
+        if alg in CSR_ALGS and "csr" in formats:
+            planned_rows += len(paths) * len(value_dtypes) * len(index_dtypes) * len(dense_cols_values) * len(strategies)
+        if alg in COO_ALGS and "coo" in formats:
+            planned_rows += len(paths) * len(value_dtypes) * len(index_dtypes) * len(dense_cols_values) * len(strategies)
     print(
         f"SpMM DCU tuning sweep: backend={backend['backend']} "
-        f"device={backend['device_name'] or 'N/A'} warp={backend['device_warp_size']}"
+        f"device={backend['device_name'] or 'N/A'} warp={backend['device_warp_size']}",
+        flush=True,
+    )
+    print(
+        f"Plan: matrices={len(paths)} formats={','.join(formats)} algs={len(algs)} "
+        f"strategies={len(strategies)} dense_cols={dense_cols_values} "
+        f"value_dtypes={[ _dtype_name(v) for v in value_dtypes ]} "
+        f"index_dtypes={[ _dtype_name(v) for v in index_dtypes ]} "
+        f"rows={planned_rows} ref_mode={ref_mode} warmup={args.warmup} iters={args.iters}",
+        flush=True,
     )
     csr_rows = []
     coo_rows = []
+    row_index = 0
     for path in paths:
         for value_dtype in value_dtypes:
             for index_dtype in index_dtypes:
@@ -587,6 +614,19 @@ def main(argv=None):
                     for strategy in strategies:
                         for alg in algs:
                             if alg in CSR_ALGS and "csr" in formats:
+                                row_index += 1
+                                run_ref = ref_mode == "all" or (
+                                    ref_mode == "baseline"
+                                    and alg == "csr_base"
+                                    and strategy == "default"
+                                )
+                                print(
+                                    f"[{row_index}/{planned_rows}] START CSR "
+                                    f"matrix={os.path.basename(path)} alg={alg} strategy={strategy} "
+                                    f"dtype={_dtype_name(value_dtype)} index={_dtype_name(index_dtype)} "
+                                    f"N={dense_cols} ref={'yes' if run_ref else 'no'}",
+                                    flush=True,
+                                )
                                 row = _run_one_csr(
                                     path,
                                     value_dtype,
@@ -596,11 +636,29 @@ def main(argv=None):
                                     strategy,
                                     args.warmup,
                                     args.iters,
-                                    not args.no_ref,
+                                    run_ref,
                                 )
                                 csr_rows.append(row)
-                                print(f"CSR {row['matrix']} {alg} {strategy} N={dense_cols}: {row['status']} {row['time_ms'] or ''}")
+                                print(
+                                    f"[{row_index}/{planned_rows}] DONE  CSR {row['matrix']} "
+                                    f"{alg} {strategy} N={dense_cols}: {row['status']} "
+                                    f"{row['time_ms'] or ''} {row['skip_reason'] or ''}",
+                                    flush=True,
+                                )
                             if alg in COO_ALGS and "coo" in formats:
+                                row_index += 1
+                                run_ref = ref_mode == "all" or (
+                                    ref_mode == "baseline"
+                                    and alg == "coo_rowrun"
+                                    and strategy == "default"
+                                )
+                                print(
+                                    f"[{row_index}/{planned_rows}] START COO "
+                                    f"matrix={os.path.basename(path)} alg={alg} strategy={strategy} "
+                                    f"dtype={_dtype_name(value_dtype)} index={_dtype_name(index_dtype)} "
+                                    f"N={dense_cols} ref={'yes' if run_ref else 'no'}",
+                                    flush=True,
+                                )
                                 row = _run_one_coo(
                                     path,
                                     value_dtype,
@@ -610,10 +668,15 @@ def main(argv=None):
                                     strategy,
                                     args.warmup,
                                     args.iters,
-                                    not args.no_ref,
+                                    run_ref,
                                 )
                                 coo_rows.append(row)
-                                print(f"COO {row['matrix']} {alg} {strategy} N={dense_cols}: {row['status']} {row['time_ms'] or ''}")
+                                print(
+                                    f"[{row_index}/{planned_rows}] DONE  COO {row['matrix']} "
+                                    f"{alg} {strategy} N={dense_cols}: {row['status']} "
+                                    f"{row['time_ms'] or ''} {row['skip_reason'] or ''}",
+                                    flush=True,
+                                )
 
     out_dir = os.path.abspath(args.out_dir)
     csr_path = os.path.join(out_dir, "spmm_dcu_tuning_csr_raw.csv")
@@ -622,9 +685,9 @@ def main(argv=None):
     _write_csv(csr_path, csr_rows, RAW_FIELDS)
     _write_csv(coo_path, coo_rows, RAW_FIELDS)
     _write_csv(summary_path, _best_summary(csr_rows + coo_rows), SUMMARY_FIELDS)
-    print(f"Wrote CSR raw: {csr_path}")
-    print(f"Wrote COO raw: {coo_path}")
-    print(f"Wrote summary: {summary_path}")
+    print(f"Wrote CSR raw: {csr_path}", flush=True)
+    print(f"Wrote COO raw: {coo_path}", flush=True)
+    print(f"Wrote summary: {summary_path}", flush=True)
 
 
 if __name__ == "__main__":
