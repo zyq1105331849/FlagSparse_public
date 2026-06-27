@@ -374,6 +374,28 @@ def _skip_row(
 def _time_cusparse(data, indices, indptr, shape, B, op, warmup, iters, layout="row"):
     if data.dtype not in CUSPARSE_DTYPES:
         return None, None, "dtype not supported by optional sparse reference"
+    if getattr(torch.version, "hip", None) is not None:
+        if op != "non":
+            return None, None, "direct hipSPARSE CSR SpMM reference currently supports op=non only"
+        if layout != "row":
+            return None, None, "direct hipSPARSE CSR SpMM reference currently supports row-major dense layout only"
+        try:
+            sparse_ref = spmm_ops._benchmark_spmm_csr_sparse_ref(
+                data,
+                indices,
+                indptr,
+                B,
+                shape,
+                warmup=warmup,
+                iters=iters,
+            )
+        except Exception as exc:
+            return None, None, str(exc)
+        if sparse_ref["backend"] is None:
+            return None, None, sparse_ref["reason"]
+        backend = sparse_ref["backend"]
+        reason = None if backend == "hipsparse" else f"backend={backend}"
+        return sparse_ref["values"], sparse_ref["ms"], reason
     try:
         import cupy as cp
         import cupyx.scipy.sparse as cpx_sparse
