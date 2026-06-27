@@ -1,8 +1,8 @@
-"""DCU/HIP-aware SpMM launch strategy helpers.
+"""Small DCU/HIP-aware SpMM launch strategy helpers.
 
-The strategies in this module are intentionally conservative candidates for
-benchmark sweeps.  They do not change CUDA defaults by themselves; callers can
-opt in to a strategy and pass the returned launch overrides to CSR/COO SpMM.
+This is deliberately not a large autotune grid.  ``default`` means the current
+operator heuristic, while ``dcu`` applies one mild HIP/DCU-biased adjustment for
+the kernels that accept explicit launch overrides.
 """
 
 from dataclasses import dataclass
@@ -12,12 +12,18 @@ from ._common import torch
 
 SPMM_DCU_TUNING_STRATEGIES = (
     "default",
-    "dcu_small_n",
-    "dcu_balanced",
-    "dcu_long_row",
-    "dcu_wide_n",
-    "dcu_wave64",
+    "dcu",
 )
+
+_SPMM_DCU_STRATEGY_ALIASES = {
+    "hip": "dcu",
+    "dcu_auto": "dcu",
+    "dcu_small_n": "dcu",
+    "dcu_balanced": "dcu",
+    "dcu_long_row": "dcu",
+    "dcu_wide_n": "dcu",
+    "dcu_wave64": "dcu",
+}
 
 
 @dataclass(frozen=True)
@@ -46,6 +52,7 @@ class SpmmDcuLaunchStrategy:
 
 def normalize_spmm_dcu_strategy(strategy):
     token = "default" if strategy is None else str(strategy).strip().lower()
+    token = _SPMM_DCU_STRATEGY_ALIASES.get(token, token)
     if token not in SPMM_DCU_TUNING_STRATEGIES:
         allowed = ", ".join(SPMM_DCU_TUNING_STRATEGIES)
         raise ValueError(f"unsupported SpMM tuning strategy {strategy!r}; allowed: {allowed}")
@@ -107,35 +114,23 @@ def resolve_spmm_dcu_launch_strategy(
 
     if strategy == "default":
         pass
-    elif strategy == "dcu_small_n":
-        block_n = min(32, _round_up_to(dense_n, 8))
-        block_nnz = 64 if fmt == "csr" else 128
-        num_warps = 1
-        num_stages = 1
-    elif strategy == "dcu_balanced":
-        block_n = 32 if dense_n <= 32 else 64
-        block_nnz = 128 if fmt == "csr" else 256
-        num_warps = 2 if dense_n <= 32 else 4
-        num_stages = 1
-    elif strategy == "dcu_long_row":
-        block_n = 32 if dense_n <= 32 else 64
-        if max_row_nnz >= 1024 or nnz >= 1_000_000:
-            block_nnz = 512
+    elif strategy == "dcu":
+        # DCU/BW-class HIP devices generally expose wavefront=64.  Keep dense-N
+        # tiles modest to reduce lane waste on small dense widths, and avoid the
+        # very aggressive long-row candidates that caused excessive runtimes in
+        # broad matrix sweeps.
+        if dense_n <= 16:
+            block_n = 16
+            num_warps = 1
+        elif dense_n <= 64:
+            block_n = 32 if wave >= 64 else 64
+            num_warps = 2
         else:
-            block_nnz = 256
-        num_warps = 4 if dense_n <= 64 else 8
-        num_stages = 1
-    elif strategy == "dcu_wide_n":
-        block_n = 64 if dense_n <= 64 else 128
-        block_nnz = 128 if fmt == "csr" else 256
-        num_warps = 4 if dense_n <= 64 else 8
-        num_stages = 1
-    elif strategy == "dcu_wave64":
-        block_n = min(128, max(16, _round_up_to(min(dense_n, wave * 2), 16)))
-        block_nnz = 64 if max_row_nnz <= wave else 128
+            block_n = 64
+            num_warps = 4
+        block_nnz = 64 if fmt == "csr" else 128
         if max_row_nnz >= 512 or nnz >= 1_000_000:
-            block_nnz = 256
-        num_warps = 1 if dense_n <= 16 else (2 if dense_n <= 64 else 4)
+            block_nnz = 128 if fmt == "csr" else 256
         num_stages = 1
 
     return SpmmDcuLaunchStrategy(

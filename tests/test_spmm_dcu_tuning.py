@@ -32,6 +32,7 @@ import flagsparse.sparse_operations.spmm_coo as spmm_coo_ops
 from flagsparse.sparse_operations._spmm_dcu_tuning import (
     SPMM_DCU_TUNING_STRATEGIES,
     get_spmm_backend_info,
+    normalize_spmm_dcu_strategy,
     resolve_spmm_dcu_launch_strategy,
 )
 
@@ -58,6 +59,8 @@ CSR_ALGS = (
 )
 COO_ALGS = ("coo_rowrun", "coo_atomic")
 ALL_ALGS = CSR_ALGS + COO_ALGS
+DEFAULT_TUNING_ALGS = ("csr_base", "coo_rowrun", "coo_atomic")
+STRATEGY_INJECTABLE_ALGS = ("csr_base", "coo_rowrun", "coo_atomic")
 DTYPE_MAP = {
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
@@ -136,6 +139,24 @@ def _parse_names(value, allowed, option_name):
             f"allowed: all,{','.join(allowed)}"
         )
     return names
+
+
+def _parse_strategy_names(value):
+    token = str(value).strip().lower()
+    if token == "all":
+        return list(SPMM_DCU_TUNING_STRATEGIES)
+    names = [item.strip().lower() for item in token.split(",") if item.strip()]
+    if not names:
+        raise ValueError("--strategy must not be empty")
+    try:
+        normalized = [normalize_spmm_dcu_strategy(name) for name in names]
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    deduped = []
+    for name in normalized:
+        if name not in deduped:
+            deduped.append(name)
+    return deduped
 
 
 def _parse_dtypes(value):
@@ -528,6 +549,8 @@ def _best_summary(rows):
 
 
 def _expand_algs(formats, alg_names):
+    if alg_names == ["default"] or alg_names == ["stable"]:
+        return [name for name in DEFAULT_TUNING_ALGS if (name in CSR_ALGS and "csr" in formats) or (name in COO_ALGS and "coo" in formats)]
     if alg_names == ["all"]:
         names = []
         if "csr" in formats:
@@ -544,10 +567,14 @@ def _expand_algs(formats, alg_names):
     return expanded
 
 
+def _should_run_alg_strategy(alg, strategy):
+    return strategy == "default" or alg in STRATEGY_INJECTABLE_ALGS
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Sweep DCU/HIP-aware SpMM tuning strategies.")
     parser.add_argument("--format", default="all", choices=("csr", "coo", "all"))
-    parser.add_argument("--alg", default="all", help=f"all or comma list from: {','.join(ALL_ALGS)}")
+    parser.add_argument("--alg", default="default", help=f"default, stable, all, or comma list from: {','.join(ALL_ALGS)}")
     parser.add_argument("--strategy", default="all", help=f"all or comma list from: {','.join(SPMM_DCU_TUNING_STRATEGIES)}")
     parser.add_argument("--dense-cols", default="8,16,32,64,128")
     parser.add_argument("--value-dtypes", default="float32,float64")
@@ -571,11 +598,7 @@ def main(argv=None):
     formats = list(FORMAT_NAMES) if args.format == "all" else [args.format]
     alg_tokens = [token.strip().lower() for token in str(args.alg).split(",") if token.strip()]
     algs = _expand_algs(formats, alg_tokens or ["all"])
-    strategies = (
-        list(SPMM_DCU_TUNING_STRATEGIES)
-        if str(args.strategy).strip().lower() == "all"
-        else _parse_names(args.strategy, SPMM_DCU_TUNING_STRATEGIES, "--strategy")
-    )
+    strategies = _parse_strategy_names(args.strategy)
     dense_cols_values = _parse_int_csv(args.dense_cols, "--dense-cols")
     value_dtypes = _parse_dtypes(args.value_dtypes)
     index_dtypes = _parse_index_dtypes(args.index_dtypes)
@@ -588,9 +611,9 @@ def main(argv=None):
     planned_rows = 0
     for alg in algs:
         if alg in CSR_ALGS and "csr" in formats:
-            planned_rows += len(paths) * len(value_dtypes) * len(index_dtypes) * len(dense_cols_values) * len(strategies)
+            planned_rows += len(paths) * len(value_dtypes) * len(index_dtypes) * len(dense_cols_values) * sum(1 for strategy in strategies if _should_run_alg_strategy(alg, strategy))
         if alg in COO_ALGS and "coo" in formats:
-            planned_rows += len(paths) * len(value_dtypes) * len(index_dtypes) * len(dense_cols_values) * len(strategies)
+            planned_rows += len(paths) * len(value_dtypes) * len(index_dtypes) * len(dense_cols_values) * sum(1 for strategy in strategies if _should_run_alg_strategy(alg, strategy))
     print(
         f"SpMM DCU tuning sweep: backend={backend['backend']} "
         f"device={backend['device_name'] or 'N/A'} warp={backend['device_warp_size']}",
@@ -613,6 +636,8 @@ def main(argv=None):
                 for dense_cols in dense_cols_values:
                     for strategy in strategies:
                         for alg in algs:
+                            if not _should_run_alg_strategy(alg, strategy):
+                                continue
                             if alg in CSR_ALGS and "csr" in formats:
                                 row_index += 1
                                 run_ref = ref_mode == "all" or (

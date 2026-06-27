@@ -282,7 +282,19 @@ def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
     indptr = torch.tensor(indptr_list, dtype=torch.int64, device=device)
     return data, indices, indptr, (n_rows, n_cols)
 
-def _build_pytorch_reference(data, indices, indptr, shape, B):
+def _apply_torch_sparse_op(sparse_matrix, B, op):
+    if op == "non":
+        return torch.sparse.mm(sparse_matrix, B)
+    if op == "trans":
+        return torch.sparse.mm(sparse_matrix.transpose(0, 1), B)
+    if op == "conj":
+        mat = sparse_matrix.conj() if torch.is_complex(sparse_matrix) else sparse_matrix
+        return torch.sparse.mm(mat.transpose(0, 1), B)
+    raise ValueError(f"unsupported op: {op}")
+
+
+def _build_pytorch_reference(data, indices, indptr, shape, B, op="non"):
+    op = ast_ops._spmm_op_to_name(op)
     device = data.device
     n_rows = shape[0]
     indptr64 = indptr.to(torch.int64)
@@ -294,18 +306,18 @@ def _build_pytorch_reference(data, indices, indptr, shape, B):
 
     try:
         csr_pt = torch.sparse_csr_tensor(indptr64, indices64, data, size=shape, device=device)
-        timing_op = lambda: torch.sparse.mm(csr_pt, B)
+        timing_op = lambda: _apply_torch_sparse_op(csr_pt, B, op)
         if data.dtype in (torch.float16, torch.bfloat16):
             csr_ref = torch.sparse_csr_tensor(indptr64, indices64, data.to(torch.float32), size=shape, device=device)
-            ref = torch.sparse.mm(csr_ref, B.to(torch.float32)).to(data.dtype)
+            ref = _apply_torch_sparse_op(csr_ref, B.to(torch.float32), op).to(data.dtype)
         elif data.dtype == torch.float32:
             csr_ref = torch.sparse_csr_tensor(indptr64, indices64, data.to(torch.float64), size=shape, device=device)
-            ref = torch.sparse.mm(csr_ref, B.to(torch.float64)).to(data.dtype)
+            ref = _apply_torch_sparse_op(csr_ref, B.to(torch.float64), op).to(data.dtype)
         elif data.dtype == torch.complex64:
             csr_ref = torch.sparse_csr_tensor(indptr64, indices64, data.to(torch.complex128), size=shape, device=device)
-            ref = torch.sparse.mm(csr_ref, B.to(torch.complex128)).to(data.dtype)
+            ref = _apply_torch_sparse_op(csr_ref, B.to(torch.complex128), op).to(data.dtype)
         else:
-            ref = torch.sparse.mm(csr_pt, B)
+            ref = _apply_torch_sparse_op(csr_pt, B, op)
         return ref, timing_op, "CSR"
     except Exception:
         coo = torch.sparse_coo_tensor(
@@ -314,15 +326,15 @@ def _build_pytorch_reference(data, indices, indptr, shape, B):
             shape,
             device=device,
         ).coalesce()
-        timing_op = lambda: torch.sparse.mm(coo, B)
+        timing_op = lambda: _apply_torch_sparse_op(coo, B, op)
         if data.dtype in (torch.float16, torch.bfloat16):
-            ref = torch.sparse.mm(coo.to(torch.float32), B.to(torch.float32)).to(data.dtype)
+            ref = _apply_torch_sparse_op(coo.to(torch.float32), B.to(torch.float32), op).to(data.dtype)
         elif data.dtype == torch.float32:
-            ref = torch.sparse.mm(coo.to(torch.float64), B.to(torch.float64)).to(data.dtype)
+            ref = _apply_torch_sparse_op(coo.to(torch.float64), B.to(torch.float64), op).to(data.dtype)
         elif data.dtype == torch.complex64:
-            ref = torch.sparse.mm(coo.to(torch.complex128), B.to(torch.complex128)).to(data.dtype)
+            ref = _apply_torch_sparse_op(coo.to(torch.complex128), B.to(torch.complex128), op).to(data.dtype)
         else:
-            ref = torch.sparse.mm(coo, B)
+            ref = _apply_torch_sparse_op(coo, B, op)
         return ref, timing_op, "COO"
 def _benchmark_triton_spmm(
     data,
@@ -335,7 +347,9 @@ def _benchmark_triton_spmm(
     block_n=None,
     block_nnz=None,
     max_segments=None,
+    op="non",
 ):
+    op = ast_ops._spmm_op_to_name(op)
     kwargs = {
         "data": data,
         "indices": indices,
@@ -345,6 +359,7 @@ def _benchmark_triton_spmm(
         "block_n": block_n,
         "block_nnz": block_nnz,
         "max_segments": max_segments,
+        "op": op,
     }
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -369,7 +384,9 @@ def _assert_spmm_matches_reference(
     block_nnz=None,
     max_segments=None,
     out=None,
+    op="non",
 ):
+    op = ast_ops._spmm_op_to_name(op)
     result = ast.flagsparse_spmm_csr(
         data,
         indices,
@@ -380,8 +397,9 @@ def _assert_spmm_matches_reference(
         block_nnz=block_nnz,
         max_segments=max_segments,
         out=out,
+        op=op,
     )
-    ref_C, _, _ = _build_pytorch_reference(data, indices, indptr, shape, B)
+    ref_C, _, _ = _build_pytorch_reference(data, indices, indptr, shape, B, op=op)
     atol, rtol = _tolerance_for_dtype(value_dtype)
     if not torch.allclose(result, ref_C, atol=atol, rtol=rtol):
         metrics = ast_ops._spmm_validation_metrics(result, ref_C)
@@ -420,14 +438,17 @@ def run_one_mtx(
     block_n=DEFAULT_BLOCK_N,
     block_nnz=DEFAULT_BLOCK_NNZ,
     max_segments=DEFAULT_MAX_SEGMENTS,
+    op="non",
 ):
     """Run SpMM on one .mtx and compare against PyTorch/hipSPARSE baselines."""
+    op = ast_ops._spmm_op_to_name(op)
     device = torch.device("cuda")
     data, indices, indptr, shape = load_mtx_to_csr_torch(mtx_path, dtype=value_dtype, device=device)
     indices = indices.to(index_dtype)
     n_rows, n_cols = shape
     nnz = data.numel()
-    B = _build_dense_matrix(n_cols, n_dense_cols, value_dtype, device)
+    b_rows = n_rows if op in ("trans", "conj") else n_cols
+    B = _build_dense_matrix(b_rows, n_dense_cols, value_dtype, device)
     atol, rtol = _tolerance_for_dtype(value_dtype)
 
     result = {
@@ -435,6 +456,7 @@ def run_one_mtx(
         "shape": shape,
         "nnz": nnz,
         "dense_cols": n_dense_cols,
+        "op": op,
         "error": None,
         "triton_ms": None,
         "triton_first_call_ms": None,
@@ -455,7 +477,9 @@ def run_one_mtx(
     }
 
     try:
-        ref_C, pytorch_op, pytorch_format = _build_pytorch_reference(data, indices, indptr, shape, B)
+        ref_C, pytorch_op, pytorch_format = _build_pytorch_reference(
+            data, indices, indptr, shape, B, op=op
+        )
         result["pytorch_format"] = pytorch_format
     except Exception as exc:
         result["error"] = f"ref: {exc}"
@@ -475,6 +499,7 @@ def run_one_mtx(
             block_n=block_n,
             block_nnz=block_nnz,
             max_segments=max_segments,
+            op=op,
         )
         result["triton_ms"] = triton_ms
         result["triton_first_call_ms"] = triton_first_call_ms
