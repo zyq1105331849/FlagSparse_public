@@ -394,7 +394,7 @@ def _time_cusparse(data, indices, indptr, shape, B, op, warmup, iters, layout="r
         if sparse_ref["backend"] is None:
             return None, None, sparse_ref["reason"]
         backend = sparse_ref["backend"]
-        reason = None if backend == "hipsparse" else f"backend={backend}"
+        reason = None if backend == "hipsparse" else f"backend={backend}; {sparse_ref.get('reason') or ''}".rstrip("; ")
         return sparse_ref["values"], sparse_ref["ms"], reason
     try:
         import cupy as cp
@@ -590,6 +590,8 @@ def _print_row(row):
         f"{_fmt(row['torch_vs_alg_speedup'], 2):>9} {_fmt(row['cusparse_vs_alg_speedup'], 2):>9} "
         f"{_fmt(row['err_vs_torch'], 2):>10} {row['status']:>6}"
     )
+    if row.get("cusparse_ms") is None and row.get("cusparse_reason"):
+        print(f"  hipSPARSE/ref: {row['cusparse_reason']}")
 
 
 def main():

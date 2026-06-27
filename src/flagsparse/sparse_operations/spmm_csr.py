@@ -862,7 +862,24 @@ def _run_alpha_spmm_alg1_tle_route(
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-    C = run_fn(B=B, prepared=alpha_prepared, meta=launch_meta)
+    try:
+        C = run_fn(B=B, prepared=alpha_prepared, meta=launch_meta)
+    except Exception as exc:
+        message = str(exc)
+        # On some Triton-HIP/DCU stacks the TLE kernels are importable and pass
+        # the coarse availability check, but fail during JIT translation with
+        # errors such as "builtin.unrealized_conversion_cast".  Treat that as
+        # an algorithm availability failure so route sweeps record a SKIP row
+        # and continue, instead of aborting the whole matrix/algorithm batch.
+        if (
+            "failed to translate module to LLVM IR" in message
+            or "unrealized_conversion_cast" in message
+            or "LLVM Translation failed" in message
+        ):
+            raise SpmmCsrAlgorithmUnavailable(
+                f"{route_name} is not executable on this Triton-HIP runtime: {message}"
+            ) from exc
+        raise
     if timing:
         end.record()
         torch.cuda.synchronize()

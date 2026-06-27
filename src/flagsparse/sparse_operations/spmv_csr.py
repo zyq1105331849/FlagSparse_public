@@ -130,7 +130,7 @@ class PreparedCsrSpmv:
         self._baseline_data = None
 
 
-# Performance-first CSR-Vector buckets.  num_warps*32 >= block_size.
+# Performance-first CSR-Vector buckets.  num_warps*warp_size >= block_size.
 # First bucket uses batch_rows>1: one program processes several short rows
 # (fewer blocks → better occupancy on graphs with millions of low-degree rows).
 _SPMV_OPT_BUCKET_CONFIGS = (
@@ -159,7 +159,82 @@ _SPMV_OPT_BUCKET_CONFIGS_FP64 = (
     {"max_row_nnz": 8192, "block_size": 256, "num_warps": 8, "num_stages": 2},
     {"max_row_nnz": None, "block_size": 512, "num_warps": 16, "num_stages": 1},
 )
+_SPMV_OPT_BUCKET_CONFIGS_HIP = (
+    {
+        "max_row_nnz": 64,
+        "block_size": 32,
+        "num_warps": 1,
+        "num_stages": 2,
+        "batch_rows": 16,
+    },
+    {"max_row_nnz": 512, "block_size": 256, "num_warps": 8, "num_stages": 2},
+    {"max_row_nnz": 4096, "block_size": 512, "num_warps": 8, "num_stages": 1},
+    {"max_row_nnz": None, "block_size": 512, "num_warps": 8, "num_stages": 1},
+)
+_SPMV_OPT_BUCKET_CONFIGS_HIP_FP64 = (
+    {
+        "max_row_nnz": 64,
+        "block_size": 32,
+        "num_warps": 1,
+        "num_stages": 2,
+        "batch_rows": 4,
+    },
+    {"max_row_nnz": 256, "block_size": 64, "num_warps": 2, "num_stages": 2},
+    {"max_row_nnz": 2048, "block_size": 256, "num_warps": 4, "num_stages": 2},
+    {"max_row_nnz": 8192, "block_size": 512, "num_warps": 8, "num_stages": 1},
+    {"max_row_nnz": None, "block_size": 512, "num_warps": 8, "num_stages": 1},
+)
 _SPMV_OPT_ACC_MODES = ("fast", "mixed", "accurate")
+
+
+def _normalize_spmv_opt_device_props(device):
+    props = torch.cuda.get_device_properties(device)
+    device_name = str(getattr(props, "name", "cuda"))
+    name_lower = device_name.lower()
+    is_hip = bool(getattr(torch.version, "hip", None)) or any(
+        token in name_lower for token in ("dcu", "hygon", "rocm", "amd")
+    )
+    warp_size = int(getattr(props, "warp_size", 64 if is_hip else 32) or 32)
+    max_threads_per_block = int(getattr(props, "max_threads_per_block", 1024) or 1024)
+    max_threads_per_mp = int(
+        getattr(props, "max_threads_per_multi_processor", max_threads_per_block)
+        or max_threads_per_block
+    )
+    return {
+        "backend": "hip" if is_hip else "cuda",
+        "device_name": device_name,
+        "warp_size": max(1, warp_size),
+        "max_threads_per_block": max(32, max_threads_per_block),
+        "max_threads_per_mp": max(32, max_threads_per_mp),
+    }
+
+
+def _spmv_opt_bucket_configs(dtype, device_props):
+    if device_props["backend"] == "hip":
+        return (
+            _SPMV_OPT_BUCKET_CONFIGS_HIP_FP64
+            if dtype == torch.float64
+            else _SPMV_OPT_BUCKET_CONFIGS_HIP
+        )
+    return (
+        _SPMV_OPT_BUCKET_CONFIGS_FP64
+        if dtype == torch.float64
+        else _SPMV_OPT_BUCKET_CONFIGS
+    )
+
+
+def _clip_spmv_opt_launch_spec(spec, device_props):
+    spec = dict(spec)
+    warp_size = max(1, int(device_props["warp_size"]))
+    max_warps_by_block = max(1, int(device_props["max_threads_per_block"]) // warp_size)
+    max_warps_by_mp = max(1, int(device_props["max_threads_per_mp"]) // warp_size)
+    max_supported = min(max_warps_by_block, max_warps_by_mp)
+    if device_props["backend"] == "hip":
+        max_supported = min(max_supported, 8)
+        spec["block_size"] = min(int(spec["block_size"]), 512)
+    spec["num_warps"] = max(1, min(int(spec["num_warps"]), max_supported))
+    spec["num_stages"] = max(1, int(spec["num_stages"]))
+    return spec
 
 
 
@@ -355,12 +430,21 @@ def _build_spmv_opt_buckets(
     max_row_nnz,
     row_index_dtype,
     max_segments=None,
-    fp64=False,
+    dtype=torch.float32,
+    device_props=None,
 ):
     buckets = []
     lower_bound = 0
-    configs = _SPMV_OPT_BUCKET_CONFIGS_FP64 if fp64 else _SPMV_OPT_BUCKET_CONFIGS
+    if device_props is None:
+        device_props = {
+            "backend": "cuda",
+            "warp_size": 32,
+            "max_threads_per_block": 1024,
+            "max_threads_per_mp": 2048,
+        }
+    configs = _spmv_opt_bucket_configs(dtype, device_props)
     for spec in configs:
+        spec = _clip_spmv_opt_launch_spec(spec, device_props)
         upper_bound = spec["max_row_nnz"]
         if upper_bound is None:
             mask = row_lengths > lower_bound
@@ -400,13 +484,17 @@ def _build_spmv_opt_buckets(
 
 
 def _build_spmv_opt_runtime_buckets(prepared):
-    row_index_dtype = torch.int32 if prepared.n_rows <= _INDEX_LIMIT_INT32 else torch.int64
+    row_index_dtype = (
+        torch.int32 if prepared.n_rows <= _INDEX_LIMIT_INT32 else torch.int64
+    )
+    device_props = _normalize_spmv_opt_device_props(prepared.data.device)
     return _build_spmv_opt_buckets(
         prepared.row_lengths,
         max_row_nnz=prepared.max_row_nnz,
         row_index_dtype=row_index_dtype,
         max_segments=prepared.opt_max_segments,
-        fp64=prepared.data.dtype == torch.float64,
+        dtype=prepared.data.dtype,
+        device_props=device_props,
     )
 
 def _triton_spmv_csr_impl_opt_prepared(prepared, x, opt_buckets=None):
