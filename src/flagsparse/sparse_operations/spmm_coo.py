@@ -834,11 +834,27 @@ def _prepare_spmm_coo_inputs(data, row, col, B, shape):
 
 def _resolve_spmm_coo_launch_config(n_dense_cols, nnz, block_n=None, block_nnz=256):
     warp_size, factor = _select_spmm_alg1_warp_and_factor(n_dense_cols)
+    is_hip = getattr(torch.version, "hip", None) is not None
 
-    if block_n is None:
-        block_n = warp_size * factor
-    if block_nnz is None:
-        block_nnz = 256
+    if is_hip:
+        if block_n is None:
+            if int(n_dense_cols) <= 16:
+                block_n = 16
+            elif int(n_dense_cols) <= 64:
+                block_n = 32
+            else:
+                block_n = 64
+        else:
+            block_n = min(int(block_n), 64)
+        if block_nnz is None:
+            block_nnz = 128 if int(nnz) < 1_000_000 else 256
+        else:
+            block_nnz = min(int(block_nnz), 256)
+    else:
+        if block_n is None:
+            block_n = warp_size * factor
+        if block_nnz is None:
+            block_nnz = 256
 
     if block_n <= 0 or block_nnz <= 0:
         raise ValueError("block_n and block_nnz must be positive when provided")
@@ -849,6 +865,7 @@ def _resolve_spmm_coo_launch_config(n_dense_cols, nnz, block_n=None, block_nnz=2
         "required_nnz_tiles": int(triton.cdiv(nnz, block_nnz) if nnz > 0 else 0),
         "heuristic_warp_size": int(warp_size),
         "heuristic_factor": int(factor),
+        "backend": "hip" if is_hip else "cuda",
     }
 
 

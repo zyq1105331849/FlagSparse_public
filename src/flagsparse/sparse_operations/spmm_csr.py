@@ -446,17 +446,56 @@ def _normalize_spmm_base_device_props(device):
         getattr(props, "max_threads_per_multi_processor", 2048) or 2048
     )
     return {
+        "is_hip": getattr(torch.version, "hip", None) is not None,
         "warp_size": max(1, warp_size),
         "max_threads_per_block": max(32, max_threads_per_block),
         "max_threads_per_mp": max(32, max_threads_per_mp),
     }
 
 
+def _spmm_is_hip_device(device_props):
+    return bool(device_props and device_props.get("is_hip"))
+
+
+def _spmm_thread_cap(device_props):
+    cap = int(device_props.get("max_threads_per_block", 1024) or 1024)
+    return min(cap, 512) if _spmm_is_hip_device(device_props) else cap
+
+
+def _spmm_hip_base_launch_overrides(n_dense_cols, max_row_nnz, block_n, block_nnz, num_warps, num_stages):
+    n_dense_cols = int(n_dense_cols)
+    max_row_nnz = int(max_row_nnz)
+    if block_n is None:
+        if n_dense_cols <= 16:
+            block_n = 16
+        elif n_dense_cols <= 64:
+            block_n = 32
+        else:
+            block_n = 64
+    else:
+        block_n = min(int(block_n), 64)
+    if block_nnz is None:
+        block_nnz = 64 if max_row_nnz < 512 else 128
+    else:
+        block_nnz = min(int(block_nnz), 512)
+    if num_warps is None:
+        if n_dense_cols <= 16:
+            num_warps = 1
+        elif n_dense_cols <= 64:
+            num_warps = 2
+        else:
+            num_warps = 4
+    if num_stages is None:
+        num_stages = 1
+    return block_n, block_nnz, num_warps, num_stages
+
+
 def _clip_spmm_base_num_warps(desired, device_props):
     warp_size = int(device_props["warp_size"])
-    max_by_block = max(1, int(device_props["max_threads_per_block"]) // warp_size)
+    max_by_block = max(1, _spmm_thread_cap(device_props) // warp_size)
     max_by_mp = max(1, int(device_props["max_threads_per_mp"]) // warp_size)
-    max_supported = min(16, max_by_block, max_by_mp)
+    max_backend = 8 if _spmm_is_hip_device(device_props) else 16
+    max_supported = min(max_backend, max_by_block, max_by_mp)
     supported = [value for value in (1, 2, 4, 8, 16) if value <= max_supported]
     if not supported:
         return 1
@@ -478,6 +517,15 @@ def _resolve_spmm_base_triton_launch(
     num_stages=None,
     device_props=None,
 ):
+    if device_props is not None and _spmm_is_hip_device(device_props):
+        block_n, block_nnz, num_warps, num_stages = _spmm_hip_base_launch_overrides(
+            n_dense_cols,
+            max_row_nnz,
+            block_n,
+            block_nnz,
+            num_warps,
+            num_stages,
+        )
     launch = _resolve_spmm_alg1_launch_config(
         n_dense_cols,
         max_row_nnz,
@@ -1226,6 +1274,9 @@ def _spmm_csr_alg1_run_bucket(plan, bucket, B, C_out, block_n, device_props):
         bucket.get("block_n_cap", block_n),
     )
     block_nnz = int(bucket["block_nnz"])
+    block_n, block_nnz = _adapt_spmm_opt_tile_for_device(
+        block_n, block_nnz, device_props
+    )
     launch = _resolve_spmm_opt_launch(
         kind,
         block_n,
@@ -1284,6 +1335,9 @@ def _spmm_csr_alg1_run_split_bucket(plan, B, C_out, block_n, device_props):
     if plan.long_part_rows.numel() == 0:
         return
     block_n = _select_spmm_opt_block_n_for_bucket(int(B.shape[1]), block_n)
+    block_n, split_block_nnz = _adapt_spmm_opt_tile_for_device(
+        block_n, _SPMM_OPT_SPLIT_BLOCK_NNZ, device_props, split=True
+    )
     workspace = torch.empty(
         (plan.long_part_rows.numel(), B.shape[1]),
         dtype=B.dtype,
@@ -1302,7 +1356,7 @@ def _spmm_csr_alg1_run_split_bucket(plan, B, C_out, block_n, device_props):
     split_launch = _resolve_spmm_opt_launch(
         "split_part",
         block_n,
-        _SPMM_OPT_SPLIT_BLOCK_NNZ,
+        split_block_nnz,
         1,
         B.dtype,
         device_props,
@@ -1310,7 +1364,7 @@ def _spmm_csr_alg1_run_split_bucket(plan, B, C_out, block_n, device_props):
     reduce_launch = _resolve_spmm_opt_launch(
         "split_reduce",
         block_n,
-        _SPMM_OPT_SPLIT_BLOCK_NNZ,
+        split_block_nnz,
         1,
         B.dtype,
         device_props,
@@ -1534,6 +1588,7 @@ def _normalize_spmm_csr_alg2_device_props(device):
     max_threads_per_block = int(getattr(props, "max_threads_per_block", 1024) or 1024)
     shared_memory_per_block = int(getattr(props, "shared_memory_per_block", 0) or 0)
     return {
+        "is_hip": getattr(torch.version, "hip", None) is not None,
         "device_name": str(getattr(props, "name", "cuda")),
         "warp_size": max(1, warp_size),
         "sm_count": max(0, sm_count),
@@ -1559,6 +1614,13 @@ def _select_spmm_csr_alg2_block_n(n_dense_cols, block_n_cap):
     else:
         block_n = 128
     return max(8, min(int(block_n), int(block_n_cap)))
+
+
+def _adapt_spmm_csr_alg2_launch_for_device(block_n, bucket, device_props):
+    block_n = int(block_n)
+    if not _spmm_is_hip_device(device_props):
+        return block_n
+    return max(8, min(block_n, 64))
 
 
 def _select_spmm_csr_alg2_num_warps(bucket, block_n, device_props, dtype):
@@ -1589,9 +1651,11 @@ def _select_spmm_csr_alg2_num_warps(bucket, block_n, device_props, dtype):
     if max_threads_per_mp < 1536 and desired > 8:
         desired = 8
 
+    max_threads_per_block = _spmm_thread_cap(device_props)
     max_warps_by_block = max(1, max_threads_per_block // warp_size)
     max_warps_by_mp = max(1, max_threads_per_mp // warp_size)
-    max_supported = min(16, max_warps_by_block, max_warps_by_mp)
+    max_backend = 8 if _spmm_is_hip_device(device_props) else 16
+    max_supported = min(max_backend, max_warps_by_block, max_warps_by_mp)
     supported = [value for value in (1, 2, 4, 8, 16) if value <= max_supported]
     if not supported:
         return 1
@@ -1603,6 +1667,8 @@ def _select_spmm_csr_alg2_num_warps(bucket, block_n, device_props, dtype):
 
 
 def _select_spmm_csr_alg2_num_stages(bucket, block_n, num_warps, device_props, dtype):
+    if _spmm_is_hip_device(device_props):
+        return 1
     kind = bucket["kind"]
     segments = int(bucket.get("segments", 1))
     shared_memory_per_block = int(device_props["shared_memory_per_block"])
@@ -1629,6 +1695,7 @@ def _select_spmm_csr_alg2_num_stages(bucket, block_n, num_warps, device_props, d
 
 def _resolve_spmm_csr_alg2_launch(bucket, n_dense_cols, dtype, device_props):
     block_n = _select_spmm_csr_alg2_block_n(n_dense_cols, bucket["block_n_cap"])
+    block_n = _adapt_spmm_csr_alg2_launch_for_device(block_n, bucket, device_props)
     num_warps = _select_spmm_csr_alg2_num_warps(bucket, block_n, device_props, dtype)
     num_stages = _select_spmm_csr_alg2_num_stages(
         bucket,
@@ -2346,6 +2413,7 @@ def _normalize_spmm_opt_device_props(device):
     )
     shared_memory_per_block = int(getattr(props, "shared_memory_per_block", 0) or 0)
     return {
+        "is_hip": getattr(torch.version, "hip", None) is not None,
         "warp_size": max(1, warp_size),
         "max_threads_per_block": max(32, max_threads_per_block),
         "max_threads_per_mp": max(32, max_threads_per_mp),
@@ -2355,9 +2423,10 @@ def _normalize_spmm_opt_device_props(device):
 
 def _clip_spmm_opt_num_warps(desired, device_props):
     warp_size = int(device_props["warp_size"])
-    max_by_block = max(1, int(device_props["max_threads_per_block"]) // warp_size)
+    max_by_block = max(1, _spmm_thread_cap(device_props) // warp_size)
     max_by_mp = max(1, int(device_props["max_threads_per_mp"]) // warp_size)
-    max_supported = min(16, max_by_block, max_by_mp)
+    max_backend = 8 if _spmm_is_hip_device(device_props) else 16
+    max_supported = min(max_backend, max_by_block, max_by_mp)
     supported = [value for value in (1, 2, 4, 8, 16) if value <= max_supported]
     if not supported:
         return 1
@@ -2395,7 +2464,9 @@ def _resolve_spmm_opt_launch(kind, block_n, block_nnz, batch_rows, dtype, device
         desired_warps = min(desired_warps, 8)
     num_warps = _clip_spmm_opt_num_warps(desired_warps, device_props)
 
-    if dtype == torch.float64:
+    if _spmm_is_hip_device(device_props):
+        num_stages = 1
+    elif dtype == torch.float64:
         num_stages = 1 if kind.startswith("split") or block_n >= 64 else 2
     elif kind == "batched":
         num_stages = 2
@@ -2404,6 +2475,17 @@ def _resolve_spmm_opt_launch(kind, block_n, block_nnz, batch_rows, dtype, device
     else:
         num_stages = 1 if num_warps >= 8 else 2
     return {"num_warps": int(num_warps), "num_stages": int(num_stages)}
+
+
+def _adapt_spmm_opt_tile_for_device(block_n, block_nnz, device_props, *, split=False):
+    block_n = int(block_n)
+    block_nnz = int(block_nnz)
+    if not _spmm_is_hip_device(device_props):
+        return block_n, block_nnz
+    block_n = max(8, min(block_n, 64))
+    block_nnz_cap = 256 if split else 128
+    block_nnz = max(16, min(block_nnz, block_nnz_cap, 512))
+    return block_n, block_nnz
 
 
 def _select_spmm_opt_block_n_for_bucket(n_dense_cols, block_n_cap):
@@ -2762,10 +2844,6 @@ def _triton_spmm_csr_impl(
             compute_dtype = torch.float32
             data_in = data.to(torch.float32)
             B_in = _materialize_dense_layout(B.to(torch.float32), dense_layout)
-        elif dtype == torch.float32:
-            compute_dtype = torch.float64
-            data_in = data.to(torch.float64)
-            B_in = _materialize_dense_layout(B.to(torch.float64), dense_layout)
 
         C_compute = (
             out
@@ -3174,6 +3252,9 @@ def _run_spmm_opt_bucket(prepared, bucket, B, C_out, block_n, device_props):
         int(B.shape[1]), bucket.get("block_n_cap", block_n)
     )
     block_nnz = int(bucket["block_nnz"])
+    block_n, block_nnz = _adapt_spmm_opt_tile_for_device(
+        block_n, block_nnz, device_props
+    )
     launch = _resolve_spmm_opt_launch(
         kind,
         block_n,
@@ -3232,6 +3313,9 @@ def _run_spmm_opt_split_bucket(prepared, B, C_out, block_n, device_props):
     if prepared.long_part_rows.numel() == 0:
         return False
     block_n = _select_spmm_opt_block_n_for_bucket(int(B.shape[1]), block_n)
+    block_n, split_block_nnz = _adapt_spmm_opt_tile_for_device(
+        block_n, _SPMM_OPT_SPLIT_BLOCK_NNZ, device_props, split=True
+    )
     workspace = torch.empty(
         (prepared.long_part_rows.numel(), B.shape[1]),
         dtype=B.dtype,
@@ -3250,7 +3334,7 @@ def _run_spmm_opt_split_bucket(prepared, B, C_out, block_n, device_props):
     split_launch = _resolve_spmm_opt_launch(
         "split_part",
         block_n,
-        _SPMM_OPT_SPLIT_BLOCK_NNZ,
+        split_block_nnz,
         1,
         B.dtype,
         device_props,
@@ -3258,7 +3342,7 @@ def _run_spmm_opt_split_bucket(prepared, B, C_out, block_n, device_props):
     reduce_launch = _resolve_spmm_opt_launch(
         "split_reduce",
         block_n,
-        _SPMM_OPT_SPLIT_BLOCK_NNZ,
+        split_block_nnz,
         1,
         B.dtype,
         device_props,

@@ -28,6 +28,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import flagsparse as fs
+import flagsparse.sparse_operations.spmm_csr as spmm_csr_ops
 import flagsparse.sparse_operations.spmm_coo as spmm_coo_ops
 from flagsparse.sparse_operations._spmm_dcu_tuning import (
     SPMM_DCU_TUNING_STRATEGIES,
@@ -392,8 +393,25 @@ def _run_one_csr(path, value_dtype, index_dtype, dense_cols, alg, strategy, warm
     ref = None
     ref_ms = None
     if run_ref:
-        ref, ref_op, _ = _build_csr_reference(data, indices, indptr, shape, B)
-        _, ref_ms = _cuda_event_benchmark(ref_op, warmup, iters)
+        try:
+            sparse_ref = spmm_csr_ops._benchmark_spmm_csr_sparse_ref(
+                data,
+                indices,
+                indptr,
+                B,
+                shape,
+                warmup=warmup,
+                iters=iters,
+            )
+            if sparse_ref["backend"] is not None:
+                ref = sparse_ref["values"]
+                ref_ms = sparse_ref["ms"]
+            else:
+                ref = None
+                ref_ms = None
+        except Exception:
+            ref = None
+            ref_ms = None
     process_ms = 0.0
     try:
         t0 = time.perf_counter()
@@ -575,22 +593,24 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Sweep DCU/HIP-aware SpMM tuning strategies.")
     parser.add_argument("--format", default="all", choices=("csr", "coo", "all"))
     parser.add_argument("--alg", default="default", help=f"default, stable, all, or comma list from: {','.join(ALL_ALGS)}")
-    parser.add_argument("--strategy", default="all", help=f"all or comma list from: {','.join(SPMM_DCU_TUNING_STRATEGIES)}")
-    parser.add_argument("--dense-cols", default="8,16,32,64,128")
-    parser.add_argument("--value-dtypes", default="float32,float64")
-    parser.add_argument("--index-dtypes", default="int32,int64")
+    parser.add_argument("--strategy", default=None, help=f"all or comma list from: {','.join(SPMM_DCU_TUNING_STRATEGIES)}")
+    parser.add_argument("--dense-cols", default=None)
+    parser.add_argument("--value-dtypes", default=None)
+    parser.add_argument("--index-dtypes", default=None)
     parser.add_argument("--input", nargs="*", default=[str(_PROJECT_ROOT / "tests" / "data")])
     parser.add_argument("--out-dir", default=str(_PROJECT_ROOT / "tests" / "results" / "spmm_dcu_tuning"))
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
+    parser.add_argument("--sweep", action="store_true", help="Expand dtype/index/dense_N/strategy coverage for deeper analysis.")
     parser.add_argument("--no-ref", action="store_true", help="Skip PyTorch reference timing and correctness checks.")
     parser.add_argument(
         "--ref-mode",
         default="baseline",
         choices=("none", "baseline", "all"),
         help=(
-            "Reference policy: none skips PyTorch reference; baseline checks only "
-            "default csr_base/coo_rowrun rows; all checks every row. Default: baseline."
+            "Reference policy: none skips reference; baseline checks only default "
+            "csr_base/coo_rowrun rows; all checks every row. CSR uses sparse library "
+            "reference when available. Default: baseline."
         ),
     )
     args = parser.parse_args(argv)
@@ -598,10 +618,14 @@ def main(argv=None):
     formats = list(FORMAT_NAMES) if args.format == "all" else [args.format]
     alg_tokens = [token.strip().lower() for token in str(args.alg).split(",") if token.strip()]
     algs = _expand_algs(formats, alg_tokens or ["all"])
-    strategies = _parse_strategy_names(args.strategy)
-    dense_cols_values = _parse_int_csv(args.dense_cols, "--dense-cols")
-    value_dtypes = _parse_dtypes(args.value_dtypes)
-    index_dtypes = _parse_index_dtypes(args.index_dtypes)
+    strategy_arg = args.strategy if args.strategy is not None else ("all" if args.sweep else "default")
+    dense_cols_arg = args.dense_cols if args.dense_cols is not None else ("8,16,32,64,128" if args.sweep else "32")
+    value_dtypes_arg = args.value_dtypes if args.value_dtypes is not None else ("float32,float64" if args.sweep else "float32")
+    index_dtypes_arg = args.index_dtypes if args.index_dtypes is not None else ("int32,int64" if args.sweep else "int32")
+    strategies = _parse_strategy_names(strategy_arg)
+    dense_cols_values = _parse_int_csv(dense_cols_arg, "--dense-cols")
+    value_dtypes = _parse_dtypes(value_dtypes_arg)
+    index_dtypes = _parse_index_dtypes(index_dtypes_arg)
     paths = _resolve_paths(args.input)
     if not paths:
         raise FileNotFoundError(f"no .mtx files found from --input: {args.input}")
