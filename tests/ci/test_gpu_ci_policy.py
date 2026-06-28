@@ -29,20 +29,19 @@ def test_gpu_accuracy_workflow_checks_rocm_before_tests():
     assert "rocm-smi" in text
     assert "tools/ci/check_gpu_environment.py" in text
     assert "--require-rocm" in text
-    assert "pytest" in text
-    assert "tests/pytest" in text
+    assert "run_flagsparse_accuracy.py" in text
+    assert "--results-dir pytest_results" in text
 
 
 def test_gpu_benchmark_workflow_uploads_artifacts():
     text = _read(WORKFLOWS_DIR / "gpu-benchmark.yml")
     assert "self-hosted" in text
     assert "gpu" in text
-    assert "tools/ci/run_gpu_benchmark.py" in text
+    assert "run_flagsparse_performance.py" in text
     assert "matrix_dir:" in text
     assert "use_hipsparse:" in text
-    assert "--with-hipsparse" in text
-    for suite_name in ["alpha-spmm-alg1", "spmm-opt-alg2", "spgemm", "sddmm"]:
-        assert suite_name in text
+    assert "--benchmark-args \"--no-hipsparse\"" in text
+    assert "--results-dir benchmark_results" in text
     assert "actions/upload-artifact@v4" in text
 
 

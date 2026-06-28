@@ -4,6 +4,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ACCURACY_UTILS = PROJECT_ROOT / "tests" / "pytest" / "accuracy_utils.py"
+PYTEST_CONFTEST = PROJECT_ROOT / "tests" / "pytest" / "conftest.py"
 
 
 def test_accuracy_policy_helpers_are_defined():
@@ -24,3 +25,10 @@ def test_accuracy_policy_documents_goldens():
     text = ACCURACY_UTILS.read_text(encoding="utf-8")
     assert "CPU float64 golden reference" in text
     assert "CPU int32" in text
+
+
+def test_accuracy_pytest_json_record_plugin_exists():
+    text = PYTEST_CONFTEST.read_text(encoding="utf-8")
+    assert "--record" in text
+    assert "--output" in text
+    assert "accuracy_result.json" in text

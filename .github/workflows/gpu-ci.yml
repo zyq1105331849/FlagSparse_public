@@ -11,8 +11,11 @@ on:
         options:
           - quick
           - normal
-      marker:
-        description: Optional pytest marker expression
+      ops:
+        description: >-
+          Comma-separated operator ids to run (keys of OP_TEST_CONFIGS in
+          run_flagsparse_pytest.py). Leave empty to run all configured
+          operators from conf/operators.yaml.
         required: false
         type: string
 
@@ -28,6 +31,11 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Initialize artifact paths
+        run: |
+          mkdir -p pytest_results
+          printf '{}\n' > gpu_ci_metadata.json
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -58,11 +66,16 @@ jobs:
       - name: Run ROCm GPU accuracy tests
         shell: bash
         run: |
-          args=(tests/pytest --mode "${{ inputs.mode }}" -q)
-          if [ -n "${{ inputs.marker }}" ]; then
-            args+=(-m "${{ inputs.marker }}")
+          args=(
+            run_flagsparse_accuracy.py
+            --mode "${{ inputs.mode }}"
+            --gpus 0
+            --results-dir pytest_results
+          )
+          if [ -n "${{ inputs.ops }}" ]; then
+            args+=(--ops "${{ inputs.ops }}")
           fi
-          pytest "${args[@]}"
+          python "${args[@]}"
 
       - name: Upload ROCm GPU CI artifacts
         if: always()

@@ -4,6 +4,7 @@ import torch
 from flagsparse import (
     build_alpha_spmm_alg1_tle_opt_meta,
     build_alpha_spmm_alg1_tle_opt2_meta,
+    flagsparse_alpha_spmm_alg1,
     flagsparse_alpha_spmm_alg1_tle_opt,
     flagsparse_alpha_spmm_alg1_tle_opt2,
     is_alpha_spmm_alg1_tle_opt_available,
@@ -42,7 +43,40 @@ def _reference(Asp, B, dtype):
             device=Asp.device,
         )
         return torch.sparse.mm(Asp64, B.double()).float()
+    if dtype == torch.complex64:
+        Asp128 = torch.sparse_csr_tensor(
+            crow_indices=Asp.crow_indices(),
+            col_indices=Asp.col_indices(),
+            values=Asp.values().to(torch.complex128),
+            size=Asp.shape,
+            dtype=torch.complex128,
+            device=Asp.device,
+        )
+        return torch.sparse.mm(Asp128, B.to(torch.complex128)).to(torch.complex64)
     return torch.sparse.mm(Asp, B)
+
+
+@pytest.mark.alpha_spmm_alg1
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.complex64, torch.complex128],
+    ids=["complex64", "complex128"],
+)
+def test_alpha_spmm_alg1_complex_matches_torch(dtype):
+    device = torch.device("cuda")
+    M, K, N = 32, 40, 17
+    Asp = _random_csr_mk(M, K, dtype, device)
+    B = torch.randn(K, N, dtype=dtype, device=device)
+    out = flagsparse_alpha_spmm_alg1(
+        Asp.values(),
+        Asp.col_indices(),
+        Asp.crow_indices(),
+        B,
+        (M, K),
+    )
+    ref = _reference(Asp, B, dtype)
+    atol, rtol = _tol(dtype)
+    assert torch.allclose(out, ref, atol=atol, rtol=rtol)
 
 
 @pytest.mark.alpha_spmm_alg1
