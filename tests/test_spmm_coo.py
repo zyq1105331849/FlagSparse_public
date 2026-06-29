@@ -459,22 +459,30 @@ def _benchmark_spmm_coo_route(
         warmup=warmup,
         iters=iters,
     )
-    if not timing:
-        return values, gpu_ms, first_call_ms
-    _, meta = run(return_meta=True)
-    process_cpu_ms = float(meta.get("symbolic_ms", 0.0) or 0.0)
     timing_meta = {
         "gpu_ms": gpu_ms,
-        "process_cpu_ms": process_cpu_ms,
-        "process_gpu_ms": 0.0,
-        "compute_ms": gpu_ms,
-        "op_total_ms": process_cpu_ms + gpu_ms,
-        "dense_layout": meta.get("dense_layout", dense_layout),
-        "b_stride": meta.get("b_stride"),
-        "c_stride": meta.get("c_stride"),
-        "output_layout": meta.get("output_layout"),
+        "process_cpu_ms": 0.0,
+        "process_gpu_ms": None,
+        "compute_ms": None,
+        "op_total_ms": gpu_ms,
+        "dense_layout": dense_layout,
+        "b_stride": tuple(int(v) for v in B.stride()),
+        "c_stride": None,
+        "output_layout": None,
     }
-    return values, process_cpu_ms + gpu_ms, first_call_ms, timing_meta
+    if timing:
+        _, meta = run(return_meta=True)
+        timing_meta.update(
+            {
+                "process_gpu_ms": 0.0,
+                "compute_ms": gpu_ms,
+                "dense_layout": meta.get("dense_layout", dense_layout),
+                "b_stride": meta.get("b_stride"),
+                "c_stride": meta.get("c_stride"),
+                "output_layout": meta.get("output_layout"),
+            }
+        )
+    return values, gpu_ms, first_call_ms, timing_meta
 
 def _summarize_route_output(values, reference, value_dtype, ms=None, first_call_ms=None, cusparse_values=None):
     metrics = ast_ops._spmm_validation_metrics(values, reference)
@@ -712,18 +720,13 @@ def run_one_mtx(
             dense_layout=dense_layout,
             timing=timing,
         )
-        if timing:
-            triton_C, triton_ms, triton_first_call_ms, triton_timing = bench_result
-        else:
-            triton_C, triton_ms, triton_first_call_ms = bench_result
-            triton_timing = {}
+        triton_C, triton_ms, triton_first_call_ms, triton_timing = bench_result
         result["triton_ms"] = triton_ms
         result["triton_first_call_ms"] = triton_first_call_ms
-        if timing:
-            result["triton_gpu_ms"] = triton_timing.get("gpu_ms")
-            result["process_cpu_ms"] = triton_timing.get("process_cpu_ms")
-            result["process_gpu_ms"] = triton_timing.get("process_gpu_ms")
-            result["compute_ms"] = triton_timing.get("compute_ms")
+        result["triton_gpu_ms"] = triton_timing.get("gpu_ms")
+        result["process_cpu_ms"] = triton_timing.get("process_cpu_ms")
+        result["process_gpu_ms"] = triton_timing.get("process_gpu_ms")
+        result["compute_ms"] = triton_timing.get("compute_ms")
     except Exception as exc:
         # Continue to PyTorch / hipSPARSE timing when Triton fails (same as CSR SpMM test).
         result["error"] = f"triton: {exc}"
@@ -815,10 +818,7 @@ def run_one_mtx(
                     dense_layout=dense_layout,
                     timing=timing,
                 )
-                if timing:
-                    extra_C, extra_ms, extra_first_call_ms, _extra_timing = extra_result
-                else:
-                    extra_C, extra_ms, extra_first_call_ms = extra_result
+                extra_C, extra_ms, extra_first_call_ms, _extra_timing = extra_result
                 route_outputs[extra_route] = extra_C
                 route_summaries[extra_route] = _summarize_route_output(
                     extra_C,
