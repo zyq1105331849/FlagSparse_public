@@ -162,6 +162,29 @@ def _build_dense_matrix(n_rows, n_cols, value_dtype, device):
     raise TypeError(f"Unsupported value dtype: {value_dtype}")
 
 
+def _normalize_layout_name(layout):
+    token = "row" if layout is None else str(layout).strip().lower()
+    if token in ("auto", "default", "row", "row_major", "row-major", "c", "c_order"):
+        return "row"
+    if token in ("col", "column", "col_major", "column_major", "col-major", "column-major", "f", "fortran"):
+        return "col"
+    raise ValueError("layout must be one of: row, col")
+
+
+def _materialize_dense_layout_for_test(tensor, layout):
+    layout = _normalize_layout_name(layout)
+    if layout == "row":
+        return tensor.contiguous()
+    out = torch.empty_strided(
+        tuple(tensor.shape),
+        (1, max(1, int(tensor.shape[0]))),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    out.copy_(tensor)
+    return out
+
+
 def _tolerance_for_dtype(value_dtype):
     if value_dtype in (torch.float32, torch.complex64):
         return 1.3e-6, 1e-3
@@ -316,11 +339,11 @@ def _empty_pairwise_summary():
 
 
 
-def _prepare_canonical_case(data, row, col, shape, B, op="non"):
+def _prepare_canonical_case(data, row, col, shape, B, op="non", dense_layout="row"):
     op_code = ast_ops._normalize_spmm_coo_op(op)
     data, row, col, shape = ast_ops._materialize_spmm_coo_op(data, row, col, shape, op_code)
     native_data, native_row, native_col, native_B, n_rows, n_cols, n_dense_cols = ast_ops._prepare_spmm_coo_inputs(
-        data, row, col, B, shape
+        data, row, col, B, shape, dense_layout=dense_layout
     )
     (
         canonical_data,
@@ -376,8 +399,12 @@ def _prepare_canonical_case(data, row, col, shape, B, op="non"):
 
 
 
-def _build_pytorch_reference(data, row, col, shape, B, prepared=None, op="non"):
-    prepared = _prepare_canonical_case(data, row, col, shape, B, op=op) if prepared is None else prepared
+def _build_pytorch_reference(data, row, col, shape, B, prepared=None, op="non", dense_layout="row"):
+    prepared = (
+        _prepare_canonical_case(data, row, col, shape, B, op=op, dense_layout=dense_layout)
+        if prepared is None
+        else prepared
+    )
     expected = ast_ops._build_spmm_coo_pytorch_reference_from_canonical(
         prepared["canonical_data"],
         prepared["canonical_row"],
@@ -404,22 +431,50 @@ def _benchmark_spmm_coo_route(
     block_nnz=DEFAULT_BLOCK_NNZ,
     prepared=None,
     op="non",
+    dense_layout="row",
+    timing=False,
 ):
     selected_route = _selected_route(route)
     del prepared
-    return ast_ops._benchmark_spmm_coo_route(
+    run = lambda return_meta=False: ast_ops._run_spmm_coo_route(
         data,
         row,
         col,
         B,
         shape,
-        warmup,
-        iters,
-        block_n,
-        block_nnz,
-        selected_route,
+        block_n=block_n,
+        block_nnz=block_nnz,
+        return_meta=return_meta,
+        route=selected_route,
         op=op,
+        dense_layout=dense_layout,
     )
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    _ = run(return_meta=False)
+    torch.cuda.synchronize()
+    first_call_ms = (time.perf_counter() - t0) * 1000.0
+    values, gpu_ms = ast_ops._benchmark_cuda_op(
+        lambda: run(return_meta=False),
+        warmup=warmup,
+        iters=iters,
+    )
+    if not timing:
+        return values, gpu_ms, first_call_ms
+    _, meta = run(return_meta=True)
+    process_cpu_ms = float(meta.get("symbolic_ms", 0.0) or 0.0)
+    timing_meta = {
+        "gpu_ms": gpu_ms,
+        "process_cpu_ms": process_cpu_ms,
+        "process_gpu_ms": 0.0,
+        "compute_ms": gpu_ms,
+        "op_total_ms": process_cpu_ms + gpu_ms,
+        "dense_layout": meta.get("dense_layout", dense_layout),
+        "b_stride": meta.get("b_stride"),
+        "c_stride": meta.get("c_stride"),
+        "output_layout": meta.get("output_layout"),
+    }
+    return values, process_cpu_ms + gpu_ms, first_call_ms, timing_meta
 
 def _summarize_route_output(values, reference, value_dtype, ms=None, first_call_ms=None, cusparse_values=None):
     metrics = ast_ops._spmm_validation_metrics(values, reference)
@@ -565,10 +620,13 @@ def run_one_mtx(
     block_nnz=DEFAULT_BLOCK_NNZ,
     route="rowrun",
     op="non",
+    dense_layout="row",
+    timing=False,
 ):
     route = _normalize_route(route)
     selected_route = _selected_route(route)
     op_name = ast_ops._spmm_coo_op_to_name(op)
+    dense_layout = _normalize_layout_name(dense_layout)
     device = torch.device("cuda")
     data, row, col, shape = load_mtx_to_coo_torch(mtx_path, dtype=value_dtype, device=device)
     row = row.to(index_dtype)
@@ -576,7 +634,10 @@ def run_one_mtx(
     n_rows, n_cols = shape
     nnz = data.numel()
     b_rows = n_rows if ast_ops._spmm_coo_op_transposes(op_name) else n_cols
-    B = _build_dense_matrix(b_rows, n_dense_cols, value_dtype, device)
+    B = _materialize_dense_layout_for_test(
+        _build_dense_matrix(b_rows, n_dense_cols, value_dtype, device),
+        dense_layout,
+    )
     prepared = None
     atol, rtol = _tolerance_for_dtype(value_dtype)
 
@@ -587,8 +648,13 @@ def run_one_mtx(
         "dense_cols": n_dense_cols,
         "route": selected_route,
         "op": op_name,
+        "layout": dense_layout,
         "error": None,
         "triton_ms": None,
+        "triton_gpu_ms": None,
+        "process_cpu_ms": None,
+        "process_gpu_ms": None,
+        "compute_ms": None,
         "triton_first_call_ms": None,
         "cusparse_ms": None,
         "pytorch_ms": None,
@@ -608,8 +674,19 @@ def run_one_mtx(
     }
 
     try:
-        prepared = _prepare_canonical_case(data, row, col, shape, B, op=op_name)
-        ref_C, pytorch_op, pytorch_format, pytorch_reason = _build_pytorch_reference(data, row, col, shape, B, prepared=prepared, op=op_name)
+        prepared = _prepare_canonical_case(
+            data, row, col, shape, B, op=op_name, dense_layout=dense_layout
+        )
+        ref_C, pytorch_op, pytorch_format, pytorch_reason = _build_pytorch_reference(
+            data,
+            row,
+            col,
+            shape,
+            B,
+            prepared=prepared,
+            op=op_name,
+            dense_layout=dense_layout,
+        )
         result["pytorch_format"] = pytorch_format
         result["pytorch_reason"] = pytorch_reason
     except Exception as exc:
@@ -619,7 +696,7 @@ def run_one_mtx(
 
     triton_C = None
     try:
-        triton_C, triton_ms, triton_first_call_ms = _benchmark_spmm_coo_route(
+        bench_result = _benchmark_spmm_coo_route(
             data,
             row,
             col,
@@ -632,9 +709,21 @@ def run_one_mtx(
             block_nnz=block_nnz,
             prepared=prepared,
             op=op_name,
+            dense_layout=dense_layout,
+            timing=timing,
         )
+        if timing:
+            triton_C, triton_ms, triton_first_call_ms, triton_timing = bench_result
+        else:
+            triton_C, triton_ms, triton_first_call_ms = bench_result
+            triton_timing = {}
         result["triton_ms"] = triton_ms
         result["triton_first_call_ms"] = triton_first_call_ms
+        if timing:
+            result["triton_gpu_ms"] = triton_timing.get("gpu_ms")
+            result["process_cpu_ms"] = triton_timing.get("process_cpu_ms")
+            result["process_gpu_ms"] = triton_timing.get("process_gpu_ms")
+            result["compute_ms"] = triton_timing.get("compute_ms")
     except Exception as exc:
         # Continue to PyTorch / hipSPARSE timing when Triton fails (same as CSR SpMM test).
         result["error"] = f"triton: {exc}"
@@ -710,7 +799,7 @@ def run_one_mtx(
             if extra_route in route_outputs:
                 continue
             try:
-                extra_C, extra_ms, extra_first_call_ms = _benchmark_spmm_coo_route(
+                extra_result = _benchmark_spmm_coo_route(
                     data,
                     row,
                     col,
@@ -723,7 +812,13 @@ def run_one_mtx(
                     block_nnz=block_nnz,
                     prepared=prepared,
                     op=op_name,
+                    dense_layout=dense_layout,
+                    timing=timing,
                 )
+                if timing:
+                    extra_C, extra_ms, extra_first_call_ms, _extra_timing = extra_result
+                else:
+                    extra_C, extra_ms, extra_first_call_ms = extra_result
                 route_outputs[extra_route] = extra_C
                 route_summaries[extra_route] = _summarize_route_output(
                     extra_C,
@@ -786,6 +881,8 @@ def run_mtx_batch(
     block_nnz=DEFAULT_BLOCK_NNZ,
     route="rowrun",
     op="non",
+    dense_layout="row",
+    timing=False,
     on_result=None,
 ):
     results = []
@@ -802,6 +899,8 @@ def run_mtx_batch(
             block_nnz=block_nnz,
             route=route,
             op=op,
+            dense_layout=dense_layout,
+            timing=timing,
         )
         results.append(entry)
         if on_result is not None:
@@ -809,10 +908,13 @@ def run_mtx_batch(
     return results
 
 
-def _print_spmm_coo_mtx_header(value_dtype, index_dtype, route):
+def _print_spmm_coo_mtx_header(value_dtype, index_dtype, route, layout="row", timing=False):
     route = _normalize_route(route)
+    layout = _normalize_layout_name(layout)
     print(f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}")
+    print(f"Dense layout: {layout}")
     print(f"Formats: FlagSparse={_route_label(route)}, hipSPARSE=COO dense-mm, PyTorch=COO.")
+    print("Timing: FS(ms)=process_cpu_ms+FS_GPU(ms); --timing adds process_gpu_ms/compute_ms split.")
     print("Timing stays in native dtype. For float32, correctness references use float64 compute then cast.")
     print("PT/HS show per-reference correctness. Err(PT)/Err(HS)=max(|diff| / (atol + rtol*|ref|)).")
     print("PyTorch uses COO sparse.mm as the only correctness reference path.")
@@ -821,9 +923,12 @@ def _print_spmm_coo_mtx_header(value_dtype, index_dtype, route):
     print("-" * 186)
     print(
         f"{'Matrix':<28} {'Op':>5} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} "
-        f"{'FlagSparse(ms)':>14} {'hipSPARSE(ms)':>14} {'PyTorch(ms)':>11} "
+        f"{'FlagSparse(ms)':>14} {'FS_GPU':>9} {'CPUProc':>9} "
+        f"{'hipSPARSE(ms)':>14} {'PyTorch(ms)':>11} "
         f"{'FS/HS':>7} {'FS/PT':>7} {'PT':>6} {'HS':>6} {'Err(PT)':>10} {'Err(HS)':>10}"
     )
+    if timing:
+        print(f"{'':<28} {'':>5} {'':>7} {'':>7} {'':>10} {'':>8} {'process_gpu_ms/compute_ms are available in CSV rows':>34}")
     print("-" * 186)
 
 
@@ -835,7 +940,8 @@ def _print_spmm_coo_mtx_row(entry):
     pt_ms = entry.get("pytorch_ms")
     print(
         f"{name:<28} {entry.get('op', 'non'):>5} {n_rows:>7} {n_cols:>7} {entry['nnz']:>10} {entry['dense_cols']:>8} "
-        f"{_fmt_ms(triton_ms):>14} {_fmt_ms(cu_ms):>13} {_fmt_ms(pt_ms):>11} "
+        f"{_fmt_ms(triton_ms):>14} {_fmt_ms(entry.get('triton_gpu_ms')):>9} {_fmt_ms(entry.get('process_cpu_ms')):>9} "
+        f"{_fmt_ms(cu_ms):>13} {_fmt_ms(pt_ms):>11} "
         f"{_fmt_speedup(cu_ms, triton_ms):>7} {_fmt_speedup(pt_ms, triton_ms):>7} "
         f"{_fmt_check(entry.get('triton_ok_pt')):>6} {_fmt_check(entry.get('triton_ok_cu')):>6} "
         f"{_fmt_err(entry.get('err_pt')):>10} {_fmt_err(entry.get('err_cu')):>10}"
@@ -848,9 +954,9 @@ def _print_spmm_coo_mtx_row(entry):
         print(f"  NOTE: {msg}")
 
 
-def print_mtx_results(results, value_dtype, index_dtype, route="rowrun"):
+def print_mtx_results(results, value_dtype, index_dtype, route="rowrun", layout="row", timing=False):
     route = _normalize_route(route)
-    _print_spmm_coo_mtx_header(value_dtype, index_dtype, route)
+    _print_spmm_coo_mtx_header(value_dtype, index_dtype, route, layout=layout, timing=timing)
     for entry in results:
         _print_spmm_coo_mtx_row(entry)
     print("-" * 186)
@@ -920,8 +1026,11 @@ def run_all_dtypes_export_csv(
     value_dtypes=None,
     index_dtypes=None,
     op_names=None,
+    dense_layout="row",
+    timing=False,
 ):
     route = _normalize_route(route)
+    dense_layout = _normalize_layout_name(dense_layout)
     if route == "compare":
         raise ValueError("CSV export only supports route='rowrun' or route='atomic'")
     selected_route = _selected_route(route)
@@ -934,7 +1043,7 @@ def run_all_dtypes_export_csv(
         for index_dtype in index_dtypes:
             for op_name in op_names:
                 print("=" * 150)
-                _print_spmm_coo_mtx_header(value_dtype, index_dtype, route)
+                _print_spmm_coo_mtx_header(value_dtype, index_dtype, route, layout=dense_layout, timing=timing)
                 results = run_mtx_batch(
                     paths,
                     value_dtype=value_dtype,
@@ -947,6 +1056,8 @@ def run_all_dtypes_export_csv(
                     block_nnz=block_nnz,
                     route=selected_route,
                     op=op_name,
+                    dense_layout=dense_layout,
+                    timing=timing,
                     on_result=_print_spmm_coo_mtx_row,
                 )
                 print("-" * 186)
@@ -957,10 +1068,15 @@ def run_all_dtypes_export_csv(
                         "op": entry.get("op", op_name),
                         "value_dtype": _dtype_name(value_dtype),
                         "index_dtype": _dtype_name(index_dtype),
+                        "layout": entry.get("layout", dense_layout),
                         "n_rows": n_rows,
                         "n_cols": n_cols,
                         "nnz": entry["nnz"],
                         "triton_ms": entry.get("triton_ms"),
+                        "triton_gpu_ms": entry.get("triton_gpu_ms"),
+                        "process_cpu_ms": entry.get("process_cpu_ms"),
+                        "process_gpu_ms": entry.get("process_gpu_ms"),
+                        "compute_ms": entry.get("compute_ms"),
                         "cusparse_ms": entry.get("cusparse_ms"),
                         "pytorch_ms": entry.get("pytorch_ms"),
                         "triton_speedup_vs_cusparse": _speedup_ratio(
@@ -981,8 +1097,9 @@ def run_all_dtypes_export_csv(
                         "error": entry.get("error"),
                     })
     fieldnames = [
-        "matrix", "op", "value_dtype", "index_dtype", "n_rows", "n_cols", "nnz",
-        "triton_ms", "cusparse_ms", "pytorch_ms",
+        "matrix", "op", "value_dtype", "index_dtype", "layout", "n_rows", "n_cols", "nnz",
+        "triton_ms", "triton_gpu_ms", "process_cpu_ms", "process_gpu_ms", "compute_ms",
+        "cusparse_ms", "pytorch_ms",
         "triton_speedup_vs_cusparse", "triton_speedup_vs_pytorch",
         "pt_status", "cu_status", "status", "err_pt", "err_cu", "error",
     ]
@@ -1232,6 +1349,8 @@ def run_comprehensive_synthetic(
     block_nnz=DEFAULT_BLOCK_NNZ,
     route="rowrun",
     op_names=None,
+    dense_layout="row",
+    timing=False,
 ):
     if not torch.cuda.is_available():
         print("ROCm/PyTorch GPU is not available.")
@@ -1240,13 +1359,14 @@ def run_comprehensive_synthetic(
     route = _normalize_route(route)
     selected_route = _selected_route(route)
     op_names = ["non"] if op_names is None else op_names
+    dense_layout = _normalize_layout_name(dense_layout)
 
     print("=" * 150)
     print("FLAGSPARSE SpMM BENCHMARK (synthetic COO @ dense)")
     print("=" * 150)
     print(
         f"GPU: {torch.cuda.get_device_name(0)}  |  Warmup: {warmup}  Iters: {iters}  "
-        f"BLOCK_N: {_fmt_launch_value(block_n)}  BLOCK_NNZ: {_fmt_launch_value(block_nnz)}  Route: {route}  Ops: {','.join(op_names)}"
+        f"BLOCK_N: {_fmt_launch_value(block_n)}  BLOCK_NNZ: {_fmt_launch_value(block_nnz)}  Route: {route}  Layout: {dense_layout}  Ops: {','.join(op_names)}"
     )
     print(f"Formats: FlagSparse={_route_label(route)}, hipSPARSE=COO dense-mm (when supported), PyTorch=COO.")
     print("For float32, PT checks the float64-based correctness reference while HS reflects native hipSPARSE float32 consistency.")
@@ -1285,6 +1405,7 @@ def run_comprehensive_synthetic(
                         route=selected_route,
                         compare_routes=(route == "compare"),
                         op=op_name,
+                        dense_layout=dense_layout,
                     )
                     total += 1
                     params = result["parameters"]
@@ -1362,6 +1483,8 @@ def main():
     parser.add_argument("--block-n", type=int, default=DEFAULT_BLOCK_N, help="Output column tile override (default: auto from dense-column heuristic)")
     parser.add_argument("--block-nnz", type=int, default=DEFAULT_BLOCK_NNZ, help="COO nnz tile width override (default: 256)")
     parser.add_argument("--route", default="rowrun", choices=["rowrun", "atomic", "compare"], help="Native COO route to benchmark/test (default: rowrun)")
+    parser.add_argument("--layout", default="row", choices=["row", "col"], help="Dense RHS/output layout for FlagSparse runs")
+    parser.add_argument("--timing", action="store_true", help="Add process_gpu_ms/compute_ms split timing columns")
     parser.add_argument("--warmup", type=int, default=10, help="Warmup runs")
     parser.add_argument("--iters", type=int, default=50, help="Timing iterations")
     parser.add_argument("--no-hipsparse", action="store_true", dest="no_cusparse", help="Skip direct hipSPARSE reference")
@@ -1402,6 +1525,8 @@ def main():
             block_nnz=args.block_nnz,
             route=args.route,
             op_names=op_names,
+            dense_layout=args.layout,
+            timing=args.timing,
         )
         return
 
@@ -1438,7 +1563,7 @@ def main():
         except ValueError as exc:
             parser.error(str(exc))
         print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  DenseN: {args.dense_cols}  |  Route: {args.route}  |  CSV: {csv_path}")
-        print(f"dtypes: {args.dtypes}  |  index_dtypes: {args.index_dtypes}  |  ops: {args.op}")
+        print(f"dtypes: {args.dtypes}  |  index_dtypes: {args.index_dtypes}  |  ops: {args.op}  |  layout: {args.layout}")
         run_all_dtypes_export_csv(
             paths,
             csv_path,
@@ -1452,6 +1577,8 @@ def main():
             value_dtypes=csv_value_dtypes,
             index_dtypes=csv_index_dtypes,
             op_names=csv_op_names,
+            dense_layout=args.layout,
+            timing=args.timing,
         )
         return
 
@@ -1462,11 +1589,11 @@ def main():
     print(
         f"dtype: {args.dtype}  index_dtype: {args.index_dtype}  dense_cols: {args.dense_cols}  "
         f"op: {args.op}  warmup: {args.warmup}  iters: {args.iters}  block_n: {_fmt_launch_value(args.block_n)}  "
-        f"block_nnz: {_fmt_launch_value(args.block_nnz)}  route: {args.route}"
+        f"block_nnz: {_fmt_launch_value(args.block_nnz)}  route: {args.route}  layout: {args.layout}"
     )
     print()
     for op_name in op_names:
-        _print_spmm_coo_mtx_header(value_dtype, index_dtype, route=args.route)
+        _print_spmm_coo_mtx_header(value_dtype, index_dtype, route=args.route, layout=args.layout, timing=args.timing)
         results = run_mtx_batch(
             paths,
             value_dtype=value_dtype,
@@ -1479,6 +1606,8 @@ def main():
             block_nnz=args.block_nnz,
             route=args.route,
             op=op_name,
+            dense_layout=args.layout,
+            timing=args.timing,
             on_result=_print_spmm_coo_mtx_row,
         )
         print("-" * 186)

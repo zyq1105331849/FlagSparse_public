@@ -42,6 +42,10 @@ DEFAULT_DTYPE_NAMES = ("float32", "float64", "complex64", "complex128")
 DEFAULT_RUN_DTYPE_NAMES = ("float32", "float64")
 DEFAULT_OP_NAMES = tuple(spmm_ops.SPMM_OP_NAMES.values())
 CUSPARSE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
+MAIN_CSR_SPMM_ALGORITHMS = {
+    "csr_base",
+    "csr_base_accuracy",
+}
 
 PERF_FIELDS = [
     "matrix",
@@ -451,7 +455,7 @@ def run_one_case(path, dtype, op, layout, alg_names, dense_cols, warmup, iters, 
     for alg in _expand_algs(alg_names, op, dtype):
         try:
             resolved = fs.resolve_spmm_csr_algorithm(alg, op, dtype)
-            if layout == "col" and resolved.name != "csr_base":
+            if layout == "col" and resolved.name not in MAIN_CSR_SPMM_ALGORITHMS:
                 rows.append(
                     _skip_row(
                         path,
@@ -465,7 +469,7 @@ def run_one_case(path, dtype, op, layout, alg_names, dense_cols, warmup, iters, 
                         b_stride,
                         torch_ms,
                         cusparse_ms,
-                        "col-major layout is currently supported only by csr_base",
+                        "col-major layout is currently supported only by csr_base/csr_base_accuracy",
                         timing,
                         cusparse_reason=cusparse_reason,
                     )

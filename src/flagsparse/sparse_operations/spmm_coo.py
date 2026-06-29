@@ -1554,6 +1554,7 @@ def _benchmark_spmm_coo_route(
     block_nnz,
     route,
     op="non",
+    dense_layout="row",
 ):
     route = _normalize_spmm_coo_route(route)
     run = lambda: _run_spmm_coo_route(
@@ -1567,6 +1568,7 @@ def _benchmark_spmm_coo_route(
         return_time=False,
         route=route,
         op=op,
+        dense_layout=dense_layout,
     )
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -1608,18 +1610,23 @@ def benchmark_spmm_coo_case(
     route="rowrun",
     compare_routes=False,
     op="non",
+    dense_layout="row",
 ):
     """Benchmark native COO SpMM vs PyTorch COO sparse.mm and direct hipSPARSE COO @ dense."""
     selected_route = _normalize_spmm_coo_route(route)
     op_code = _normalize_spmm_coo_op(op)
     op_name = _spmm_coo_op_to_name(op_code)
+    dense_layout = _normalize_dense_layout(dense_layout)
     device = torch.device("cuda")
     data, row, col = _build_random_coo(
         n_rows, n_cols, nnz, value_dtype, index_dtype, device
     )
     shape = (n_rows, n_cols)
     b_rows = n_rows if _spmm_coo_op_transposes(op_code) else n_cols
-    B = _build_random_dense((b_rows, n_dense_cols), value_dtype, device)
+    B = _materialize_dense_layout(
+        _build_random_dense((b_rows, n_dense_cols), value_dtype, device),
+        dense_layout,
+    )
     effective_data, effective_row, effective_col, effective_shape = _materialize_spmm_coo_op(
         data,
         row,
@@ -1629,7 +1636,12 @@ def benchmark_spmm_coo_case(
     )
 
     native_data, native_row, native_col, native_B, _, _, _ = _prepare_spmm_coo_inputs(
-        effective_data, effective_row, effective_col, B, effective_shape
+        effective_data,
+        effective_row,
+        effective_col,
+        B,
+        effective_shape,
+        dense_layout=dense_layout,
     )
     (
         canonical_data,
@@ -1697,6 +1709,7 @@ def benchmark_spmm_coo_case(
         launch["block_nnz"],
         selected_route,
         op=op_name,
+        dense_layout=dense_layout,
     )
     triton_summary = _spmm_coo_pairwise_summary(triton_C, expected, value_dtype)
     triton_match = triton_summary["match"]
@@ -1781,6 +1794,7 @@ def benchmark_spmm_coo_case(
                     launch["block_nnz"],
                     extra_route,
                     op=op_name,
+                    dense_layout=dense_layout,
                 )
                 extra_summary = _spmm_coo_pairwise_summary(extra_values, expected, value_dtype)
                 route_outputs[extra_route] = extra_values
@@ -1843,6 +1857,8 @@ def benchmark_spmm_coo_case(
             "internal_format": f"native-{selected_route}",
             "route": selected_route,
             "op": op_name,
+            "dense_layout": dense_layout,
+            "output_layout": _dense_layout_name(triton_C),
             "compare_routes": bool(compare_routes),
             "n_rows": n_rows,
             "n_cols": n_cols,

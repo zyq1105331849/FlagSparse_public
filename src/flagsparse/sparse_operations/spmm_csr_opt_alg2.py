@@ -454,6 +454,7 @@ def _spmm_csr_alg2_batched_rows_kernel(
     BLOCK_K: tl.constexpr,
     ACC_DTYPE: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
+    ACCURACY: tl.constexpr,
 ):
     pid_row = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -505,6 +506,7 @@ def _spmm_csr_alg2_row_rows_kernel(
     BLOCK_K: tl.constexpr,
     ACC_DTYPE: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
+    ACCURACY: tl.constexpr,
 ):
     pid_row = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -552,6 +554,7 @@ def _spmm_csr_alg2_segmented_rows_kernel(
     SEGMENTS: tl.constexpr,
     ACC_DTYPE: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
+    ACCURACY: tl.constexpr,
 ):
     pid_row = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -820,6 +823,7 @@ def _run_spmm_opt_alg2_bucket(prepared, bucket, B, C_out, device_props):
             BLOCK_K=launch["block_k"],
             ACC_DTYPE=acc_dtype,
             OUT_DTYPE=out_dtype,
+            ACCURACY=False,
             **common_kwargs,
         )
     elif bucket["kind"] == "row2d":
@@ -841,6 +845,7 @@ def _run_spmm_opt_alg2_bucket(prepared, bucket, B, C_out, device_props):
             BLOCK_K=launch["block_k"],
             ACC_DTYPE=acc_dtype,
             OUT_DTYPE=out_dtype,
+            ACCURACY=False,
             **common_kwargs,
         )
     else:
@@ -863,6 +868,7 @@ def _run_spmm_opt_alg2_bucket(prepared, bucket, B, C_out, device_props):
             SEGMENTS=launch["segments"],
             ACC_DTYPE=acc_dtype,
             OUT_DTYPE=out_dtype,
+            ACCURACY=False,
             **common_kwargs,
         )
 
