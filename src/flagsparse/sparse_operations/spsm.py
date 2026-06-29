@@ -106,6 +106,9 @@ def _hipsparse_csrsm2_skip_reason(value_dtype, index_dtype, indptr_dtype=None):
         return f"hipSPARSE csrsm2 has no value dtype mapping for {value_dtype}"
     if index_dtype != torch.int32 or indptr_dtype != torch.int32:
         return "hipSPARSE csrsm2 requires int32 CSR indices and row offsets"
+    for symbol in ("hipMalloc", "hipFree"):
+        if hip is None or not hasattr(hip, symbol):
+            return f"hipSPARSE csrsm2 is unavailable: missing HIP runtime {symbol}"
     required = (
         "hipsparseCreate",
         "hipsparseDestroy",
@@ -484,37 +487,46 @@ def _benchmark_spsm_csr_sparse_ref(
         return result
     state = None
     try:
-        state = _prepare_spsm_csr_ref_hipsparse(
-            data,
-            indices,
-            indptr,
-            B,
-            shape,
-            lower=lower,
-            unit_diagonal=unit_diagonal,
-        )
         values = None
         for _ in range(warmup):
-            values = _run_spsm_csr_ref_hipsparse_prepared(state)
+            state = _prepare_spsm_csr_ref_hipsparse(
+                data,
+                indices,
+                indptr,
+                B,
+                shape,
+                lower=lower,
+                unit_diagonal=unit_diagonal,
+            )
+            try:
+                values = _run_spsm_csr_ref_hipsparse_prepared(state)
+            finally:
+                _destroy_spsm_csr_ref_hipsparse_prepared(state)
+                state = None
+            torch.cuda.synchronize()
         torch.cuda.synchronize()
         times = []
         for _ in range(iters):
-            state["solution_col_major"].copy_(state["rhs"])
-            times.append(
-                _time_hipsparse_call_ms(
-                    lambda: _hip_check_result(
-                        state["solve_fn"](
-                            *state["solve_args"], state["workspace"]
-                        ),
-                        "hipsparseXcsrsm2_solve",
-                    )
-                )
+            torch.cuda.synchronize()
+            start_time = time.perf_counter()
+            state = _prepare_spsm_csr_ref_hipsparse(
+                data,
+                indices,
+                indptr,
+                B,
+                shape,
+                lower=lower,
+                unit_diagonal=unit_diagonal,
             )
-        values = state["solution_col_major"].transpose(0, 1).contiguous()
-        analysis_ms = float(state.get("analysis_ms", 0.0))
-        solve_ms = _spsm_filtered_avg_ms(times)
+            try:
+                values = _run_spsm_csr_ref_hipsparse_prepared(state)
+                torch.cuda.synchronize()
+                times.append((time.perf_counter() - start_time) * 1000.0)
+            finally:
+                _destroy_spsm_csr_ref_hipsparse_prepared(state)
+                state = None
         result["values"] = values
-        result["ms"] = analysis_ms + solve_ms if solve_ms is not None else None
+        result["ms"] = _spsm_filtered_avg_ms(times)
         result["reason"] = None
     except Exception as exc:
         result["reason"] = str(exc)

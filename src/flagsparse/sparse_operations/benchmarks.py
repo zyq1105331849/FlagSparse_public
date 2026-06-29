@@ -34,6 +34,9 @@ from .sddmm_csr import benchmark_sddmm_case
 from .spsm import benchmark_spsm_case
 
 
+_GATHER_GRAPH_BATCH = 100
+
+
 def _normalize_dtype_name(value):
     if isinstance(value, str):
         return value.strip().lower()
@@ -95,11 +98,33 @@ def benchmark_gather_case(
     dense_vector, indices, kernel_indices = _prepare_inputs(dense_vector, indices)
     expected = dense_vector[indices]
 
-    pytorch_op = lambda: dense_vector[indices]
-    triton_op = lambda: _triton_gather_impl(dense_vector, kernel_indices, block_size=block_size)
+    pytorch_out = torch.empty_like(expected)
+    triton_out = torch.empty_like(expected)
+    pytorch_op = lambda: torch.index_select(dense_vector, 0, indices, out=pytorch_out)
+    triton_op = lambda: _triton_gather_impl(
+        dense_vector, kernel_indices, out=triton_out, block_size=block_size
+    )
 
-    pytorch_values, pytorch_ms = _benchmark_cuda_op(pytorch_op, warmup=warmup, iters=iters)
-    triton_values, triton_ms = _benchmark_cuda_op(triton_op, warmup=warmup, iters=iters)
+    try:
+        pytorch_ms = _benchmark_cuda_graph_op(
+            pytorch_op,
+            graph_batch=_GATHER_GRAPH_BATCH,
+            warmup=warmup,
+            repeats=iters,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"PyTorch CUDA Graph timing failed: {exc}") from exc
+    try:
+        triton_ms = _benchmark_cuda_graph_op(
+            triton_op,
+            graph_batch=_GATHER_GRAPH_BATCH,
+            warmup=warmup,
+            repeats=iters,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Triton CUDA Graph timing failed: {exc}") from exc
+    pytorch_values = pytorch_out
+    triton_values = triton_out
 
     atol, rtol = _tolerance_for_dtype(value_dtype)
     triton_match = torch.allclose(triton_values, expected, atol=atol, rtol=rtol)
@@ -183,6 +208,7 @@ def benchmark_gather_case(
             "index_dtype": str(index_dtype),
             "warmup": warmup,
             "iters": iters,
+            "kernel_graph_batch": _GATHER_GRAPH_BATCH,
         },
         "performance": {
             "pytorch_ms": pytorch_ms,
@@ -190,6 +216,7 @@ def benchmark_gather_case(
             "hipsparse_ms": hipsparse_ms,
             "triton_speedup_vs_pytorch": triton_speedup_vs_pytorch,
             "triton_speedup_vs_hipsparse": triton_speedup_vs_hipsparse,
+            "kernel_timing_method": "cuda_graph_event_amortized_device_estimate",
         },
         "verification": {
             "triton_match_pytorch": triton_match,

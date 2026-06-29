@@ -2,6 +2,14 @@ import argparse
 import csv
 import math
 import os
+import sys
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+if SRC_ROOT.is_dir():
+    sys.path.insert(0, str(SRC_ROOT))
 
 import torch
 
@@ -18,6 +26,7 @@ DEFAULT_VALUE_DTYPES = "float16,bfloat16,float32,float64,complex64,complex128"
 DEFAULT_INDEX_DTYPES = "int32,int64"
 WARMUP = 20
 ITERS = 200
+KERNEL_GRAPH_BATCH = 100
 
 
 def _fmt_ms(value):
@@ -82,8 +91,8 @@ def _parse_cases(raw):
         left, right = item.split(":", 1)
         dense_size = int(left)
         nnz = int(right)
-        if dense_size < 0 or nnz < 0:
-            raise ValueError(f"case values must be non-negative: {item}")
+        if dense_size <= 0 or nnz <= 0:
+            raise ValueError(f"case values must be positive: {item}")
         pairs.append((dense_size, nnz))
     if not pairs:
         raise ValueError("case list is empty")
@@ -201,9 +210,11 @@ def run_cli(args):
     print("=" * 180)
     print("FLAGSPARSE GATHER BENCHMARK/VALIDATION")
     print("=" * 180)
+    print(f"FlagSparse source: {Path(ast.__file__).resolve()}")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(
         f"Warmup: {args.warmup} | Iterations: {args.iters} | "
+        f"Kernel graph batch: {KERNEL_GRAPH_BATCH} | "
         "HS(ms): direct hipSPARSE backend steady-state time"
     )
     print()
@@ -241,6 +252,18 @@ def run_cli(args):
                     verify = result["verification"]
                     params = result["parameters"]
                     backend = result["backend_status"]
+                    timing_method = perf.get("kernel_timing_method")
+                    graph_batch = params.get("kernel_graph_batch")
+                    if timing_method != "cuda_graph_event_amortized_device_estimate":
+                        raise RuntimeError(
+                            "loaded benchmark_gather_case does not provide CUDA Graph timing; "
+                            f"flagsparse was loaded from {Path(ast.__file__).resolve()}"
+                        )
+                    if graph_batch != KERNEL_GRAPH_BATCH:
+                        raise RuntimeError(
+                            "unexpected gather graph batch: "
+                            f"expected {KERNEL_GRAPH_BATCH}, got {graph_batch}"
+                        )
                     status = _status_from_result(verify)
                     if status != "PASS":
                         failed_cases += 1
@@ -262,6 +285,8 @@ def run_cli(args):
                         "hipsparse_ms": perf.get("hipsparse_ms"),
                         "triton_speedup_vs_pytorch": perf.get("triton_speedup_vs_pytorch"),
                         "triton_speedup_vs_hipsparse": perf.get("triton_speedup_vs_hipsparse"),
+                        "kernel_timing_method": timing_method,
+                        "kernel_graph_batch": graph_batch,
                         "triton_match_pytorch": verify.get("triton_match_pytorch"),
                         "hipsparse_match_pytorch": verify.get("hipsparse_match_pytorch"),
                         "triton_max_error": verify.get("triton_max_error"),
@@ -284,6 +309,8 @@ def run_cli(args):
                         )
                 except Exception as exc:
                     failed_cases += 1
+                    error_text = f"{exc.__class__.__name__}: {exc}"
+                    print(f"\nERROR [{case_id}]: {error_text}")
                     row = {
                         "case_id": case_id,
                         "gpu": torch.cuda.get_device_name(0),
@@ -300,12 +327,14 @@ def run_cli(args):
                         "hipsparse_ms": None,
                         "triton_speedup_vs_pytorch": None,
                         "triton_speedup_vs_hipsparse": None,
+                        "kernel_timing_method": "cuda_graph_event_amortized_device_estimate",
+                        "kernel_graph_batch": KERNEL_GRAPH_BATCH,
                         "triton_match_pytorch": None,
                         "hipsparse_match_pytorch": None,
                         "triton_max_error": None,
                         "hipsparse_max_error": None,
-                        "hipsparse_unavailable_reason": str(exc),
-                        "index_fallback_reason": str(exc),
+                        "hipsparse_unavailable_reason": error_text,
+                        "index_fallback_reason": error_text,
                         "status": "ERROR",
                     }
                     summary_rows.append(row)
@@ -333,6 +362,8 @@ def run_cli(args):
             "hipsparse_ms",
             "triton_speedup_vs_pytorch",
             "triton_speedup_vs_hipsparse",
+            "kernel_timing_method",
+            "kernel_graph_batch",
             "triton_match_pytorch",
             "hipsparse_match_pytorch",
             "triton_max_error",
