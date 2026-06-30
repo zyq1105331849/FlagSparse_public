@@ -35,8 +35,8 @@ VALUE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
 INDEX_DTYPES = [torch.int32]
 CSV_VALUE_DTYPES = [torch.float32, torch.float64, torch.complex64, torch.complex128]
 CSV_INDEX_DTYPES = [torch.int32]
-WARMUP = 10
-ITERS = 20
+WARMUP = 0
+ITERS = 1
 SPSM_CASE_TIMEOUT_SECONDS = 180
 SPSM_OP_MODES = ["NON", "NON_TRANS"]
 
@@ -467,28 +467,76 @@ def _solution_residual_metrics(data, indices, indptr, shape, X, B, value_dtype):
 
 
 def _benchmark_flagsparse_full_round(
-    reset_call, analyze_call, solve_call, warmup, iters
+    reset_call,
+    analyze_call,
+    solve_call,
+    warmup,
+    iters,
+    *,
+    progress=None,
+    max_total_seconds=None,
+    stage_prefix="flagsparse",
 ):
+    def _progress(stage):
+        if progress is not None:
+            progress(stage)
+
+    total_rounds = max(1, int(warmup) + int(iters))
+
+    def _check_estimate(round_ms, source):
+        if max_total_seconds is None:
+            return
+        estimated_seconds = (float(round_ms) * total_rounds) / 1000.0
+        if estimated_seconds > float(max_total_seconds):
+            raise TimeoutError(
+                f"{source} took {round_ms:.4f} ms; estimated "
+                f"{estimated_seconds:.1f}s for warmup={warmup}, timed_iters={iters}, "
+                f"exceeds per-matrix timeout {float(max_total_seconds):.1f}s"
+            )
+
     X = None
-    for _ in range(warmup):
-        reset_call()
-        torch.cuda.synchronize()
-        analyze_call()
-        X = solve_call()
-        torch.cuda.synchronize()
-    times = []
-    for _ in range(iters):
+    for warmup_idx in range(warmup):
         reset_call()
         torch.cuda.synchronize()
         start = time.perf_counter()
+        _progress(f"{stage_prefix}_warmup_{warmup_idx + 1}_analysis")
         analyze_call()
+        _progress(f"{stage_prefix}_warmup_{warmup_idx + 1}_solve")
         X = solve_call()
         torch.cuda.synchronize()
-        times.append((time.perf_counter() - start) * 1000.0)
+        round_ms = (time.perf_counter() - start) * 1000.0
+        if warmup_idx > 0 or warmup <= 1:
+            _check_estimate(
+                round_ms,
+                f"{stage_prefix} warmup round {warmup_idx + 1}",
+            )
+    times = []
+    for iter_idx in range(iters):
+        reset_call()
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        _progress(f"{stage_prefix}_timed_{iter_idx + 1}_analysis")
+        analyze_call()
+        _progress(f"{stage_prefix}_timed_{iter_idx + 1}_solve")
+        X = solve_call()
+        torch.cuda.synchronize()
+        round_ms = (time.perf_counter() - start) * 1000.0
+        if iter_idx == 0 and warmup <= 0:
+            _check_estimate(round_ms, f"{stage_prefix} timed round 1")
+        times.append(round_ms)
     return X, _allinone_filtered_avg_ms(times)
 
 
-def _benchmark_flagsparse_spsm_csr_total(data, indices, indptr, B, shape):
+def _benchmark_flagsparse_spsm_csr_total(
+    data,
+    indices,
+    indptr,
+    B,
+    shape,
+    *,
+    progress=None,
+    max_total_seconds=None,
+):
     warmup, iters = _spsm_benchmark_schedule(
         data.numel(), B.shape[1], data.dtype, fmt="csr"
     )
@@ -514,10 +562,22 @@ def _benchmark_flagsparse_spsm_csr_total(data, indices, indptr, B, shape):
         solve_call,
         warmup,
         iters,
+        progress=progress,
+        max_total_seconds=max_total_seconds,
+        stage_prefix="flagsparse_csr",
     )
 
 
-def _benchmark_flagsparse_spsm_coo_total(data, row, col, B, shape):
+def _benchmark_flagsparse_spsm_coo_total(
+    data,
+    row,
+    col,
+    B,
+    shape,
+    *,
+    progress=None,
+    max_total_seconds=None,
+):
     warmup, iters = _spsm_benchmark_schedule(
         data.numel(), B.shape[1], data.dtype, fmt="coo"
     )
@@ -543,6 +603,9 @@ def _benchmark_flagsparse_spsm_coo_total(data, row, col, B, shape):
         solve_call,
         warmup,
         iters,
+        progress=progress,
+        max_total_seconds=max_total_seconds,
+        stage_prefix="flagsparse_coo",
     )
 
 
@@ -638,6 +701,7 @@ def _run_one_spsm_case(
     fmt,
     progress=None,
     partial=None,
+    max_case_seconds=None,
 ):
     def _progress(stage):
         if progress is not None:
@@ -669,6 +733,8 @@ def _run_one_spsm_case(
             indptr_eff.to(index_dtype),
             B,
             shape,
+            progress=_progress,
+            max_total_seconds=max_case_seconds,
         )
     else:
         _progress("flagsparse_coo_analysis_plus_solve")
@@ -678,6 +744,8 @@ def _run_one_spsm_case(
             col.to(index_dtype),
             B,
             shape,
+            progress=_progress,
+            max_total_seconds=max_case_seconds,
         )
     _partial(
         _partial_csv_case_row(
@@ -794,6 +862,7 @@ def _run_spsm_csv_case_worker(
     fmt,
     warmup,
     iters,
+    timeout_seconds,
 ):
     global WARMUP, ITERS
     WARMUP = max(0, int(warmup))
@@ -820,6 +889,7 @@ def _run_spsm_csv_case_worker(
             fmt,
             progress=lambda stage: result_queue.put(("progress", stage)),
             partial=lambda row: result_queue.put(("partial", {**base, **row})),
+            max_case_seconds=timeout_seconds,
         )
         result_queue.put(("ok", {**base, **row}))
     except BaseException as exc:
@@ -850,6 +920,7 @@ def _run_spsm_csv_case_with_timeout(
             fmt,
             WARMUP,
             ITERS,
+            timeout_seconds,
         ),
     )
     proc.start()
@@ -873,7 +944,15 @@ def _run_spsm_csv_case_with_timeout(
                 proc.join()
                 return payload
             err_msg = str(payload)
-            status_out = "SKIP" if "SpSM requires square matrices" in err_msg else "ERROR"
+            status_out = (
+                "SKIP"
+                if (
+                    "SpSM requires square matrices" in err_msg
+                    or "exceeds per-matrix timeout" in err_msg
+                    or "TimeoutError" in err_msg
+                )
+                else "ERROR"
+            )
             proc.join()
             return _empty_csv_case_row(base, fmt, n_rhs, status_out, err_msg)
 
@@ -911,7 +990,15 @@ def _run_spsm_csv_case_with_timeout(
         if status == "ok":
             return payload
         err_msg = str(payload)
-        status_out = "SKIP" if "SpSM requires square matrices" in err_msg else "ERROR"
+        status_out = (
+            "SKIP"
+            if (
+                "SpSM requires square matrices" in err_msg
+                or "exceeds per-matrix timeout" in err_msg
+                or "TimeoutError" in err_msg
+            )
+            else "ERROR"
+        )
         return _empty_csv_case_row(base, fmt, n_rhs, status_out, err_msg)
 
     if latest_partial is not None:
