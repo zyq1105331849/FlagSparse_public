@@ -184,6 +184,53 @@ def _empty_csv_case_row(base, fmt, n_rhs, status, error):
     }
 
 
+def _partial_csv_case_row(
+    fmt,
+    n_rows,
+    n_cols,
+    nnz,
+    n_rhs,
+    *,
+    flagsparse_ms=None,
+    hipsparse_ms=None,
+    pytorch_ms=None,
+    flagsparse_speedup_vs_hipsparse=None,
+    flagsparse_speedup_vs_pytorch=None,
+    pt_status="N/A",
+    hs_status="N/A",
+    status="PARTIAL",
+    err_ref=None,
+    err_res=None,
+    err_pt=None,
+    err_hs=None,
+    hipsparse_reason=None,
+    pytorch_reason=None,
+    error=None,
+):
+    return {
+        "format": fmt,
+        "n_rows": int(n_rows),
+        "n_cols": int(n_cols),
+        "nnz": int(nnz),
+        "n_rhs": int(n_rhs),
+        "flagsparse_ms": flagsparse_ms,
+        "hipsparse_ms": hipsparse_ms,
+        "pytorch_ms": pytorch_ms,
+        "flagsparse_speedup_vs_hipsparse": flagsparse_speedup_vs_hipsparse,
+        "flagsparse_speedup_vs_pytorch": flagsparse_speedup_vs_pytorch,
+        "pt_status": pt_status,
+        "hs_status": hs_status,
+        "status": status,
+        "err_ref": err_ref,
+        "err_res": err_res,
+        "err_pt": err_pt,
+        "err_hs": err_hs,
+        "hipsparse_reason": hipsparse_reason,
+        "pytorch_reason": pytorch_reason,
+        "error": error,
+    }
+
+
 def _short_matrix_name(matrix):
     return matrix[:27] + ("…" if len(matrix) > 27 else "")
 
@@ -320,46 +367,29 @@ def _stabilize_lower_triangular_csr(data, indices, indptr, shape):
     return data_stable, col.to(torch.int64), indptr_stable
 
 
-def _benchmark_pytorch_reference(data, indices, indptr, shape, B, warmup, iters):
+def _benchmark_pytorch_reference(data, indices, indptr, shape, B):
     try:
         sparse_spsolve = getattr(torch.sparse, "spsolve", None)
         if sparse_spsolve is None:
             raise NotImplementedError("torch.sparse.spsolve is unavailable")
-        warmup = max(0, int(warmup))
-        iters = max(1, int(iters))
-        X_ref = None
-
-        def _run_one_round():
-            data_eff, indices_eff, indptr_eff = _extract_effective_lower_csr(
-                data, indices, indptr, shape
-            )
-            A_csr = torch.sparse_csr_tensor(
-                indptr_eff,
-                indices_eff,
-                data_eff,
-                size=shape,
-                device=data.device,
-            )
-            if not A_csr.is_cuda:
-                raise RuntimeError("torch.sparse.spsolve CUDA path is unavailable")
-            cols = []
-            for bj in torch.unbind(B, dim=1):
-                cols.append(sparse_spsolve(A_csr, bj))
-            return torch.stack(cols, dim=1) if cols else B.new_empty(B.shape)
-
-        for _ in range(warmup):
-            X_ref = _run_one_round()
-            torch.cuda.synchronize()
-
-        times = []
-        for _ in range(iters):
-            torch.cuda.synchronize()
-            start = time.perf_counter()
-            X_ref = _run_one_round()
-            torch.cuda.synchronize()
-            times.append((time.perf_counter() - start) * 1000.0)
-        ms = _allinone_filtered_avg_ms(times)
-        return X_ref.to(B.dtype), ms, "gpu_sparse", None
+        data_eff, indices_eff, indptr_eff = _extract_effective_lower_csr(
+            data, indices, indptr, shape
+        )
+        A_csr = torch.sparse_csr_tensor(
+            indptr_eff,
+            indices_eff,
+            data_eff,
+            size=shape,
+            device=data.device,
+        )
+        if not A_csr.is_cuda:
+            raise RuntimeError("torch.sparse.spsolve CUDA path is unavailable")
+        cols = []
+        for bj in torch.unbind(B, dim=1):
+            cols.append(sparse_spsolve(A_csr, bj))
+        X_ref = torch.stack(cols, dim=1) if cols else B.new_empty(B.shape)
+        torch.cuda.synchronize()
+        return X_ref.to(B.dtype), None, "gpu_sparse", None
     except Exception as exc:
         if "out of memory" in str(exc).lower() and torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -597,7 +627,27 @@ def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
     return data, indices, indptr, (n_rows, n_cols)
 
 
-def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n_rhs, fmt):
+def _run_one_spsm_case(
+    data,
+    indices,
+    indptr,
+    shape,
+    value_dtype,
+    index_dtype,
+    n_rhs,
+    fmt,
+    progress=None,
+    partial=None,
+):
+    def _progress(stage):
+        if progress is not None:
+            progress(stage)
+
+    def _partial(row):
+        if partial is not None:
+            partial(row)
+
+    _progress("prepare_rhs_and_triangular_csr")
     n_rows = int(shape[0])
     B = torch.randn((n_rows, n_rhs), dtype=value_dtype, device=data.device).contiguous()
     data_eff, indices_eff, indptr_eff = _extract_effective_lower_csr(
@@ -612,6 +662,7 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
     )
 
     if fmt == "csr":
+        _progress("flagsparse_csr_analysis_plus_solve")
         X_fs, flagsparse_ms = _benchmark_flagsparse_spsm_csr_total(
             data_eff,
             indices_eff.to(index_dtype),
@@ -620,6 +671,7 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
             shape,
         )
     else:
+        _progress("flagsparse_coo_analysis_plus_solve")
         X_fs, flagsparse_ms = _benchmark_flagsparse_spsm_coo_total(
             data_eff,
             row.to(index_dtype),
@@ -627,6 +679,18 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
             B,
             shape,
         )
+    _partial(
+        _partial_csv_case_row(
+            fmt,
+            n_rows,
+            int(shape[1]),
+            int(data_eff.numel()),
+            n_rhs,
+            flagsparse_ms=flagsparse_ms,
+            status="FS_DONE",
+        )
+    )
+    _progress("hipsparse_csrsm2_analysis_plus_solve")
     (
         X_hs,
         hipsparse_ms,
@@ -642,9 +706,28 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
         warmup,
         iters,
     )
-    X_pt, pytorch_ms, _pt_backend, pytorch_reason = _benchmark_pytorch_reference(
-        data_eff, indices_eff, indptr_eff, shape, B, warmup, iters
+    _partial(
+        _partial_csv_case_row(
+            fmt,
+            n_rows,
+            int(shape[1]),
+            int(data_eff.numel()),
+            n_rhs,
+            flagsparse_ms=flagsparse_ms,
+            hipsparse_ms=hipsparse_ms,
+            flagsparse_speedup_vs_hipsparse=_safe_ratio(
+                hipsparse_ms, flagsparse_ms
+            ),
+            hs_status="DONE" if X_hs is not None else "N/A",
+            status="HS_DONE",
+            hipsparse_reason=hipsparse_reason,
+        )
     )
+    _progress("pytorch_reference_single_spsolve")
+    X_pt, pytorch_ms, _pt_backend, pytorch_reason = _benchmark_pytorch_reference(
+        data_eff, indices_eff, indptr_eff, shape, B
+    )
+    _progress("validate_results")
 
     err_hs = None
     ok_hs = None
@@ -719,11 +802,13 @@ def _run_spsm_csv_case_worker(
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA/ROCm device is not available.")
         device = torch.device("cuda")
+        result_queue.put(("progress", "load_mtx"))
         data, indices, indptr, shape = _load_mtx_to_csr_torch(
             path,
             dtype=value_dtype,
             device=device,
         )
+        result_queue.put(("progress", "run_case"))
         row = _run_one_spsm_case(
             data,
             indices,
@@ -733,6 +818,8 @@ def _run_spsm_csv_case_worker(
             index_dtype,
             n_rhs,
             fmt,
+            progress=lambda stage: result_queue.put(("progress", stage)),
+            partial=lambda row: result_queue.put(("partial", {**base, **row})),
         )
         result_queue.put(("ok", {**base, **row}))
     except BaseException as exc:
@@ -750,7 +837,7 @@ def _run_spsm_csv_case_with_timeout(
 ):
     timeout_seconds = max(1, int(timeout_seconds))
     ctx = mp.get_context("spawn")
-    result_queue = ctx.Queue(maxsize=1)
+    result_queue = ctx.Queue()
     proc = ctx.Process(
         target=_run_spsm_csv_case_worker,
         args=(
@@ -766,38 +853,83 @@ def _run_spsm_csv_case_with_timeout(
         ),
     )
     proc.start()
-    proc.join(timeout_seconds)
+    deadline = time.monotonic() + timeout_seconds
+    last_phase = "startup"
+    latest_partial = None
+    while proc.is_alive() and time.monotonic() < deadline:
+        proc.join(0.2)
+        while True:
+            try:
+                status, payload = result_queue.get_nowait()
+            except Empty:
+                break
+            if status == "progress":
+                last_phase = str(payload)
+                continue
+            if status == "partial":
+                latest_partial = dict(payload)
+                continue
+            if status == "ok":
+                proc.join()
+                return payload
+            err_msg = str(payload)
+            status_out = "SKIP" if "SpSM requires square matrices" in err_msg else "ERROR"
+            proc.join()
+            return _empty_csv_case_row(base, fmt, n_rhs, status_out, err_msg)
+
     if proc.is_alive():
         proc.terminate()
         proc.join(10)
         if proc.is_alive():
             proc.kill()
             proc.join()
+        timeout_error = f"timed out after {timeout_seconds} seconds during {last_phase}"
+        if latest_partial is not None:
+            row = dict(latest_partial)
+            row["status"] = "SKIP"
+            row["error"] = timeout_error
+            return row
         return _empty_csv_case_row(
             base,
             fmt,
             n_rhs,
             "SKIP",
-            f"timed out after {timeout_seconds} seconds",
+            timeout_error,
         )
 
-    try:
-        status, payload = result_queue.get_nowait()
-    except Empty:
-        return _empty_csv_case_row(
-            base,
-            fmt,
-            n_rhs,
-            "ERROR",
-            f"worker exited with code {proc.exitcode} without returning a result",
+    while True:
+        try:
+            status, payload = result_queue.get_nowait()
+        except Empty:
+            break
+        if status == "progress":
+            last_phase = str(payload)
+            continue
+        if status == "partial":
+            latest_partial = dict(payload)
+            continue
+        if status == "ok":
+            return payload
+        err_msg = str(payload)
+        status_out = "SKIP" if "SpSM requires square matrices" in err_msg else "ERROR"
+        return _empty_csv_case_row(base, fmt, n_rhs, status_out, err_msg)
+
+    if latest_partial is not None:
+        row = dict(latest_partial)
+        row["status"] = "ERROR"
+        row["error"] = (
+            f"worker exited with code {proc.exitcode} after partial result; "
+            f"last phase: {last_phase}"
         )
+        return row
 
-    if status == "ok":
-        return payload
-
-    err_msg = str(payload)
-    status_out = "SKIP" if "SpSM requires square matrices" in err_msg else "ERROR"
-    return _empty_csv_case_row(base, fmt, n_rhs, status_out, err_msg)
+    return _empty_csv_case_row(
+        base,
+        fmt,
+        n_rhs,
+        "ERROR",
+        f"worker exited with code {proc.exitcode} without returning a result; last phase: {last_phase}",
+    )
 
 
 def run_spsm_synthetic_all(n=512, n_rhs=1024):

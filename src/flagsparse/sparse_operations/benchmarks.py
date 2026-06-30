@@ -34,7 +34,7 @@ from .sddmm_csr import benchmark_sddmm_case
 from .spsm import benchmark_spsm_case
 
 
-_GATHER_TIMING_METHOD = "prepared_event_steady_state"
+_GATHER_TIMING_METHOD = "prepared_hip_event_current_stream"
 
 
 def _noop_destroy(_state):
@@ -123,7 +123,7 @@ def benchmark_gather_case(
         )
 
     try:
-        pytorch_values, pytorch_ms = _benchmark_prepared_cuda_op(
+        pytorch_values, pytorch_ms = _benchmark_prepared_hip_event_op(
             _prepare_pytorch_gather,
             _run_pytorch_gather_prepared,
             _noop_destroy,
@@ -133,7 +133,7 @@ def benchmark_gather_case(
     except Exception as exc:
         raise RuntimeError(f"PyTorch prepared-event timing failed: {exc}") from exc
     try:
-        triton_values, triton_ms = _benchmark_prepared_cuda_op(
+        triton_values, triton_ms = _benchmark_prepared_hip_event_op(
             _prepare_triton_gather,
             _run_triton_gather_prepared,
             _noop_destroy,

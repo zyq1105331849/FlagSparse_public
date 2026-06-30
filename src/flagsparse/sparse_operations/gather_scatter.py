@@ -16,6 +16,7 @@ _hipsparse_unavailable_reason = _common_mod._hipsparse_unavailable_reason
 _hipsparse_value_type = _common_mod._hipsparse_value_type
 _hipsparse_index_type = _common_mod._hipsparse_index_type
 _benchmark_prepared_cuda_op = _common_mod._benchmark_prepared_cuda_op
+_benchmark_prepared_hip_event_op = _common_mod._benchmark_prepared_hip_event_op
 
 SUPPORTED_SCATTER_VALUE_DTYPES = (
     torch.float16,
@@ -26,18 +27,12 @@ SUPPORTED_SCATTER_VALUE_DTYPES = (
     torch.complex128,
 )
 DEFAULT_GATHER_BLOCK_SIZE = 256
-DEFAULT_GATHER_NUM_WARPS = 4
+DEFAULT_GATHER_MAX_PROGRAMS = 2
+DEFAULT_GATHER_NUM_WARPS = 8
 
 
 def _torch_current_stream_ptr():
-    stream = torch.cuda.current_stream()
-    for attr_name in ("cuda_stream", "hip_stream"):
-        stream_ptr = getattr(stream, attr_name, None)
-        if callable(stream_ptr):
-            stream_ptr = stream_ptr()
-        if stream_ptr is not None:
-            return int(stream_ptr)
-    return None
+    return _common_mod._torch_current_stream_ptr()
 
 
 def _set_hipsparse_current_stream(handle):
@@ -49,13 +44,12 @@ def _set_hipsparse_current_stream(handle):
     if stream_ptr is None:
         return "could not resolve torch current CUDA/HIP stream pointer"
 
-    stream_args = []
+    stream_args = [ctypes.c_void_p(stream_ptr), stream_ptr]
     if HipPointer is not None:
         try:
             stream_args.append(HipPointer.fromObj(stream_ptr))
         except Exception:
             pass
-    stream_args.extend([stream_ptr, ctypes.c_void_p(stream_ptr)])
 
     last_error = None
     for stream_arg in stream_args:
@@ -89,11 +83,13 @@ def _gather_real_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < nnz
-    indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
-    gathered_values = tl.load(dense_values_ptr + indices, mask=mask, other=0.0)
-    tl.store(sparse_values_ptr + offsets, gathered_values, mask=mask)
+    num_programs = tl.num_programs(axis=0)
+    for block_start in tl.range(pid * BLOCK_SIZE, nnz, num_programs * BLOCK_SIZE):
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < nnz
+        indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
+        gathered_values = tl.load(dense_values_ptr + indices, mask=mask, other=0.0)
+        tl.store(sparse_values_ptr + offsets, gathered_values, mask=mask)
 
 
 @triton.jit
@@ -105,22 +101,24 @@ def _gather_complex_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < nnz
-    indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
+    num_programs = tl.num_programs(axis=0)
+    for block_start in tl.range(pid * BLOCK_SIZE, nnz, num_programs * BLOCK_SIZE):
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < nnz
+        indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
 
-    dense_offsets = indices * 2
-    sparse_offsets = offsets * 2
+        dense_offsets = indices * 2
+        sparse_offsets = offsets * 2
 
-    gathered_real = tl.load(
-        dense_values_ri_ptr + dense_offsets, mask=mask, other=0.0
-    )
-    gathered_imag = tl.load(
-        dense_values_ri_ptr + dense_offsets + 1, mask=mask, other=0.0
-    )
+        gathered_real = tl.load(
+            dense_values_ri_ptr + dense_offsets, mask=mask, other=0.0
+        )
+        gathered_imag = tl.load(
+            dense_values_ri_ptr + dense_offsets + 1, mask=mask, other=0.0
+        )
 
-    tl.store(sparse_values_ri_ptr + sparse_offsets, gathered_real, mask=mask)
-    tl.store(sparse_values_ri_ptr + sparse_offsets + 1, gathered_imag, mask=mask)
+        tl.store(sparse_values_ri_ptr + sparse_offsets, gathered_real, mask=mask)
+        tl.store(sparse_values_ri_ptr + sparse_offsets + 1, gathered_imag, mask=mask)
 
 
 @triton.jit
@@ -181,7 +179,9 @@ def _triton_gather_impl(
             raise TypeError("out dtype must match gather output dtype")
         return out
 
-    grid = lambda meta: (triton.cdiv(nnz, meta["BLOCK_SIZE"]),)
+    grid = lambda meta: (
+        min(DEFAULT_GATHER_MAX_PROGRAMS, triton.cdiv(nnz, meta["BLOCK_SIZE"])),
+    )
 
     if not _is_complex_dtype(dense_vector.dtype):
         sparse_values = out
@@ -549,7 +549,7 @@ def hipsparse_gather(dense_vector, indices, out=None, return_metadata=False):
 
 
 def benchmark_hipsparse_gather(dense_vector, indices, warmup, iters, out=None):
-    return _benchmark_prepared_cuda_op(
+    return _benchmark_prepared_hip_event_op(
         lambda: _prepare_hipsparse_gather(
             dense_vector, indices, out=out, require_stream=True
         ),

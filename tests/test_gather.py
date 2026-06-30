@@ -26,7 +26,7 @@ DEFAULT_VALUE_DTYPES = "float16,bfloat16,float32,float64,complex64,complex128"
 DEFAULT_INDEX_DTYPES = "int32,int64"
 WARMUP = 20
 ITERS = 200
-KERNEL_TIMING_METHOD = "prepared_event_steady_state"
+KERNEL_TIMING_METHOD = "prepared_hip_event_current_stream"
 
 
 def _fmt_ms(value):
@@ -214,7 +214,7 @@ def run_cli(args):
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(
         f"Warmup: {args.warmup} | Iterations: {args.iters} | "
-        "Timing: prepared-event steady-state for PT/FS/HS | "
+        "Timing: prepared HIP-event current-stream for PT/FS/HS | "
         "HS(ms): direct hipSPARSE Gather kernel time"
     )
     print()
@@ -255,7 +255,7 @@ def run_cli(args):
                     timing_method = perf.get("kernel_timing_method")
                     if timing_method != KERNEL_TIMING_METHOD:
                         raise RuntimeError(
-                            "loaded benchmark_gather_case does not provide prepared-event timing; "
+                            "loaded benchmark_gather_case does not provide HIP-event current-stream timing; "
                             f"flagsparse was loaded from {Path(ast.__file__).resolve()}"
                         )
                     status = _status_from_result(verify)
