@@ -6,6 +6,7 @@ import glob
 import multiprocessing as mp
 import os
 import sys
+import time
 from pathlib import Path
 from queue import Empty
 
@@ -269,34 +270,95 @@ def _extract_effective_lower_csr(data, indices, indptr, shape):
     return data_tri, col_tri.to(torch.int64), indptr_tri
 
 
-def _benchmark_pytorch_reference(data, indices, indptr, shape, B):
+def _stabilize_lower_triangular_csr(data, indices, indptr, shape):
+    """Make Matrix Market lower-triangular extracts safe for NON_UNIT SpSM."""
+    n_rows = int(shape[0])
+    row, col = _csr_to_coo(indices, indptr, n_rows)
+    diag_mask = row == col
+    offdiag_mask = ~diag_mask
+
+    real_dtype = (
+        torch.float32
+        if data.dtype in (torch.float32, torch.complex64)
+        else torch.float64
+    )
+    offdiag_abs_sum = torch.zeros(
+        n_rows, dtype=real_dtype, device=data.device
+    )
+    if bool(torch.any(offdiag_mask).item()):
+        offdiag_abs_sum.index_add_(
+            0,
+            row[offdiag_mask],
+            torch.abs(data[offdiag_mask]).to(real_dtype),
+        )
+    stable_diag = (offdiag_abs_sum + 1.0).to(data.dtype)
+
+    data_stable = data.clone()
+    diag_present = torch.zeros(n_rows, dtype=torch.bool, device=data.device)
+    if bool(torch.any(diag_mask).item()):
+        diag_rows = row[diag_mask]
+        data_stable[diag_mask] = stable_diag[diag_rows]
+        diag_present[diag_rows] = True
+
+    missing_diag = torch.nonzero(
+        ~diag_present, as_tuple=False
+    ).reshape(-1).to(torch.int64)
+    if missing_diag.numel() > 0:
+        row = torch.cat((row, missing_diag))
+        col = torch.cat((col, missing_diag))
+        data_stable = torch.cat((data_stable, stable_diag[missing_diag]))
+
+    order = torch.argsort(row * max(1, n_rows) + col)
+    row = row[order]
+    col = col[order]
+    data_stable = data_stable[order]
+    counts = torch.bincount(row, minlength=n_rows)
+    indptr_stable = torch.zeros(
+        n_rows + 1, dtype=torch.int64, device=data.device
+    )
+    indptr_stable[1:] = torch.cumsum(counts, dim=0)
+    return data_stable, col.to(torch.int64), indptr_stable
+
+
+def _benchmark_pytorch_reference(data, indices, indptr, shape, B, warmup, iters):
     try:
         sparse_spsolve = getattr(torch.sparse, "spsolve", None)
         if sparse_spsolve is None:
             raise NotImplementedError("torch.sparse.spsolve is unavailable")
-        data_eff, indices_eff, indptr_eff = _extract_effective_lower_csr(
-            data, indices, indptr, shape
-        )
-        A_csr = torch.sparse_csr_tensor(
-            indptr_eff,
-            indices_eff,
-            data_eff,
-            size=shape,
-            device=data.device,
-        )
-        if not A_csr.is_cuda:
-            raise RuntimeError("torch.sparse.spsolve CUDA path is unavailable")
-        torch.cuda.synchronize()
-        e0 = torch.cuda.Event(True)
-        e1 = torch.cuda.Event(True)
-        e0.record()
-        cols = []
-        for bj in torch.unbind(B, dim=1):
-            cols.append(sparse_spsolve(A_csr, bj))
-        X_ref = torch.stack(cols, dim=1) if cols else B.new_empty(B.shape)
-        e1.record()
-        torch.cuda.synchronize()
-        ms = e0.elapsed_time(e1)
+        warmup = max(0, int(warmup))
+        iters = max(1, int(iters))
+        X_ref = None
+
+        def _run_one_round():
+            data_eff, indices_eff, indptr_eff = _extract_effective_lower_csr(
+                data, indices, indptr, shape
+            )
+            A_csr = torch.sparse_csr_tensor(
+                indptr_eff,
+                indices_eff,
+                data_eff,
+                size=shape,
+                device=data.device,
+            )
+            if not A_csr.is_cuda:
+                raise RuntimeError("torch.sparse.spsolve CUDA path is unavailable")
+            cols = []
+            for bj in torch.unbind(B, dim=1):
+                cols.append(sparse_spsolve(A_csr, bj))
+            return torch.stack(cols, dim=1) if cols else B.new_empty(B.shape)
+
+        for _ in range(warmup):
+            X_ref = _run_one_round()
+            torch.cuda.synchronize()
+
+        times = []
+        for _ in range(iters):
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            X_ref = _run_one_round()
+            torch.cuda.synchronize()
+            times.append((time.perf_counter() - start) * 1000.0)
+        ms = _allinone_filtered_avg_ms(times)
         return X_ref.to(B.dtype), ms, "gpu_sparse", None
     except Exception as exc:
         if "out of memory" in str(exc).lower() and torch.cuda.is_available():
@@ -541,6 +603,9 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
     data_eff, indices_eff, indptr_eff = _extract_effective_lower_csr(
         data, indices, indptr, shape
     )
+    data_eff, indices_eff, indptr_eff = _stabilize_lower_triangular_csr(
+        data_eff, indices_eff, indptr_eff, shape
+    )
     row, col = _csr_to_coo(indices_eff, indptr_eff, n_rows)
     warmup, iters = _spsm_benchmark_schedule(
         data_eff.numel(), n_rhs, value_dtype, fmt=fmt
@@ -578,7 +643,7 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
         iters,
     )
     X_pt, pytorch_ms, _pt_backend, pytorch_reason = _benchmark_pytorch_reference(
-        data_eff, indices_eff, indptr_eff, shape, B
+        data_eff, indices_eff, indptr_eff, shape, B, warmup, iters
     )
 
     err_hs = None
@@ -808,10 +873,15 @@ def run_all_dtypes_spsm_csv(
     use_coo=False,
     n_rhs=1024,
     case_timeout_seconds=SPSM_CASE_TIMEOUT_SECONDS,
+    warmup=WARMUP,
+    iters=ITERS,
 ):
     if not torch.cuda.is_available():
         print("CUDA/ROCm device is not available.")
         return
+    global WARMUP, ITERS
+    WARMUP = max(0, int(warmup))
+    ITERS = max(1, int(iters))
     rows_out = []
     fmt = "coo" if use_coo else "csr"
 
@@ -1006,6 +1076,8 @@ def main():
             use_coo=False,
             n_rhs=args.rhs,
             case_timeout_seconds=args.case_timeout_seconds,
+            warmup=WARMUP,
+            iters=ITERS,
         )
         return
 
@@ -1021,6 +1093,8 @@ def main():
             use_coo=True,
             n_rhs=args.rhs,
             case_timeout_seconds=args.case_timeout_seconds,
+            warmup=WARMUP,
+            iters=ITERS,
         )
         return
 

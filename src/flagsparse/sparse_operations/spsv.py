@@ -67,6 +67,46 @@ _SPSV_CSR_PREPROCESS_CACHE = OrderedDict()
 _SPSV_CSR_PREPROCESS_CACHE_SIZE = 8
 
 
+def _torch_current_stream_ptr():
+    stream = torch.cuda.current_stream()
+    for attr_name in ("cuda_stream", "hip_stream"):
+        stream_ptr = getattr(stream, attr_name, None)
+        if callable(stream_ptr):
+            stream_ptr = stream_ptr()
+        if stream_ptr is not None:
+            return int(stream_ptr)
+    return None
+
+
+def _try_set_hipsparse_current_stream(handle):
+    set_stream = getattr(hipsparse, "hipsparseSetStream", None)
+    if set_stream is None:
+        return "hipSPARSE binding does not expose hipsparseSetStream"
+
+    stream_ptr = _torch_current_stream_ptr()
+    if stream_ptr is None:
+        return "could not resolve torch current CUDA/HIP stream pointer"
+
+    stream_args = []
+    if HipPointer is not None:
+        try:
+            stream_args.append(HipPointer.fromObj(stream_ptr))
+        except Exception:
+            pass
+    stream_args.extend([stream_ptr, ctypes.c_void_p(stream_ptr)])
+
+    last_error = None
+    for stream_arg in stream_args:
+        try:
+            _hip_check_result(set_stream(handle, stream_arg), "hipsparseSetStream")
+            return None
+        except TypeError as exc:
+            last_error = exc
+        except Exception as exc:
+            last_error = exc
+    return f"hipsparseSetStream failed for torch current stream: {last_error}"
+
+
 def _hipsparse_spsv_op(op):
     return _hipsparse_spmv_operation(op, "hipSPARSE CSR SpSV")
 
@@ -582,6 +622,7 @@ def _prepare_spsv_csr_ref_hipsparse(
     workspace_allocated = False
     try:
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        stream_warning = _try_set_hipsparse_current_stream(handle)
         ptr_type = type(handle)
 
         spmat = ptr_type()
@@ -690,6 +731,7 @@ def _prepare_spsv_csr_ref_hipsparse(
             "value_type": value_type,
             "alg": alg,
             "solution": solution,
+            "stream_binding_warning": stream_warning,
             "empty": False,
         }
     finally:

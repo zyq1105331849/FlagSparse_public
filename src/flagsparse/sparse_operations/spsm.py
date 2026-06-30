@@ -40,6 +40,46 @@ _SPSM_PREPROCESS_CACHE_SIZE = 8
 _SPSM_POLLING_RHS_TILE = 32
 
 
+def _torch_current_stream_ptr():
+    stream = torch.cuda.current_stream()
+    for attr_name in ("cuda_stream", "hip_stream"):
+        stream_ptr = getattr(stream, attr_name, None)
+        if callable(stream_ptr):
+            stream_ptr = stream_ptr()
+        if stream_ptr is not None:
+            return int(stream_ptr)
+    return None
+
+
+def _try_set_hipsparse_current_stream(handle):
+    set_stream = getattr(hipsparse, "hipsparseSetStream", None)
+    if set_stream is None:
+        return "hipSPARSE binding does not expose hipsparseSetStream"
+
+    stream_ptr = _torch_current_stream_ptr()
+    if stream_ptr is None:
+        return "could not resolve torch current CUDA/HIP stream pointer"
+
+    stream_args = []
+    if HipPointer is not None:
+        try:
+            stream_args.append(HipPointer.fromObj(stream_ptr))
+        except Exception:
+            pass
+    stream_args.extend([stream_ptr, ctypes.c_void_p(stream_ptr)])
+
+    last_error = None
+    for stream_arg in stream_args:
+        try:
+            _hip_check_result(set_stream(handle, stream_arg), "hipsparseSetStream")
+            return None
+        except TypeError as exc:
+            last_error = exc
+        except Exception as exc:
+            last_error = exc
+    return f"hipsparseSetStream failed for torch current stream: {last_error}"
+
+
 def _hipsparse_csrsm2_functions(value_dtype):
     prefix = {
         torch.float32: "S",
@@ -142,8 +182,8 @@ def _hipsparse_csrsm2_skip_reason(value_dtype, index_dtype, indptr_dtype=None):
         _hipsparse_lookup(
             "hipsparseSolvePolicy_t",
             (
-                "HIPSPARSE_SOLVE_POLICY_USE_LEVEL",
                 "HIPSPARSE_SOLVE_POLICY_NO_LEVEL",
+                "HIPSPARSE_SOLVE_POLICY_USE_LEVEL",
             ),
         )
         _hipsparse_scalar(value_dtype, 1.0, 0.0)
@@ -299,6 +339,7 @@ def _prepare_spsm_csr_ref_hipsparse(
 
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
         state["handle"] = handle
+        state["stream_binding_warning"] = _try_set_hipsparse_current_stream(handle)
         descr = _hipsparse_create_descriptor(
             ("hipsparseCreateMatDescr",),
             "hipsparseCreateMatDescr",
@@ -361,8 +402,8 @@ def _prepare_spsm_csr_ref_hipsparse(
         policy = _hipsparse_lookup(
             "hipsparseSolvePolicy_t",
             (
-                "HIPSPARSE_SOLVE_POLICY_USE_LEVEL",
                 "HIPSPARSE_SOLVE_POLICY_NO_LEVEL",
+                "HIPSPARSE_SOLVE_POLICY_USE_LEVEL",
             ),
         )
         dense_ptr = HipPointer.fromObj(solution_col_major.data_ptr())

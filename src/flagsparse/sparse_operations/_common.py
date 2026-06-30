@@ -1,7 +1,6 @@
 """Shared imports, dtypes, and helpers for FlagSparse sparse ops."""
 
 import ctypes
-import statistics
 import time
 
 try:
@@ -102,7 +101,7 @@ __all__ = (
     "_prepare_inputs",
     "_prepare_scatter_inputs",
     "_benchmark_cuda_op",
-    "_benchmark_cuda_graph_op",
+    "_benchmark_prepared_cuda_op",
     "cp",
     "cpx_sparse",
     "time",
@@ -1820,77 +1819,15 @@ def _benchmark_cuda_op(op, warmup, iters):
     return output, elapsed_ms
 
 
-def _benchmark_cuda_graph_op(
-    op,
-    *,
-    graph_batch=100,
-    warmup=20,
-    repeats=10,
-    capture_setup=None,
-):
-    """Measure allocation-free CUDA/ROCm work without Python launch gaps."""
-    graph_batch = max(1, int(graph_batch))
-    warmup = max(0, int(warmup))
-    repeats = max(1, int(repeats))
-
-    torch.cuda.synchronize()
-    capture_stream = torch.cuda.Stream()
-    graph = torch.cuda.CUDAGraph()
-
-    with torch.cuda.stream(capture_stream):
-        if capture_setup is not None:
-            capture_setup()
-        op()
-    capture_stream.synchronize()
-
-    with torch.cuda.graph(graph, stream=capture_stream):
-        for _ in range(graph_batch):
-            op()
-    capture_stream.synchronize()
-
-    with torch.cuda.stream(capture_stream):
-        for _ in range(warmup):
-            graph.replay()
-    capture_stream.synchronize()
-
-    samples_ms = []
-    start_ev = torch.cuda.Event(enable_timing=True)
-    stop_ev = torch.cuda.Event(enable_timing=True)
-    for _ in range(repeats):
-        with torch.cuda.stream(capture_stream):
-            start_ev.record()
-            graph.replay()
-            stop_ev.record()
-        stop_ev.synchronize()
-        samples_ms.append(float(start_ev.elapsed_time(stop_ev)) / graph_batch)
-
-    return statistics.median(samples_ms)
-
-
 def _benchmark_prepared_cuda_op(prepare_fn, run_fn, destroy_fn, warmup, iters):
     warmup = max(0, int(warmup))
     iters = max(1, int(iters))
     state = None
-    start_ev = None
-    stop_ev = None
     try:
         state = prepare_fn()
         output = None
         for _ in range(warmup):
             output = run_fn(state)
-
-        if _is_rocm_runtime() and _hip_runtime_event_available():
-            torch.cuda.synchronize()
-            start_ev = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(start)")
-            stop_ev = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(stop)")
-            _hip_check_result(hip.hipEventRecord(start_ev, 0), "hipEventRecord(start)")
-            for _ in range(iters):
-                output = run_fn(state)
-            _hip_check_result(hip.hipEventRecord(stop_ev, 0), "hipEventRecord(stop)")
-            _hip_check_result(
-                hip.hipEventSynchronize(stop_ev), "hipEventSynchronize(stop)"
-            )
-            return output, _hip_event_elapsed_ms(start_ev, stop_ev) / iters
 
         torch.cuda.synchronize()
         start_ev_torch = torch.cuda.Event(enable_timing=True)
@@ -1902,7 +1839,5 @@ def _benchmark_prepared_cuda_op(prepare_fn, run_fn, destroy_fn, warmup, iters):
         torch.cuda.synchronize()
         return output, start_ev_torch.elapsed_time(end_ev_torch) / iters
     finally:
-        _destroy_hip_event(stop_ev)
-        _destroy_hip_event(start_ev)
         if state is not None:
             destroy_fn(state)

@@ -3,6 +3,7 @@
 from . import _common as _common_mod
 from ._common import *
 
+import ctypes
 import triton
 import triton.language as tl
 
@@ -27,6 +28,46 @@ SUPPORTED_SCATTER_VALUE_DTYPES = (
 DEFAULT_GATHER_BLOCK_SIZE = 256
 DEFAULT_GATHER_MAX_PROGRAMS = 2
 DEFAULT_GATHER_NUM_WARPS = 8
+
+
+def _torch_current_stream_ptr():
+    stream = torch.cuda.current_stream()
+    for attr_name in ("cuda_stream", "hip_stream"):
+        stream_ptr = getattr(stream, attr_name, None)
+        if callable(stream_ptr):
+            stream_ptr = stream_ptr()
+        if stream_ptr is not None:
+            return int(stream_ptr)
+    return None
+
+
+def _set_hipsparse_current_stream(handle):
+    set_stream = getattr(hipsparse, "hipsparseSetStream", None)
+    if set_stream is None:
+        return "hipSPARSE binding does not expose hipsparseSetStream"
+
+    stream_ptr = _torch_current_stream_ptr()
+    if stream_ptr is None:
+        return "could not resolve torch current CUDA/HIP stream pointer"
+
+    stream_args = []
+    if HipPointer is not None:
+        try:
+            stream_args.append(HipPointer.fromObj(stream_ptr))
+        except Exception:
+            pass
+    stream_args.extend([stream_ptr, ctypes.c_void_p(stream_ptr)])
+
+    last_error = None
+    for stream_arg in stream_args:
+        try:
+            _hip_check_result(set_stream(handle, stream_arg), "hipsparseSetStream")
+            return None
+        except TypeError as exc:
+            last_error = exc
+        except Exception as exc:
+            last_error = exc
+    return f"hipsparseSetStream failed for torch current stream: {last_error}"
 
 
 def _scatter_dtype_error_message():
@@ -388,7 +429,7 @@ def _hipsparse_create_dnvec_descriptor(dnvec_ref, size, values, value_type):
     )
 
 
-def _prepare_hipsparse_gather(dense_vector, indices, out=None):
+def _prepare_hipsparse_gather(dense_vector, indices, out=None, require_stream=False):
     dense_vector, indices = _prepare_hipsparse_gather_inputs(dense_vector, indices)
     skip_reason = _hipsparse_gather_scatter_skip_reason(
         dense_vector.dtype, indices.dtype, "gather"
@@ -424,6 +465,9 @@ def _prepare_hipsparse_gather(dense_vector, indices, out=None):
     success = False
     try:
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        stream_warning = _set_hipsparse_current_stream(handle)
+        if require_stream and stream_warning is not None:
+            raise RuntimeError(stream_warning)
         ptr_type = type(handle)
         spvec = ptr_type()
         dnvec = ptr_type()
@@ -450,6 +494,7 @@ def _prepare_hipsparse_gather(dense_vector, indices, out=None):
             "spvec": spvec,
             "dnvec": dnvec,
             "values": sparse_values,
+            "stream_binding_warning": stream_warning,
         }
     finally:
         if not success:
@@ -512,7 +557,9 @@ def hipsparse_gather(dense_vector, indices, out=None, return_metadata=False):
 
 def benchmark_hipsparse_gather(dense_vector, indices, warmup, iters, out=None):
     return _benchmark_prepared_cuda_op(
-        lambda: _prepare_hipsparse_gather(dense_vector, indices, out=out),
+        lambda: _prepare_hipsparse_gather(
+            dense_vector, indices, out=out, require_stream=True
+        ),
         _run_hipsparse_gather_prepared,
         _destroy_hipsparse_gather_prepared,
         warmup=warmup,
@@ -527,6 +574,7 @@ def _prepare_hipsparse_scatter(
     out=None,
     reset_output=True,
     dtype_policy="strict",
+    require_stream=False,
 ):
     sparse_values, indices, _, dense_size, _ = _prepare_scatter_inputs(
         sparse_values,
@@ -569,6 +617,9 @@ def _prepare_hipsparse_scatter(
     success = False
     try:
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        stream_warning = _set_hipsparse_current_stream(handle)
+        if require_stream and stream_warning is not None:
+            raise RuntimeError(stream_warning)
         ptr_type = type(handle)
         spvec = ptr_type()
         dnvec = ptr_type()
@@ -595,6 +646,7 @@ def _prepare_hipsparse_scatter(
             "spvec": spvec,
             "dnvec": dnvec,
             "values": dense_values,
+            "stream_binding_warning": stream_warning,
         }
     finally:
         if not success:
@@ -688,6 +740,7 @@ def benchmark_hipsparse_scatter(
             out=out,
             reset_output=reset_output,
             dtype_policy=dtype_policy,
+            require_stream=True,
         ),
         _run_hipsparse_scatter_prepared,
         _destroy_hipsparse_scatter_prepared,

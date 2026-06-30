@@ -34,7 +34,11 @@ from .sddmm_csr import benchmark_sddmm_case
 from .spsm import benchmark_spsm_case
 
 
-_GATHER_GRAPH_BATCH = 100
+_GATHER_TIMING_METHOD = "prepared_event_steady_state"
+
+
+def _noop_destroy(_state):
+    return None
 
 
 def _normalize_dtype_name(value):
@@ -100,31 +104,51 @@ def benchmark_gather_case(
 
     pytorch_out = torch.empty_like(expected)
     triton_out = torch.empty_like(expected)
-    pytorch_op = lambda: torch.index_select(dense_vector, 0, indices, out=pytorch_out)
-    triton_op = lambda: _triton_gather_impl(
-        dense_vector, kernel_indices, out=triton_out, block_size=block_size
-    )
+
+    def _prepare_pytorch_gather():
+        return {"values": pytorch_out}
+
+    def _run_pytorch_gather_prepared(state):
+        return torch.index_select(dense_vector, 0, indices, out=state["values"])
+
+    def _prepare_triton_gather():
+        return {"values": triton_out}
+
+    def _run_triton_gather_prepared(state):
+        return _triton_gather_impl(
+            dense_vector,
+            kernel_indices,
+            out=state["values"],
+            block_size=block_size,
+        )
 
     try:
-        pytorch_ms = _benchmark_cuda_graph_op(
-            pytorch_op,
-            graph_batch=_GATHER_GRAPH_BATCH,
+        pytorch_values, pytorch_ms = _benchmark_prepared_cuda_op(
+            _prepare_pytorch_gather,
+            _run_pytorch_gather_prepared,
+            _noop_destroy,
             warmup=warmup,
-            repeats=iters,
+            iters=iters,
         )
     except Exception as exc:
-        raise RuntimeError(f"PyTorch CUDA Graph timing failed: {exc}") from exc
+        raise RuntimeError(f"PyTorch prepared-event timing failed: {exc}") from exc
     try:
-        triton_ms = _benchmark_cuda_graph_op(
-            triton_op,
-            graph_batch=_GATHER_GRAPH_BATCH,
+        triton_values, triton_ms = _benchmark_prepared_cuda_op(
+            _prepare_triton_gather,
+            _run_triton_gather_prepared,
+            _noop_destroy,
             warmup=warmup,
-            repeats=iters,
+            iters=iters,
         )
     except Exception as exc:
-        raise RuntimeError(f"Triton CUDA Graph timing failed: {exc}") from exc
-    pytorch_values = pytorch_out
-    triton_values = triton_out
+        raise RuntimeError(f"Triton prepared-event timing failed: {exc}") from exc
+
+    pytorch_values = pytorch_values if pytorch_values is not None else pytorch_out
+    triton_values = triton_values if triton_values is not None else triton_out
+
+    torch.cuda.synchronize()
+    pytorch_values = pytorch_values.clone()
+    triton_values = triton_values.clone()
 
     atol, rtol = _tolerance_for_dtype(value_dtype)
     triton_match = torch.allclose(triton_values, expected, atol=atol, rtol=rtol)
@@ -208,7 +232,6 @@ def benchmark_gather_case(
             "index_dtype": str(index_dtype),
             "warmup": warmup,
             "iters": iters,
-            "kernel_graph_batch": _GATHER_GRAPH_BATCH,
         },
         "performance": {
             "pytorch_ms": pytorch_ms,
@@ -216,7 +239,7 @@ def benchmark_gather_case(
             "hipsparse_ms": hipsparse_ms,
             "triton_speedup_vs_pytorch": triton_speedup_vs_pytorch,
             "triton_speedup_vs_hipsparse": triton_speedup_vs_hipsparse,
-            "kernel_timing_method": "cuda_graph_event_amortized_device_estimate",
+            "kernel_timing_method": _GATHER_TIMING_METHOD,
         },
         "verification": {
             "triton_match_pytorch": triton_match,

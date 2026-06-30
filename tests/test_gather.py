@@ -26,7 +26,7 @@ DEFAULT_VALUE_DTYPES = "float16,bfloat16,float32,float64,complex64,complex128"
 DEFAULT_INDEX_DTYPES = "int32,int64"
 WARMUP = 20
 ITERS = 200
-KERNEL_GRAPH_BATCH = 100
+KERNEL_TIMING_METHOD = "prepared_event_steady_state"
 
 
 def _fmt_ms(value):
@@ -214,8 +214,8 @@ def run_cli(args):
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(
         f"Warmup: {args.warmup} | Iterations: {args.iters} | "
-        f"Kernel graph batch: {KERNEL_GRAPH_BATCH} | "
-        "HS(ms): direct hipSPARSE backend steady-state time"
+        "Timing: prepared-event steady-state for PT/FS/HS | "
+        "HS(ms): direct hipSPARSE Gather kernel time"
     )
     print()
     _print_header()
@@ -253,16 +253,10 @@ def run_cli(args):
                     params = result["parameters"]
                     backend = result["backend_status"]
                     timing_method = perf.get("kernel_timing_method")
-                    graph_batch = params.get("kernel_graph_batch")
-                    if timing_method != "cuda_graph_event_amortized_device_estimate":
+                    if timing_method != KERNEL_TIMING_METHOD:
                         raise RuntimeError(
-                            "loaded benchmark_gather_case does not provide CUDA Graph timing; "
+                            "loaded benchmark_gather_case does not provide prepared-event timing; "
                             f"flagsparse was loaded from {Path(ast.__file__).resolve()}"
-                        )
-                    if graph_batch != KERNEL_GRAPH_BATCH:
-                        raise RuntimeError(
-                            "unexpected gather graph batch: "
-                            f"expected {KERNEL_GRAPH_BATCH}, got {graph_batch}"
                         )
                     status = _status_from_result(verify)
                     if status != "PASS":
@@ -286,7 +280,6 @@ def run_cli(args):
                         "triton_speedup_vs_pytorch": perf.get("triton_speedup_vs_pytorch"),
                         "triton_speedup_vs_hipsparse": perf.get("triton_speedup_vs_hipsparse"),
                         "kernel_timing_method": timing_method,
-                        "kernel_graph_batch": graph_batch,
                         "triton_match_pytorch": verify.get("triton_match_pytorch"),
                         "hipsparse_match_pytorch": verify.get("hipsparse_match_pytorch"),
                         "triton_max_error": verify.get("triton_max_error"),
@@ -327,8 +320,7 @@ def run_cli(args):
                         "hipsparse_ms": None,
                         "triton_speedup_vs_pytorch": None,
                         "triton_speedup_vs_hipsparse": None,
-                        "kernel_timing_method": "cuda_graph_event_amortized_device_estimate",
-                        "kernel_graph_batch": KERNEL_GRAPH_BATCH,
+                        "kernel_timing_method": KERNEL_TIMING_METHOD,
                         "triton_match_pytorch": None,
                         "hipsparse_match_pytorch": None,
                         "triton_max_error": None,
@@ -363,7 +355,6 @@ def run_cli(args):
             "triton_speedup_vs_pytorch",
             "triton_speedup_vs_hipsparse",
             "kernel_timing_method",
-            "kernel_graph_batch",
             "triton_match_pytorch",
             "hipsparse_match_pytorch",
             "triton_max_error",

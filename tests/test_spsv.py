@@ -4,10 +4,12 @@ import argparse
 import csv
 import glob
 import hashlib
+import multiprocessing as mp
 import os
 import sys
 import time
 from pathlib import Path
+from queue import Empty
 
 import torch
 
@@ -33,6 +35,7 @@ INDEX_DTYPES = [torch.int32, torch.int64]
 TEST_SIZES = [256, 512, 1024, 2048]
 WARMUP = 1
 ITERS = 1
+SPSV_CASE_TIMEOUT_SECONDS = 180
 
 SPSV_TRIANGULAR_DIAG_DOMINANCE = 4.0
 # CSR 完整组合覆盖（在原 csv-csr 逻辑外新增，不影响原入口）
@@ -227,6 +230,36 @@ def _csv_export_row_spsv(row):
         "err_hs": row.get("err_hs"),
         "pytorch_reason": row.get("pytorch_reason"),
         "error": row.get("error"),
+    }
+
+
+def _empty_csv_case_row_spsv(path, value_dtype, index_dtype, op_mode, status, error):
+    return {
+        "matrix": os.path.basename(path),
+        "value_dtype": _dtype_name(value_dtype),
+        "index_dtype": _dtype_name(index_dtype),
+        "opA": op_mode,
+        "n_rows": "ERR",
+        "n_cols": "ERR",
+        "nnz": "ERR",
+        "analysis_ms": None,
+        "solve_ms": None,
+        "triton_total_ms": None,
+        "hipsparse_ms": None,
+        "pytorch_ms": None,
+        "hipsparse_speedup_solve": None,
+        "pytorch_speedup_solve": None,
+        "hipsparse_speedup_total": None,
+        "pytorch_speedup_total": None,
+        "pt_status": "N/A",
+        "hs_status": "N/A",
+        "status": status,
+        "err_ref": None,
+        "err_res": None,
+        "err_pt": None,
+        "err_hs": None,
+        "pytorch_reason": None,
+        "error": error,
     }
 
 
@@ -1497,6 +1530,122 @@ def _finalize_csv_row_csr_full(
     return row, pt_skip_reason
 
 
+def _run_spsv_csv_case_worker(
+    result_queue,
+    fmt,
+    path,
+    value_dtype,
+    index_dtype,
+    op_mode,
+    lower,
+    alg_num,
+    warmup,
+    iters,
+):
+    global WARMUP, ITERS
+    WARMUP = max(0, int(warmup))
+    ITERS = max(1, int(iters))
+    try:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA/ROCm device is not available.")
+        device = torch.device("cuda")
+        if fmt == "csr":
+            row, pt_skip = _run_one_csv_row_csr_full(
+                path,
+                value_dtype,
+                index_dtype,
+                op_mode,
+                device,
+                lower=lower,
+                alg_num=alg_num,
+            )
+        elif fmt == "coo":
+            row, pt_skip = _run_one_csv_row_coo(
+                path,
+                value_dtype,
+                index_dtype,
+                op_mode,
+                device,
+                lower=lower,
+                alg_num=alg_num,
+            )
+        else:
+            raise ValueError(f"unsupported SpSV CSV format: {fmt}")
+        result_queue.put(("ok", (row, pt_skip)))
+    except BaseException as exc:
+        result_queue.put(("error", f"{exc.__class__.__name__}: {exc}"))
+
+
+def _run_spsv_csv_case_with_timeout(
+    fmt,
+    path,
+    value_dtype,
+    index_dtype,
+    op_mode,
+    lower,
+    alg_num,
+    timeout_seconds,
+):
+    timeout_seconds = max(1, int(timeout_seconds))
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue(maxsize=1)
+    proc = ctx.Process(
+        target=_run_spsv_csv_case_worker,
+        args=(
+            result_queue,
+            fmt,
+            path,
+            value_dtype,
+            index_dtype,
+            op_mode,
+            lower,
+            alg_num,
+            WARMUP,
+            ITERS,
+        ),
+    )
+    proc.start()
+    proc.join(timeout_seconds)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(10)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        row = _empty_csv_case_row_spsv(
+            path,
+            value_dtype,
+            index_dtype,
+            op_mode,
+            "SKIP",
+            f"timed out after {timeout_seconds} seconds",
+        )
+        return row, None
+
+    try:
+        status, payload = result_queue.get_nowait()
+    except Empty:
+        row = _empty_csv_case_row_spsv(
+            path,
+            value_dtype,
+            index_dtype,
+            op_mode,
+            "ERROR",
+            f"worker exited with code {proc.exitcode} without returning a result",
+        )
+        return row, None
+
+    if status == "ok":
+        return payload
+
+    err_msg = str(payload)
+    status_out = "SKIP" if "SpSV requires square matrices" in err_msg else "ERROR"
+    row = _empty_csv_case_row_spsv(
+        path, value_dtype, index_dtype, op_mode, status_out, err_msg
+    )
+    return row, None
+
+
 def run_all_supported_spsv_csr_csv(
     mtx_paths,
     csv_path,
@@ -1505,6 +1654,7 @@ def run_all_supported_spsv_csr_csv(
     index_dtypes=None,
     op_modes=None,
     alg_num=None,
+    case_timeout_seconds=SPSV_CASE_TIMEOUT_SECONDS,
 ):
     if not torch.cuda.is_available():
         print("CUDA/ROCm device is not available.")
@@ -1538,6 +1688,7 @@ def run_all_supported_spsv_csr_csv(
                     f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
                     "(override with --warmup/--iters)"
                 )
+                print(f"Per-matrix timeout: {int(case_timeout_seconds)} seconds")
                 print(
                     "RHS is generated directly. "
                     "PT.total / HS.total are single official interface call times. "
@@ -1562,8 +1713,15 @@ def run_all_supported_spsv_csr_csv(
                             f"index={_dtype_name(index_dtype)} | fmt=csr | opA={op_mode}",
                             flush=True,
                         )
-                        row, pt_skip = _run_one_csv_row_csr_full(
-                            path, value_dtype, index_dtype, op_mode, device, lower=lower, alg_num=alg_num
+                        row, pt_skip = _run_spsv_csv_case_with_timeout(
+                            "csr",
+                            path,
+                            value_dtype,
+                            index_dtype,
+                            op_mode,
+                            lower,
+                            alg_num,
+                            case_timeout_seconds,
                         )
                         rows_out.append(row)
                         name = os.path.basename(path)[:27]
@@ -1588,37 +1746,15 @@ def run_all_supported_spsv_csr_csv(
                         if status in ("FAIL", "REF_FAIL"):
                             if pt_skip:
                                 print(f"  NOTE: {pt_skip}")
+                        if status in ("SKIP", "ERROR") and row.get("error"):
+                            print(f"  {status}: {row['error']}")
                     except Exception as e:
                         err_msg = str(e)
                         status = "SKIP" if "SpSV requires square matrices" in err_msg else "ERROR"
                         rows_out.append(
-                            {
-                                "matrix": os.path.basename(path),
-                                "value_dtype": _dtype_name(value_dtype),
-                                "index_dtype": _dtype_name(index_dtype),
-                                "opA": op_mode,
-                                "n_rows": "ERR",
-                                "n_cols": "ERR",
-                                "nnz": "ERR",
-                                "analysis_ms": None,
-                                "solve_ms": None,
-                                "triton_total_ms": None,
-                                "hipsparse_ms": None,
-                                "pytorch_ms": None,
-                                "hipsparse_speedup_solve": None,
-                                "pytorch_speedup_solve": None,
-                                "hipsparse_speedup_total": None,
-                                "pytorch_speedup_total": None,
-                                "pt_status": "N/A",
-                                "hs_status": "N/A",
-                                "status": status,
-                                "err_ref": None,
-                                "err_res": None,
-                                "err_pt": None,
-                                "err_hs": None,
-                                "pytorch_reason": None,
-                                "error": err_msg,
-                            }
+                            _empty_csv_case_row_spsv(
+                                path, value_dtype, index_dtype, op_mode, status, err_msg
+                            )
                         )
                         name = os.path.basename(path)[:27]
                         if len(os.path.basename(path)) > 27:
@@ -1674,6 +1810,7 @@ def run_all_dtypes_spsv_coo_csv(
     index_dtypes=None,
     op_modes=None,
     alg_num=None,
+    case_timeout_seconds=SPSV_CASE_TIMEOUT_SECONDS,
 ):
     if not torch.cuda.is_available():
         print("CUDA/ROCm device is not available.")
@@ -1708,6 +1845,7 @@ def run_all_dtypes_spsv_coo_csv(
                     f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
                     "(override with --warmup/--iters)"
                 )
+                print(f"Per-matrix timeout: {int(case_timeout_seconds)} seconds")
                 print(
                     "PT.total / HS.total are single official interface call times. "
                     "PT.spdS and HS.spdS compare against FS.solve; PT.spdT and HS.spdT compare against FS.total."
@@ -1736,8 +1874,15 @@ def run_all_dtypes_spsv_coo_csv(
                             f"index={_dtype_name(index_dtype)} | fmt=coo | opA={op_mode}",
                             flush=True,
                         )
-                        row, pt_skip = _run_one_csv_row_coo(
-                            path, value_dtype, index_dtype, op_mode, device, lower=lower, alg_num=alg_num
+                        row, pt_skip = _run_spsv_csv_case_with_timeout(
+                            "coo",
+                            path,
+                            value_dtype,
+                            index_dtype,
+                            op_mode,
+                            lower,
+                            alg_num,
+                            case_timeout_seconds,
                         )
                         rows_out.append(row)
                         name = os.path.basename(path)[:27]
@@ -1762,37 +1907,15 @@ def run_all_dtypes_spsv_coo_csv(
                         if status in ("FAIL", "REF_FAIL"):
                             if pt_skip:
                                 print(f"  NOTE: {pt_skip}")
+                        if status in ("SKIP", "ERROR") and row.get("error"):
+                            print(f"  {status}: {row['error']}")
                     except Exception as e:
                         err_msg = str(e)
                         status = "SKIP" if "SpSV requires square matrices" in err_msg else "ERROR"
                         rows_out.append(
-                            {
-                                "matrix": os.path.basename(path),
-                                "value_dtype": _dtype_name(value_dtype),
-                                "index_dtype": _dtype_name(index_dtype),
-                                "opA": op_mode,
-                                "n_rows": "ERR",
-                                "n_cols": "ERR",
-                                "nnz": "ERR",
-                                "analysis_ms": None,
-                                "solve_ms": None,
-                                "triton_total_ms": None,
-                                "hipsparse_ms": None,
-                                "pytorch_ms": None,
-                                "hipsparse_speedup_solve": None,
-                                "pytorch_speedup_solve": None,
-                                "hipsparse_speedup_total": None,
-                                "pytorch_speedup_total": None,
-                                "pt_status": "N/A",
-                                "hs_status": "N/A",
-                                "status": status,
-                                "err_ref": None,
-                                "err_res": None,
-                                "err_pt": None,
-                                "err_hs": None,
-                                "pytorch_reason": None,
-                                "error": err_msg,
-                            }
+                            _empty_csv_case_row_spsv(
+                                path, value_dtype, index_dtype, op_mode, status, err_msg
+                            )
                         )
                         name = os.path.basename(path)[:27]
                         if len(os.path.basename(path)) > 27:
@@ -2105,6 +2228,12 @@ def main():
         default=ITERS,
         help="Benchmark timed iterations (Library-main style default: 1)",
     )
+    parser.add_argument(
+        "--case-timeout-seconds",
+        type=int,
+        default=SPSV_CASE_TIMEOUT_SECONDS,
+        help="Skip one .mtx case if it does not finish within this many seconds (default: 180)",
+    )
     args = parser.parse_args()
     WARMUP = max(0, int(args.warmup))
     ITERS = max(1, int(args.iters))
@@ -2189,6 +2318,7 @@ def main():
             index_dtypes=index_dtypes,
             op_modes=op_modes,
             alg_num=args.alg_num,
+            case_timeout_seconds=args.case_timeout_seconds,
         )
         return
     if args.csv_coo:
@@ -2220,6 +2350,7 @@ def main():
             index_dtypes=index_dtypes,
             op_modes=op_modes,
             alg_num=args.alg_num,
+            case_timeout_seconds=args.case_timeout_seconds,
         )
         return
 
