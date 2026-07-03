@@ -250,6 +250,7 @@ def _csv_export_row_spsv(row):
         "err_pt": row.get("err_pt"),
         "err_hs": row.get("err_hs"),
         "pytorch_reason": row.get("pytorch_reason"),
+        "hipsparse_reason": row.get("hipsparse_reason"),
         "error": row.get("error"),
     }
 
@@ -280,6 +281,7 @@ def _empty_csv_case_row_spsv(path, value_dtype, index_dtype, op_mode, status, er
         "err_pt": None,
         "err_hs": None,
         "pytorch_reason": None,
+        "hipsparse_reason": None,
         "error": error,
     }
 
@@ -1010,7 +1012,17 @@ def _benchmark_sparse_ref_lower_csr_or_coo(
         return None, None
 
 
-def _benchmark_sparse_ref_csr_with_op(data, indices, indptr, shape, b, op_mode, lower):
+def _benchmark_sparse_ref_csr_with_op(
+    data,
+    indices,
+    indptr,
+    shape,
+    b,
+    op_mode,
+    lower,
+    *,
+    return_reason=False,
+):
     if fs_spsv_impl._is_rocm_runtime():
         sparse_ref = fs_spsv_impl._benchmark_spsv_csr_sparse_ref(
             data,
@@ -1024,12 +1036,16 @@ def _benchmark_sparse_ref_csr_with_op(data, indices, indptr, shape, b, op_mode, 
             warmup=WARMUP,
             iters=ITERS,
         )
+        if return_reason:
+            return sparse_ref["ms"], sparse_ref["values"], sparse_ref.get("reason")
         return sparse_ref["ms"], sparse_ref["values"]
     if (
         cp is None
         or cpx_sparse is None
         or cpx_spsolve_triangular is None
     ):
+        if return_reason:
+            return None, None, "CuPy sparse triangular solve reference is unavailable"
         return None, None
     try:
         warmup, iters = _spsv_benchmark_schedule(int(data.numel()), op_mode, data.dtype, fmt="CSR")
@@ -1069,8 +1085,12 @@ def _benchmark_sparse_ref_csr_with_op(data, indices, indptr, shape, b, op_mode, 
         c1.synchronize()
         ms = cp.cuda.get_elapsed_time(c0, c1) / iters
         x_t = torch.utils.dlpack.from_dlpack(x_cp.toDlpack()).to(b.dtype)
+        if return_reason:
+            return ms, x_t, None
         return ms, x_t
-    except Exception:
+    except Exception as exc:
+        if return_reason:
+            return None, None, str(exc)
         return None, None
 
 
@@ -1354,8 +1374,9 @@ def _finalize_csv_row(
     err_hs = None
     ok_hs = False
     x_hs_t = None
-    hipsparse_ms, x_hs_t = _benchmark_sparse_ref_csr_with_op(
-        data, indices, indptr, shape, b, op_mode, lower
+    hs_skip_reason = None
+    hipsparse_ms, x_hs_t, hs_skip_reason = _benchmark_sparse_ref_csr_with_op(
+        data, indices, indptr, shape, b, op_mode, lower, return_reason=True
     )
     if x_hs_t is not None:
         x_cmp = x
@@ -1398,6 +1419,7 @@ def _finalize_csv_row(
         "err_pt": err_pt,
         "err_hs": err_hs,
         "pytorch_reason": pt_skip_reason,
+        "hipsparse_reason": hs_skip_reason,
         "error": None,
     }
     return row, pt_skip_reason
@@ -1502,8 +1524,9 @@ def _finalize_csv_row_csr_full(
     err_hs = None
     ok_hs = False
     x_hs_t = None
-    hipsparse_ms, x_hs_t = _benchmark_sparse_ref_csr_with_op(
-        data, indices, indptr, shape, b, op_mode, lower
+    hs_skip_reason = None
+    hipsparse_ms, x_hs_t, hs_skip_reason = _benchmark_sparse_ref_csr_with_op(
+        data, indices, indptr, shape, b, op_mode, lower, return_reason=True
     )
     if x_hs_t is not None:
         x_cmp = x
@@ -1546,6 +1569,7 @@ def _finalize_csv_row_csr_full(
         "err_pt": err_pt,
         "err_hs": err_hs,
         "pytorch_reason": pt_skip_reason,
+        "hipsparse_reason": hs_skip_reason,
         "error": None,
     }
     return row, pt_skip_reason
@@ -1784,6 +1808,8 @@ def run_all_supported_spsv_csr_csv(
                         if status in ("FAIL", "REF_FAIL"):
                             if pt_skip:
                                 print(f"  NOTE: {pt_skip}")
+                            if row.get("hipsparse_reason"):
+                                print(f"  NOTE: hipSPARSE reference unavailable ({row['hipsparse_reason']})")
                         if status in ("SKIP", "ERROR") and row.get("error"):
                             print(f"  {status}: {row['error']}")
                     except Exception as e:
@@ -1830,6 +1856,7 @@ def run_all_supported_spsv_csr_csv(
         "err_pt",
         "err_hs",
         "pytorch_reason",
+        "hipsparse_reason",
         "error",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -1948,6 +1975,8 @@ def run_all_dtypes_spsv_coo_csv(
                         if status in ("FAIL", "REF_FAIL"):
                             if pt_skip:
                                 print(f"  NOTE: {pt_skip}")
+                            if row.get("hipsparse_reason"):
+                                print(f"  NOTE: hipSPARSE reference unavailable ({row['hipsparse_reason']})")
                         if status in ("SKIP", "ERROR") and row.get("error"):
                             print(f"  {status}: {row['error']}")
                     except Exception as e:
@@ -1993,6 +2022,7 @@ def run_all_dtypes_spsv_coo_csv(
         "err_pt",
         "err_hs",
         "pytorch_reason",
+        "hipsparse_reason",
         "error",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
