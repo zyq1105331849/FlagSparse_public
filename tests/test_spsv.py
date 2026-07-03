@@ -18,7 +18,6 @@ _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
-import flagsparse as fs
 import flagsparse.sparse_operations.spsv as fs_spsv_impl
 
 try:
@@ -757,7 +756,7 @@ def _benchmark_flagsparse_spsv_csr(
     iters=ITERS,
 ):
     return _benchmark_flagsparse(
-        lambda: fs.flagsparse_spsv_csr(
+        lambda: fs_spsv_impl.flagsparse_spsv_csr(
             data,
             indices,
             indptr,
@@ -2023,7 +2022,7 @@ def _check_one_csr_transpose_case(path, value_dtype, index_dtype, op_mode, devic
             _dtype_name(index_dtype),
         ),
     )
-    x_op = fs.flagsparse_spsv_csr(
+    x_op = fs_spsv_impl.flagsparse_spsv_csr(
         data,
         indices,
         indptr,
@@ -2032,7 +2031,7 @@ def _check_one_csr_transpose_case(path, value_dtype, index_dtype, op_mode, devic
         lower=lower,
         transpose=op_mode,
     )
-    x_mat = fs.flagsparse_spsv_csr(
+    x_mat = fs_spsv_impl.flagsparse_spsv_csr(
         trans_data,
         trans_indices,
         trans_indptr,

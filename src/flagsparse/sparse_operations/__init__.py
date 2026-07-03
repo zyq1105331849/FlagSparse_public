@@ -20,21 +20,25 @@ from .alpha_spmm_alg1 import (
     prepare_alpha_spmm_alg1_tle_opt,
     prepare_alpha_spmm_alg1_tle_opt2,
 )
-from .benchmarks import (
-    benchmark_gather_case,
-    benchmark_performance,
-    benchmark_scatter_case,
-    benchmark_sddmm_case,
-    benchmark_spgemm_case,
-    benchmark_spmm_case,
-    benchmark_spmm_opt_case,
-    benchmark_spmv_case,
-    benchmark_spsm_case,
-    comprehensive_gather_test,
-    comprehensive_scatter_test,
-    comprehensive_spmm_test,
-    comprehensive_spsm_test,
-)
+_BENCHMARK_EXPORTS = {
+    "benchmark_gather_case",
+    "benchmark_performance",
+    "benchmark_scatter_case",
+    "benchmark_sddmm_case",
+    "benchmark_spgemm_case",
+    "benchmark_spmm_case",
+    "benchmark_spmm_opt_case",
+    "benchmark_spmv_case",
+    "benchmark_spsm_case",
+    "comprehensive_gather_test",
+    "comprehensive_scatter_test",
+    "comprehensive_spmm_test",
+    "comprehensive_spsm_test",
+}
+_SPSM_EXPORTS = {
+    "flagsparse_spsm_coo",
+    "flagsparse_spsm_csr",
+}
 from .gather_scatter import (
     benchmark_hipsparse_gather,
     benchmark_hipsparse_scatter,
@@ -109,8 +113,6 @@ from .spsv import (
     flagsparse_spsv_solve_csr,
     flagsparse_spsv_solve_ex,
 )
-from .spsm import flagsparse_spsm_coo, flagsparse_spsm_csr
-
 __all__ = [
     "PreparedCoo",
     "PreparedAlphaSpmmAlg1",
@@ -211,3 +213,17 @@ __all__ = [
     "SpmmCsrAlgorithmUnavailable",
     "list_spmm_csr_algorithms",
 ]
+
+
+def __getattr__(name):
+    if name in _SPSM_EXPORTS:
+        from importlib import import_module
+
+        _spsm = import_module(f"{__name__}.spsm")
+        return getattr(_spsm, name)
+    if name in _BENCHMARK_EXPORTS:
+        from importlib import import_module
+
+        _benchmarks = import_module(f"{__name__}.benchmarks")
+        return getattr(_benchmarks, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
