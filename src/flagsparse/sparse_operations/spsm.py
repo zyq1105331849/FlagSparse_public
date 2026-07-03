@@ -814,6 +814,7 @@ def _spsm_csr_polling_kernel_real(
     diag_ptr,
     work_ptr,
     done_ptr,
+    row_counter_ptr,
     n_rows,
     n_rhs,
     stride_work0,
@@ -823,103 +824,103 @@ def _spsm_csr_polling_kernel_real(
     LOWER: tl.constexpr,
     UNIT_DIAG: tl.constexpr,
 ):
-    pid_row = tl.program_id(0)
     pid_rhs = tl.program_id(1)
-    if LOWER:
-        row = pid_row
-    else:
-        row = n_rows - 1 - pid_row
-    rhs_offsets = pid_rhs * BLOCK_RHS + tl.arange(0, BLOCK_RHS)
-    row_i64 = row.to(tl.int64)
-    rhs_offsets_i64 = rhs_offsets.to(tl.int64)
-    rhs_mask = rhs_offsets < n_rhs
+    logical_row = tl.atomic_add(row_counter_ptr + pid_rhs, 1)
+    while logical_row < n_rows:
+        if LOWER:
+            row = logical_row
+        else:
+            row = n_rows - 1 - logical_row
+        rhs_offsets = pid_rhs * BLOCK_RHS + tl.arange(0, BLOCK_RHS)
+        row_i64 = row.to(tl.int64)
+        rhs_offsets_i64 = rhs_offsets.to(tl.int64)
+        rhs_mask = rhs_offsets < n_rhs
 
-    if USE_FP64_ACC:
-        rhs = tl.load(work_ptr + row_i64 * stride_work0 + rhs_offsets_i64, mask=rhs_mask, other=0.0).to(tl.float64)
-        alpha_val = tl.full((BLOCK_RHS,), alpha, tl.float64)
-        local_sum = rhs * alpha_val
-    else:
-        rhs = tl.load(work_ptr + row_i64 * stride_work0 + rhs_offsets_i64, mask=rhs_mask, other=0.0).to(tl.float32)
-        alpha_val = tl.full((BLOCK_RHS,), alpha, tl.float32)
-        local_sum = rhs * alpha_val
+        if USE_FP64_ACC:
+            rhs = tl.load(work_ptr + row_i64 * stride_work0 + rhs_offsets_i64, mask=rhs_mask, other=0.0).to(tl.float64)
+            alpha_val = tl.full((BLOCK_RHS,), alpha, tl.float64)
+            local_sum = rhs * alpha_val
+        else:
+            rhs = tl.load(work_ptr + row_i64 * stride_work0 + rhs_offsets_i64, mask=rhs_mask, other=0.0).to(tl.float32)
+            alpha_val = tl.full((BLOCK_RHS,), alpha, tl.float32)
+            local_sum = rhs * alpha_val
 
-    start = tl.load(indptr_ptr + row)
-    end = tl.load(indptr_ptr + row + 1)
-    flag_base = pid_rhs.to(tl.int64) * n_rows
+        start = tl.load(indptr_ptr + row)
+        end = tl.load(indptr_ptr + row + 1)
+        flag_base = pid_rhs.to(tl.int64) * n_rows
 
-    if LOWER:
-        p = start
-        while p < end:
-            col = tl.load(indices_ptr + p)
-            if col < row:
-                val = tl.load(data_ptr + p)
-                if USE_FP64_ACC:
-                    val = val.to(tl.float64)
-                else:
-                    val = val.to(tl.float32)
-                dep_flag_ptr = done_ptr + flag_base + col.to(tl.int64)
-                ready = tl.atomic_or(dep_flag_ptr, 0, sem="acquire")
-                while ready == 0:
+        if LOWER:
+            p = start
+            while p < end:
+                col = tl.load(indices_ptr + p)
+                if col < row:
+                    val = tl.load(data_ptr + p)
+                    if USE_FP64_ACC:
+                        val = val.to(tl.float64)
+                    else:
+                        val = val.to(tl.float32)
+                    dep_flag_ptr = done_ptr + flag_base + col.to(tl.int64)
                     ready = tl.atomic_or(dep_flag_ptr, 0, sem="acquire")
-                x_vals = tl.load(
-                    work_ptr + col.to(tl.int64) * stride_work0 + rhs_offsets_i64,
-                    mask=rhs_mask,
-                    other=0.0,
-                    cache_modifier=".cv",
-                )
-                if USE_FP64_ACC:
-                    x_vals = x_vals.to(tl.float64)
-                else:
-                    x_vals = x_vals.to(tl.float32)
-                local_sum -= val * x_vals
-            p += 1
-    else:
-        p = end - 1
-        while p >= start:
-            col = tl.load(indices_ptr + p)
-            if col > row:
-                val = tl.load(data_ptr + p)
-                if USE_FP64_ACC:
-                    val = val.to(tl.float64)
-                else:
-                    val = val.to(tl.float32)
-                dep_flag_ptr = done_ptr + flag_base + col.to(tl.int64)
-                ready = tl.atomic_or(dep_flag_ptr, 0, sem="acquire")
-                while ready == 0:
+                    while ready == 0:
+                        ready = tl.atomic_or(dep_flag_ptr, 0, sem="acquire")
+                    x_vals = tl.load(
+                        work_ptr + col.to(tl.int64) * stride_work0 + rhs_offsets_i64,
+                        mask=rhs_mask,
+                        other=0.0,
+                        cache_modifier=".cv",
+                    )
+                    if USE_FP64_ACC:
+                        x_vals = x_vals.to(tl.float64)
+                    else:
+                        x_vals = x_vals.to(tl.float32)
+                    local_sum -= val * x_vals
+                p += 1
+        else:
+            p = end - 1
+            while p >= start:
+                col = tl.load(indices_ptr + p)
+                if col > row:
+                    val = tl.load(data_ptr + p)
+                    if USE_FP64_ACC:
+                        val = val.to(tl.float64)
+                    else:
+                        val = val.to(tl.float32)
+                    dep_flag_ptr = done_ptr + flag_base + col.to(tl.int64)
                     ready = tl.atomic_or(dep_flag_ptr, 0, sem="acquire")
-                x_vals = tl.load(
-                    work_ptr + col.to(tl.int64) * stride_work0 + rhs_offsets_i64,
-                    mask=rhs_mask,
-                    other=0.0,
-                    cache_modifier=".cv",
-                )
-                if USE_FP64_ACC:
-                    x_vals = x_vals.to(tl.float64)
-                else:
-                    x_vals = x_vals.to(tl.float32)
-                local_sum -= val * x_vals
-            p -= 1
+                    while ready == 0:
+                        ready = tl.atomic_or(dep_flag_ptr, 0, sem="acquire")
+                    x_vals = tl.load(
+                        work_ptr + col.to(tl.int64) * stride_work0 + rhs_offsets_i64,
+                        mask=rhs_mask,
+                        other=0.0,
+                        cache_modifier=".cv",
+                    )
+                    if USE_FP64_ACC:
+                        x_vals = x_vals.to(tl.float64)
+                    else:
+                        x_vals = x_vals.to(tl.float32)
+                    local_sum -= val * x_vals
+                p -= 1
 
-    diag = tl.load(diag_ptr + row)
-    if USE_FP64_ACC:
-        diag = diag.to(tl.float64)
-    else:
-        diag = diag.to(tl.float32)
-    if UNIT_DIAG:
-        out = local_sum
-    else:
-        out = local_sum / diag
-    out = tl.where(out == out, out, 0.0)
-    tl.store(
-        work_ptr + row_i64 * stride_work0 + rhs_offsets_i64,
-        out,
-        mask=rhs_mask,
-        cache_modifier=".wt",
-    )
-    # Every warp must finish publishing its RHS slice before the row is marked
-    # ready for dependent programs.
-    tl.debug_barrier()
-    tl.atomic_or(done_ptr + flag_base + row_i64, 1, sem="release")
+        diag = tl.load(diag_ptr + row)
+        if USE_FP64_ACC:
+            diag = diag.to(tl.float64)
+        else:
+            diag = diag.to(tl.float32)
+        if UNIT_DIAG:
+            out = local_sum
+        else:
+            out = local_sum / diag
+        out = tl.where(out == out, out, 0.0)
+        tl.store(
+            work_ptr + row_i64 * stride_work0 + rhs_offsets_i64,
+            out,
+            mask=rhs_mask,
+            cache_modifier=".wt",
+        )
+        tl.debug_barrier()
+        tl.atomic_or(done_ptr + flag_base + row_i64, 1, sem="release")
+        logical_row = tl.atomic_add(row_counter_ptr + pid_rhs, 1)
 
 
 @triton.jit
@@ -930,6 +931,7 @@ def _spsm_csr_polling_kernel_complex(
     diag_ri_ptr,
     work_ri_ptr,
     done_ptr,
+    row_counter_ptr,
     n_rows,
     n_rhs,
     stride_work0,
@@ -940,143 +942,144 @@ def _spsm_csr_polling_kernel_complex(
     LOWER: tl.constexpr,
     UNIT_DIAG: tl.constexpr,
 ):
-    pid_row = tl.program_id(0)
     pid_rhs = tl.program_id(1)
-    if LOWER:
-        row = pid_row
-    else:
-        row = n_rows - 1 - pid_row
-    rhs_offsets = pid_rhs * BLOCK_RHS + tl.arange(0, BLOCK_RHS)
-    row_i64 = row.to(tl.int64)
-    rhs_offsets_i64 = rhs_offsets.to(tl.int64)
-    rhs_mask = rhs_offsets < n_rhs
-    base = (row_i64 * stride_work0 + rhs_offsets_i64) * 2
+    logical_row = tl.atomic_add(row_counter_ptr + pid_rhs, 1)
+    while logical_row < n_rows:
+        if LOWER:
+            row = logical_row
+        else:
+            row = n_rows - 1 - logical_row
+        rhs_offsets = pid_rhs * BLOCK_RHS + tl.arange(0, BLOCK_RHS)
+        row_i64 = row.to(tl.int64)
+        rhs_offsets_i64 = rhs_offsets.to(tl.int64)
+        rhs_mask = rhs_offsets < n_rhs
+        base = (row_i64 * stride_work0 + rhs_offsets_i64) * 2
 
-    rhs_re = tl.load(work_ri_ptr + base, mask=rhs_mask, other=0.0)
-    rhs_im = tl.load(work_ri_ptr + base + 1, mask=rhs_mask, other=0.0)
-    if USE_FP64_ACC:
-        rhs_re = rhs_re.to(tl.float64)
-        rhs_im = rhs_im.to(tl.float64)
-        alpha_re_v = tl.full((BLOCK_RHS,), alpha_re, tl.float64)
-        alpha_im_v = tl.full((BLOCK_RHS,), alpha_im, tl.float64)
-        sum_re = rhs_re * alpha_re_v - rhs_im * alpha_im_v
-        sum_im = rhs_re * alpha_im_v + rhs_im * alpha_re_v
-    else:
-        rhs_re = rhs_re.to(tl.float32)
-        rhs_im = rhs_im.to(tl.float32)
-        alpha_re_v = tl.full((BLOCK_RHS,), alpha_re, tl.float32)
-        alpha_im_v = tl.full((BLOCK_RHS,), alpha_im, tl.float32)
-        sum_re = rhs_re * alpha_re_v - rhs_im * alpha_im_v
-        sum_im = rhs_re * alpha_im_v + rhs_im * alpha_re_v
+        rhs_re = tl.load(work_ri_ptr + base, mask=rhs_mask, other=0.0)
+        rhs_im = tl.load(work_ri_ptr + base + 1, mask=rhs_mask, other=0.0)
+        if USE_FP64_ACC:
+            rhs_re = rhs_re.to(tl.float64)
+            rhs_im = rhs_im.to(tl.float64)
+            alpha_re_v = tl.full((BLOCK_RHS,), alpha_re, tl.float64)
+            alpha_im_v = tl.full((BLOCK_RHS,), alpha_im, tl.float64)
+            sum_re = rhs_re * alpha_re_v - rhs_im * alpha_im_v
+            sum_im = rhs_re * alpha_im_v + rhs_im * alpha_re_v
+        else:
+            rhs_re = rhs_re.to(tl.float32)
+            rhs_im = rhs_im.to(tl.float32)
+            alpha_re_v = tl.full((BLOCK_RHS,), alpha_re, tl.float32)
+            alpha_im_v = tl.full((BLOCK_RHS,), alpha_im, tl.float32)
+            sum_re = rhs_re * alpha_re_v - rhs_im * alpha_im_v
+            sum_im = rhs_re * alpha_im_v + rhs_im * alpha_re_v
 
-    start = tl.load(indptr_ptr + row)
-    end = tl.load(indptr_ptr + row + 1)
-    flag_base = pid_rhs.to(tl.int64) * n_rows
+        start = tl.load(indptr_ptr + row)
+        end = tl.load(indptr_ptr + row + 1)
+        flag_base = pid_rhs.to(tl.int64) * n_rows
 
-    if LOWER:
-        p = start
-        while p < end:
-            col = tl.load(indices_ptr + p)
-            if col < row:
-                val_re = tl.load(data_ri_ptr + p * 2)
-                val_im = tl.load(data_ri_ptr + p * 2 + 1)
-                if USE_FP64_ACC:
-                    val_re = val_re.to(tl.float64)
-                    val_im = val_im.to(tl.float64)
-                else:
-                    val_re = val_re.to(tl.float32)
-                    val_im = val_im.to(tl.float32)
-                dep_flag_ptr = done_ptr + flag_base + col.to(tl.int64)
-                ready = tl.atomic_or(dep_flag_ptr, 0, sem="acquire")
-                while ready == 0:
+        if LOWER:
+            p = start
+            while p < end:
+                col = tl.load(indices_ptr + p)
+                if col < row:
+                    val_re = tl.load(data_ri_ptr + p * 2)
+                    val_im = tl.load(data_ri_ptr + p * 2 + 1)
+                    if USE_FP64_ACC:
+                        val_re = val_re.to(tl.float64)
+                        val_im = val_im.to(tl.float64)
+                    else:
+                        val_re = val_re.to(tl.float32)
+                        val_im = val_im.to(tl.float32)
+                    dep_flag_ptr = done_ptr + flag_base + col.to(tl.int64)
                     ready = tl.atomic_or(dep_flag_ptr, 0, sem="acquire")
-                x_base = (col.to(tl.int64) * stride_work0 + rhs_offsets_i64) * 2
-                x_re = tl.load(
-                    work_ri_ptr + x_base,
-                    mask=rhs_mask,
-                    other=0.0,
-                    cache_modifier=".cv",
-                )
-                x_im = tl.load(
-                    work_ri_ptr + x_base + 1,
-                    mask=rhs_mask,
-                    other=0.0,
-                    cache_modifier=".cv",
-                )
-                if USE_FP64_ACC:
-                    x_re = x_re.to(tl.float64)
-                    x_im = x_im.to(tl.float64)
-                else:
-                    x_re = x_re.to(tl.float32)
-                    x_im = x_im.to(tl.float32)
-                sum_re -= val_re * x_re - val_im * x_im
-                sum_im -= val_re * x_im + val_im * x_re
-            p += 1
-    else:
-        p = end - 1
-        while p >= start:
-            col = tl.load(indices_ptr + p)
-            if col > row:
-                val_re = tl.load(data_ri_ptr + p * 2)
-                val_im = tl.load(data_ri_ptr + p * 2 + 1)
-                if USE_FP64_ACC:
-                    val_re = val_re.to(tl.float64)
-                    val_im = val_im.to(tl.float64)
-                else:
-                    val_re = val_re.to(tl.float32)
-                    val_im = val_im.to(tl.float32)
-                dep_flag_ptr = done_ptr + flag_base + col.to(tl.int64)
-                ready = tl.atomic_or(dep_flag_ptr, 0, sem="acquire")
-                while ready == 0:
+                    while ready == 0:
+                        ready = tl.atomic_or(dep_flag_ptr, 0, sem="acquire")
+                    x_base = (col.to(tl.int64) * stride_work0 + rhs_offsets_i64) * 2
+                    x_re = tl.load(
+                        work_ri_ptr + x_base,
+                        mask=rhs_mask,
+                        other=0.0,
+                        cache_modifier=".cv",
+                    )
+                    x_im = tl.load(
+                        work_ri_ptr + x_base + 1,
+                        mask=rhs_mask,
+                        other=0.0,
+                        cache_modifier=".cv",
+                    )
+                    if USE_FP64_ACC:
+                        x_re = x_re.to(tl.float64)
+                        x_im = x_im.to(tl.float64)
+                    else:
+                        x_re = x_re.to(tl.float32)
+                        x_im = x_im.to(tl.float32)
+                    sum_re -= val_re * x_re - val_im * x_im
+                    sum_im -= val_re * x_im + val_im * x_re
+                p += 1
+        else:
+            p = end - 1
+            while p >= start:
+                col = tl.load(indices_ptr + p)
+                if col > row:
+                    val_re = tl.load(data_ri_ptr + p * 2)
+                    val_im = tl.load(data_ri_ptr + p * 2 + 1)
+                    if USE_FP64_ACC:
+                        val_re = val_re.to(tl.float64)
+                        val_im = val_im.to(tl.float64)
+                    else:
+                        val_re = val_re.to(tl.float32)
+                        val_im = val_im.to(tl.float32)
+                    dep_flag_ptr = done_ptr + flag_base + col.to(tl.int64)
                     ready = tl.atomic_or(dep_flag_ptr, 0, sem="acquire")
-                x_base = (col.to(tl.int64) * stride_work0 + rhs_offsets_i64) * 2
-                x_re = tl.load(
-                    work_ri_ptr + x_base,
-                    mask=rhs_mask,
-                    other=0.0,
-                    cache_modifier=".cv",
-                )
-                x_im = tl.load(
-                    work_ri_ptr + x_base + 1,
-                    mask=rhs_mask,
-                    other=0.0,
-                    cache_modifier=".cv",
-                )
-                if USE_FP64_ACC:
-                    x_re = x_re.to(tl.float64)
-                    x_im = x_im.to(tl.float64)
-                else:
-                    x_re = x_re.to(tl.float32)
-                    x_im = x_im.to(tl.float32)
-                prod_re = val_re * x_re - val_im * x_im
-                prod_im = val_re * x_im + val_im * x_re
-                sum_re -= prod_re
-                sum_im -= prod_im
-            p -= 1
+                    while ready == 0:
+                        ready = tl.atomic_or(dep_flag_ptr, 0, sem="acquire")
+                    x_base = (col.to(tl.int64) * stride_work0 + rhs_offsets_i64) * 2
+                    x_re = tl.load(
+                        work_ri_ptr + x_base,
+                        mask=rhs_mask,
+                        other=0.0,
+                        cache_modifier=".cv",
+                    )
+                    x_im = tl.load(
+                        work_ri_ptr + x_base + 1,
+                        mask=rhs_mask,
+                        other=0.0,
+                        cache_modifier=".cv",
+                    )
+                    if USE_FP64_ACC:
+                        x_re = x_re.to(tl.float64)
+                        x_im = x_im.to(tl.float64)
+                    else:
+                        x_re = x_re.to(tl.float32)
+                        x_im = x_im.to(tl.float32)
+                    prod_re = val_re * x_re - val_im * x_im
+                    prod_im = val_re * x_im + val_im * x_re
+                    sum_re -= prod_re
+                    sum_im -= prod_im
+                p -= 1
 
-    diag_re = tl.load(diag_ri_ptr + row * 2)
-    diag_im = tl.load(diag_ri_ptr + row * 2 + 1)
-    if USE_FP64_ACC:
-        diag_re = diag_re.to(tl.float64)
-        diag_im = diag_im.to(tl.float64)
-    else:
-        diag_re = diag_re.to(tl.float32)
-        diag_im = diag_im.to(tl.float32)
-    denom = diag_re * diag_re + diag_im * diag_im
-    if UNIT_DIAG:
-        out_re = sum_re
-        out_im = sum_im
-    else:
-        out_re = (sum_re * diag_re + sum_im * diag_im) / denom
-        out_im = (sum_im * diag_re - sum_re * diag_im) / denom
-    out_re = tl.where(out_re == out_re, out_re, 0.0)
-    out_im = tl.where(out_im == out_im, out_im, 0.0)
+        diag_re = tl.load(diag_ri_ptr + row * 2)
+        diag_im = tl.load(diag_ri_ptr + row * 2 + 1)
+        if USE_FP64_ACC:
+            diag_re = diag_re.to(tl.float64)
+            diag_im = diag_im.to(tl.float64)
+        else:
+            diag_re = diag_re.to(tl.float32)
+            diag_im = diag_im.to(tl.float32)
+        denom = diag_re * diag_re + diag_im * diag_im
+        if UNIT_DIAG:
+            out_re = sum_re
+            out_im = sum_im
+        else:
+            out_re = (sum_re * diag_re + sum_im * diag_im) / denom
+            out_im = (sum_im * diag_re - sum_re * diag_im) / denom
+        out_re = tl.where(out_re == out_re, out_re, 0.0)
+        out_im = tl.where(out_im == out_im, out_im, 0.0)
 
-    tl.store(work_ri_ptr + base, out_re, mask=rhs_mask, cache_modifier=".wt")
-    tl.store(work_ri_ptr + base + 1, out_im, mask=rhs_mask, cache_modifier=".wt")
-    # Match the CUDA __syncthreads()/publish ordering for multi-warp RHS tiles.
-    tl.debug_barrier()
-    tl.atomic_or(done_ptr + flag_base + row_i64, 1, sem="release")
+        tl.store(work_ri_ptr + base, out_re, mask=rhs_mask, cache_modifier=".wt")
+        tl.store(work_ri_ptr + base + 1, out_im, mask=rhs_mask, cache_modifier=".wt")
+        tl.debug_barrier()
+        tl.atomic_or(done_ptr + flag_base + row_i64, 1, sem="release")
+        logical_row = tl.atomic_add(row_counter_ptr + pid_rhs, 1)
 
 
 def _prepare_spsm_rhs_work_buffer(rhs):
@@ -1099,6 +1102,19 @@ def _spsm_polling_num_warps(block_rhs):
     if block_rhs <= 256:
         return 4
     return 8
+
+
+def _spsm_polling_worker_count(n_rows, n_rhs):
+    n_rows = int(n_rows)
+    n_rhs = int(n_rhs)
+    if n_rows <= 0:
+        return 1
+    target = min(n_rows, 2048)
+    if n_rhs <= 1:
+        target = min(target, 64)
+    elif n_rhs <= 8:
+        target = min(target, 256)
+    return int(max(1, target))
 
 
 def _coo_to_csr_sorted_unique(data, row64, col64, n_rows, n_cols):
@@ -1235,11 +1251,13 @@ def _run_spsm_csr_core(
     ):
         raise ValueError("block_rhs must be a power of two in [1, 1024]")
     rhs_tiles = triton.cdiv(n_rhs, block_rhs_use)
+    worker_count = _spsm_polling_worker_count(n_rows, n_rhs)
     num_warps_use = _spsm_polling_num_warps(block_rhs_use)
     done = torch.zeros((rhs_tiles, n_rows), dtype=torch.int32, device=rhs.device)
+    row_counter = torch.zeros((rhs_tiles,), dtype=torch.int32, device=rhs.device)
     is_complex = torch.is_complex(data)
     use_fp64 = data.dtype in (torch.float64, torch.complex128)
-    grid = (n_rows, rhs_tiles)
+    grid = (worker_count, rhs_tiles)
     if is_complex:
         data_ri = data_ri if data_ri is not None else _complex_interleaved_view(data)
         rhs_work_ri = _complex_interleaved_view(rhs_work)
@@ -1262,6 +1280,7 @@ def _run_spsm_csr_core(
             diag_ri,
             rhs_work_ri,
             done,
+            row_counter,
             n_rows=n_rows,
             n_rhs=n_rhs,
             stride_work0=rhs_work.stride(0),
@@ -1293,6 +1312,7 @@ def _run_spsm_csr_core(
         diag,
         rhs_work,
         done,
+        row_counter,
         n_rows=n_rows,
         n_rhs=n_rhs,
         stride_work0=rhs_work.stride(0),
