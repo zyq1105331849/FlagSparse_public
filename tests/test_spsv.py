@@ -123,14 +123,14 @@ def _alg_label(alg_num):
             and fs_spsv_impl._is_rocm_runtime()
             and not fs_spsv_impl.SPSV_ROCM_ENABLE_TRITON_CW
         ):
-            return "ALG1/CW(host)"
+            return "ALG1/hipSPARSE"
         return f"ALG{int(alg_num)}"
     if (
         fs_spsv_impl._is_rocm_runtime()
         and not fs_spsv_impl.SPSV_ROCM_ENABLE_ADVANCED_AUTO
     ):
         if not fs_spsv_impl.SPSV_ROCM_ENABLE_TRITON_CW:
-            return "AUTO->ALG1/CW(host)"
+            return "AUTO->ALG1/hipSPARSE"
         return "AUTO->ALG1/CW"
     return "AUTO"
 

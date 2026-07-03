@@ -2327,6 +2327,52 @@ def _prepare_spsv_csr_system(
     return cw_plan
 
 
+def _prepare_rocm_hipsparse_spsv_plan(
+    data,
+    indices64,
+    indptr64,
+    n_rows,
+    lower,
+    unit_diagonal,
+):
+    if lower:
+        nontrans_variant = "csr_u_lo_cw" if unit_diagonal else "csr_n_lo_cw"
+    else:
+        nontrans_variant = "csr_u_up_cw" if unit_diagonal else "csr_n_up_cw"
+    matrix_stats = {
+        "n_rows": int(n_rows),
+        "nnz": int(indices64.numel()),
+        "avg_nnz_per_row": (
+            float(indices64.numel()) / float(n_rows) if int(n_rows) > 0 else 0.0
+        ),
+        "max_nnz_per_row": 0,
+        "max_frontier": int(n_rows),
+    }
+    return {
+        "solve_kind": "csr_cw",
+        "default_solve_kind": "csr_cw",
+        "supported_solve_kinds": ("csr_cw",),
+        "nontrans_variant": nontrans_variant,
+        "kernel_data": data,
+        "kernel_indices32": indices64.to(torch.int32),
+        "kernel_indptr64": indptr64,
+        "hipsparse_indices": indices64.contiguous(),
+        "hipsparse_indptr": indptr64.contiguous(),
+        "lower_eff": lower,
+        "default_block_nnz": 0,
+        "default_max_segments": 0,
+        "storage_view": "csr",
+        "cw_worker_count": 1,
+        "matrix_stats": matrix_stats,
+        "route_name": "hipsparse_csr_spsv",
+        "level_row_map32": torch.empty(0, dtype=torch.int32, device=data.device),
+        "level_ptr32": torch.zeros(1, dtype=torch.int32, device=data.device),
+        "nnz_balance_indegree32": torch.empty(0, dtype=torch.int32, device=data.device),
+        "nnz_balance_row_idx32": torch.empty(0, dtype=torch.int32, device=data.device),
+        "nnz_balance_launch_order32": torch.empty(0, dtype=torch.int32, device=data.device),
+    }
+
+
 def _resolve_spsv_csr_runtime(
     data,
     indices,
@@ -2353,6 +2399,34 @@ def _resolve_spsv_csr_runtime(
         _validate_spsv_non_trans_combo(data.dtype, input_index_dtype, "CSR")
     else:
         _validate_spsv_trans_combo(data.dtype, input_index_dtype, "CSR")
+    requested_route = _normalize_requested_spsv_route(requested_solve_kind, trans_mode)
+
+    if (
+        trans_mode == "N"
+        and _is_rocm_runtime()
+        and not SPSV_ROCM_ENABLE_TRITON_CW
+        and (
+            requested_route == "csr_cw"
+            or (requested_route is None and not SPSV_ROCM_ENABLE_ADVANCED_AUTO)
+        )
+    ):
+        cached = _prepare_rocm_hipsparse_spsv_plan(
+            data,
+            indices,
+            indptr,
+            n_rows,
+            lower,
+            unit_diagonal,
+        )
+        return (
+            data,
+            b,
+            original_output_dtype,
+            trans_mode,
+            n_rows,
+            n_cols,
+            cached,
+        )
 
     preprocess_key = _csr_preprocess_cache_key(
         input_data,
@@ -2362,7 +2436,7 @@ def _resolve_spsv_csr_runtime(
         lower,
         trans_mode,
         unit_diagonal,
-        _normalize_requested_spsv_route(requested_solve_kind, trans_mode),
+        requested_route,
         _normalize_spsv_storage_view(storage_view),
     )
     cached = _spsv_cache_get(_SPSV_CSR_PREPROCESS_CACHE, preprocess_key)
@@ -4779,6 +4853,81 @@ def _spsv_csr_host_triangular_solve(
     return x_cpu.to(device=b.device, dtype=b.dtype)
 
 
+def _destroy_workspace_hipsparse_spsv_state(workspace):
+    if not isinstance(workspace, FlagSparseSpSVWorkspace):
+        return
+    state = workspace.buffers.pop("_hipsparse_spsv_state", None)
+    workspace.buffers.pop("_hipsparse_spsv_key", None)
+    if state is not None:
+        _destroy_spsv_csr_ref_hipsparse_prepared(state)
+
+
+def _run_rocm_hipsparse_spsv_fallback(
+    data,
+    indices,
+    indptr,
+    b,
+    n_rows,
+    *,
+    lower=True,
+    unit_diagonal=False,
+    workspace=None,
+    out=None,
+):
+    target_out = out if out is not None and out.dtype == data.dtype else None
+    key = (
+        int(data.data_ptr()),
+        int(indices.data_ptr()),
+        int(indptr.data_ptr()),
+        int(b.data_ptr()),
+        int(target_out.data_ptr()) if target_out is not None else 0,
+        int(n_rows),
+        str(data.dtype),
+        bool(lower),
+        bool(unit_diagonal),
+    )
+
+    state = None
+    owns_state = True
+    if isinstance(workspace, FlagSparseSpSVWorkspace):
+        state = workspace.buffers.get("_hipsparse_spsv_state")
+        if workspace.buffers.get("_hipsparse_spsv_key") != key:
+            _destroy_workspace_hipsparse_spsv_state(workspace)
+            state = _prepare_spsv_csr_ref_hipsparse(
+                data,
+                indices,
+                indptr,
+                b,
+                (int(n_rows), int(n_rows)),
+                lower=lower,
+                unit_diagonal=unit_diagonal,
+                op="non",
+                out=target_out,
+            )
+            workspace.buffers["_hipsparse_spsv_key"] = key
+            workspace.buffers["_hipsparse_spsv_state"] = state
+        owns_state = False
+
+    if state is None:
+        state = _prepare_spsv_csr_ref_hipsparse(
+            data,
+            indices,
+            indptr,
+            b,
+            (int(n_rows), int(n_rows)),
+            lower=lower,
+            unit_diagonal=unit_diagonal,
+            op="non",
+            out=target_out,
+        )
+
+    try:
+        return _run_spsv_csr_ref_hipsparse_prepared(state)
+    finally:
+        if owns_state:
+            _destroy_spsv_csr_ref_hipsparse_prepared(state)
+
+
 def _execute_spsv_csr_plan(
     data,
     b,
@@ -4816,6 +4965,8 @@ def _execute_spsv_csr_plan(
     nnz_balance_launch_order32 = solve_plan.get("nnz_balance_launch_order32")
     kernel_indices = kernel_indices32
     kernel_indptr = kernel_indptr64
+    hipsparse_indices = solve_plan.get("hipsparse_indices", kernel_indices)
+    hipsparse_indptr = solve_plan.get("hipsparse_indptr", kernel_indptr)
     compute_dtype = _spsv_effective_compute_dtype(
         data.dtype, trans_mode, compute_dtype=compute_dtype
     )
@@ -4884,15 +5035,16 @@ def _execute_spsv_csr_plan(
         and _is_rocm_runtime()
         and not SPSV_ROCM_ENABLE_TRITON_CW
     ):
-        x = _spsv_csr_host_triangular_solve(
+        x = _run_rocm_hipsparse_spsv_fallback(
             data_in,
-            kernel_indices,
-            kernel_indptr,
+            hipsparse_indices,
+            hipsparse_indptr,
             b_in,
             n_rows,
             lower=lower_eff,
             unit_diagonal=unit_diagonal,
-            diag_eps=diag_eps,
+            workspace=workspace,
+            out=out,
         )
         target_dtype = original_output_dtype if original_output_dtype is not None else data.dtype
         if x.dtype != target_dtype:
