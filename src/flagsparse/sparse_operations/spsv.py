@@ -63,6 +63,9 @@ SPSV_PROMOTE_TRANSPOSE_FP32_TO_FP64 = _spsv_env_flag(
 SPSV_PROMOTE_TRANSPOSE_COMPLEX64_TO_COMPLEX128 = _spsv_env_flag(
     "FLAGSPARSE_SPSV_PROMOTE_TRANSPOSE_COMPLEX64_TO_COMPLEX128", "0"
 )
+SPSV_ROCM_ENABLE_ADVANCED_AUTO = _spsv_env_flag(
+    "FLAGSPARSE_SPSV_ROCM_ENABLE_ADVANCED_AUTO", "0"
+)
 _SPSV_CSR_PREPROCESS_CACHE = OrderedDict()
 _SPSV_CSR_PREPROCESS_CACHE_SIZE = 8
 
@@ -1668,6 +1671,8 @@ def _choose_spsv_nontrans_auto_route(
     n_rows = int(n_rows)
     if n_rows <= 0:
         return "csr_cw"
+    if _is_rocm_runtime() and not SPSV_ROCM_ENABLE_ADVANCED_AUTO:
+        return "csr_cw"
 
     # Upper NON sweeps consistently favor ALG4 (csr_smblk), so keep that as the
     # unconditional AUTO route on the upper side.
@@ -2416,16 +2421,16 @@ def _select_spsv_runtime_plan(solve_plan, trans_mode, requested_solve_kind=None)
 
 @triton.jit
 def _publish_ready_flag_i32(flag_ptr, idx):
-    """Publish a ready flag through an atomic write-like operation."""
+    """Publish a ready flag after writing the row result."""
 
-    tl.atomic_add(flag_ptr + idx, 1)
+    tl.atomic_or(flag_ptr + idx, 1, sem="release")
 
 
 @triton.jit
 def _load_ready_flag_i32(flag_ptr, idx):
-    """Mirror the original volatile/atomic polling pattern more closely."""
+    """Poll a ready flag with acquire semantics."""
 
-    return tl.atomic_add(flag_ptr + idx, 0)
+    return tl.atomic_or(flag_ptr + idx, 0, sem="acquire")
 
 
 @triton.jit
@@ -2528,9 +2533,9 @@ def _spsv_csr_cw_kernel(
                         tl.store(x_ptr + row, x_row)
                         row_done = 1
                     else:
-                        dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                        dep_ready = _load_ready_flag_i32(ready_ptr, col)
                         while dep_ready != 1:
-                            dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                            dep_ready = _load_ready_flag_i32(ready_ptr, col)
                         if USE_FP64_ACC:
                             a = tl.load(data_ptr + ptr).to(tl.float64)
                             y_dep = tl.load(x_ptr + col).to(tl.float64)
@@ -2557,9 +2562,9 @@ def _spsv_csr_cw_kernel(
                         tl.store(x_ptr + row, x_row)
                         row_done = 1
                     else:
-                        dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                        dep_ready = _load_ready_flag_i32(ready_ptr, col)
                         while dep_ready != 1:
-                            dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                            dep_ready = _load_ready_flag_i32(ready_ptr, col)
                         if USE_FP64_ACC:
                             a = tl.load(data_ptr + ptr).to(tl.float64)
                             y_dep = tl.load(x_ptr + col).to(tl.float64)
@@ -2630,9 +2635,9 @@ def _spsv_csr_cw_kernel_complex(
                         tl.store(x_ri_ptr + row * 2 + lane2, out_vals)
                         row_done = 1
                     else:
-                        dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                        dep_ready = _load_ready_flag_i32(ready_ptr, col)
                         while dep_ready != 1:
-                            dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                            dep_ready = _load_ready_flag_i32(ready_ptr, col)
                         x_re = tl.load(x_ri_ptr + col * 2)
                         x_im = tl.load(x_ri_ptr + col * 2 + 1)
                         a_re = tl.load(data_ri_ptr + ptr * 2)
@@ -2678,9 +2683,9 @@ def _spsv_csr_cw_kernel_complex(
                         tl.store(x_ri_ptr + row * 2 + lane2, out_vals)
                         row_done = 1
                     else:
-                        dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                        dep_ready = _load_ready_flag_i32(ready_ptr, col)
                         while dep_ready != 1:
-                            dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                            dep_ready = _load_ready_flag_i32(ready_ptr, col)
                         x_re = tl.load(x_ri_ptr + col * 2)
                         x_im = tl.load(x_ri_ptr + col * 2 + 1)
                         a_re = tl.load(data_ri_ptr + ptr * 2)

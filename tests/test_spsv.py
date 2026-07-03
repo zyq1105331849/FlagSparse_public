@@ -35,6 +35,7 @@ TEST_SIZES = [256, 512, 1024, 2048]
 WARMUP = 1
 ITERS = 1
 SPSV_CASE_TIMEOUT_SECONDS = 180
+SPSV_MAX_CASE_TIMEOUT_SECONDS = 180
 
 SPSV_TRIANGULAR_DIAG_DOMINANCE = 4.0
 # CSR 完整组合覆盖（在原 csv-csr 逻辑外新增，不影响原入口）
@@ -116,7 +117,14 @@ def _solve_kind_from_alg_num(alg_num):
 
 
 def _alg_label(alg_num):
-    return "AUTO" if alg_num is None else f"ALG{int(alg_num)}"
+    if alg_num is not None:
+        return f"ALG{int(alg_num)}"
+    if (
+        fs_spsv_impl._is_rocm_runtime()
+        and not fs_spsv_impl.SPSV_ROCM_ENABLE_ADVANCED_AUTO
+    ):
+        return "AUTO->ALG1/CW"
+    return "AUTO"
 
 
 def _alg_num_supports_case(alg_num, fmt, op_mode, lower, value_dtype):
@@ -1585,7 +1593,9 @@ def _run_spsv_csv_case_with_timeout(
     alg_num,
     timeout_seconds,
 ):
-    timeout_seconds = max(1, int(timeout_seconds))
+    timeout_seconds = max(
+        1, min(int(timeout_seconds), int(SPSV_MAX_CASE_TIMEOUT_SECONDS))
+    )
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue(maxsize=1)
     proc = ctx.Process(
@@ -1645,6 +1655,18 @@ def _run_spsv_csv_case_with_timeout(
     return row, None
 
 
+def _effective_spsv_case_timeout(case_timeout_seconds):
+    return min(int(case_timeout_seconds), int(SPSV_MAX_CASE_TIMEOUT_SECONDS))
+
+
+def _print_spsv_timeout(path, case_timeout_seconds):
+    print(
+        f"TIMEOUT: {os.path.basename(path)} exceeded "
+        f"{_effective_spsv_case_timeout(case_timeout_seconds)} seconds",
+        flush=True,
+    )
+
+
 def run_all_supported_spsv_csr_csv(
     mtx_paths,
     csv_path,
@@ -1687,7 +1709,8 @@ def run_all_supported_spsv_csr_csv(
                     f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
                     "(override with --warmup/--iters)"
                 )
-                print(f"Per-matrix timeout: {int(case_timeout_seconds)} seconds")
+                effective_timeout = _effective_spsv_case_timeout(case_timeout_seconds)
+                print(f"Per-matrix timeout: {effective_timeout} seconds")
                 print(
                     "RHS is generated directly. "
                     "PT.total / HS.total are single official interface call times. "
@@ -1722,6 +1745,8 @@ def run_all_supported_spsv_csr_csv(
                             alg_num,
                             case_timeout_seconds,
                         )
+                        if row["status"] == "SKIP" and row.get("error", "").startswith("timed out"):
+                            _print_spsv_timeout(path, case_timeout_seconds)
                         rows_out.append(row)
                         name = os.path.basename(path)[:27]
                         if len(os.path.basename(path)) > 27:
@@ -1844,7 +1869,8 @@ def run_all_dtypes_spsv_coo_csv(
                     f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
                     "(override with --warmup/--iters)"
                 )
-                print(f"Per-matrix timeout: {int(case_timeout_seconds)} seconds")
+                effective_timeout = _effective_spsv_case_timeout(case_timeout_seconds)
+                print(f"Per-matrix timeout: {effective_timeout} seconds")
                 print(
                     "PT.total / HS.total are single official interface call times. "
                     "PT.spdS and HS.spdS compare against FS.solve; PT.spdT and HS.spdT compare against FS.total."
@@ -1883,6 +1909,8 @@ def run_all_dtypes_spsv_coo_csv(
                             alg_num,
                             case_timeout_seconds,
                         )
+                        if row["status"] == "SKIP" and row.get("error", "").startswith("timed out"):
+                            _print_spsv_timeout(path, case_timeout_seconds)
                         rows_out.append(row)
                         name = os.path.basename(path)[:27]
                         if len(os.path.basename(path)) > 27:
@@ -2231,7 +2259,7 @@ def main():
         "--case-timeout-seconds",
         type=int,
         default=SPSV_CASE_TIMEOUT_SECONDS,
-        help="Skip one .mtx case if it does not finish within this many seconds (default: 180)",
+        help="Skip one .mtx case if it does not finish within this many seconds (default: 180; capped at 180)",
     )
     args = parser.parse_args()
     WARMUP = max(0, int(args.warmup))
