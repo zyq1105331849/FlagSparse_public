@@ -784,19 +784,26 @@ def _run_spsv_csr_ref_hipsparse_prepared(state):
         ("hipsparseSpSV_solve",),
         "hipsparseSpSV_solve",
     )
+    solve_args = (
+        state["handle"],
+        state["op_enum"],
+        state["alpha"],
+        state["spmat"],
+        state["rhs_desc"],
+        state["sol_desc"],
+        state["value_type"],
+        state["alg"],
+        state["spsv_descr"],
+    )
+    # Some hip-python/hipSPARSE builds expose SpSV_solve without externalBuffer.
+    try:
+        result = solve_fn(*solve_args, state["workspace"])
+    except TypeError as exc:
+        if "positional" not in str(exc) and "argument" not in str(exc):
+            raise
+        result = solve_fn(*solve_args)
     _hip_check_result(
-        solve_fn(
-            state["handle"],
-            state["op_enum"],
-            state["alpha"],
-            state["spmat"],
-            state["rhs_desc"],
-            state["sol_desc"],
-            state["value_type"],
-            state["alg"],
-            state["spsv_descr"],
-            state["workspace"],
-        ),
+        result,
         "hipsparseSpSV_solve",
     )
     return state["solution"]
