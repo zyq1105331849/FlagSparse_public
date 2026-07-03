@@ -151,14 +151,20 @@ def _alg_num_supports_case(alg_num, fmt, op_mode, lower, value_dtype):
 
 
 def _fmt_ms(v):
+    if isinstance(v, (tuple, list)):
+        v = v[0] if v else None
     return "N/A" if v is None else f"{v:.4f}"
 
 
 def _fmt_ratio(v):
+    if isinstance(v, (tuple, list)):
+        v = v[0] if v else None
     return "N/A" if v is None else f"{v:.2f}"
 
 
 def _fmt_err(v):
+    if isinstance(v, (tuple, list)):
+        v = v[0] if v else None
     return "N/A" if v is None else f"{v:.2e}"
 
 
@@ -1318,7 +1324,7 @@ def _finalize_csv_row(
     lower=True,
 ):
     atol, rtol = _tol_for_dtype(value_dtype)
-    err_res = _solution_residual_metrics(
+    err_res, _ok_res = _solution_residual_metrics(
         data, indices, indptr, shape, x, b, value_dtype, op_mode, lower=lower
     )
     pytorch_ms = None
@@ -1465,7 +1471,7 @@ def _finalize_csv_row_csr_full(
     lower=True,
 ):
     atol, rtol = _tol_for_dtype(value_dtype)
-    err_res = _solution_residual_metrics(
+    err_res, _ok_res = _solution_residual_metrics(
         data, indices, indptr, shape, x, b, value_dtype, op_mode, lower=lower
     )
 
