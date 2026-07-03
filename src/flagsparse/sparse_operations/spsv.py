@@ -66,6 +66,9 @@ SPSV_PROMOTE_TRANSPOSE_COMPLEX64_TO_COMPLEX128 = _spsv_env_flag(
 SPSV_ROCM_ENABLE_ADVANCED_AUTO = _spsv_env_flag(
     "FLAGSPARSE_SPSV_ROCM_ENABLE_ADVANCED_AUTO", "0"
 )
+SPSV_ROCM_ENABLE_TRITON_CW = _spsv_env_flag(
+    "FLAGSPARSE_SPSV_ROCM_ENABLE_TRITON_CW", "0"
+)
 _SPSV_CSR_PREPROCESS_CACHE = OrderedDict()
 _SPSV_CSR_PREPROCESS_CACHE_SIZE = 8
 
@@ -4711,6 +4714,64 @@ def flagsparse_spsv_analysis_coo(
     )
 
 
+def _spsv_csr_host_triangular_solve(
+    data,
+    indices,
+    indptr,
+    b,
+    n_rows,
+    *,
+    lower=True,
+    unit_diagonal=False,
+    diag_eps=0.0,
+):
+    """Host fallback for ROCm/DCU when the Triton CW busy-wait path is unsafe."""
+
+    data_cpu = data.detach().cpu()
+    indices_cpu = indices.detach().cpu().to(torch.int64)
+    indptr_cpu = indptr.detach().cpu().to(torch.int64)
+    b_cpu = b.detach().cpu()
+    x_cpu = torch.empty_like(b_cpu)
+
+    if lower:
+        row_iter = range(int(n_rows))
+    else:
+        row_iter = range(int(n_rows) - 1, -1, -1)
+
+    for row in row_iter:
+        row_start = int(indptr_cpu[row].item())
+        row_end = int(indptr_cpu[row + 1].item())
+        acc = b_cpu[row].clone()
+        diag = None
+
+        for ptr in range(row_start, row_end):
+            col = int(indices_cpu[ptr].item())
+            val = data_cpu[ptr]
+
+            if col == row:
+                diag = val
+                continue
+
+            if lower:
+                if col < row:
+                    acc = acc - val * x_cpu[col]
+                else:
+                    break
+            elif col > row:
+                acc = acc - val * x_cpu[col]
+
+        if unit_diagonal:
+            out_val = acc
+        elif diag is None or torch.abs(diag).item() < float(diag_eps):
+            out_val = b_cpu[row] * 0
+        else:
+            out_val = acc / diag
+
+        x_cpu[row] = torch.nan_to_num(out_val)
+
+    return x_cpu.to(device=b.device, dtype=b.dtype)
+
+
 def _execute_spsv_csr_plan(
     data,
     b,
@@ -4809,6 +4870,38 @@ def _execute_spsv_csr_plan(
     if return_time:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
+
+    if (
+        solve_kind == "csr_cw"
+        and trans_mode == "N"
+        and _is_rocm_runtime()
+        and not SPSV_ROCM_ENABLE_TRITON_CW
+    ):
+        x = _spsv_csr_host_triangular_solve(
+            data_in,
+            kernel_indices,
+            kernel_indptr,
+            b_in,
+            n_rows,
+            lower=lower_eff,
+            unit_diagonal=unit_diagonal,
+            diag_eps=diag_eps,
+        )
+        target_dtype = original_output_dtype if original_output_dtype is not None else data.dtype
+        if x.dtype != target_dtype:
+            x = x.to(target_dtype)
+        if return_time:
+            torch.cuda.synchronize()
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        if out is not None:
+            if out.shape != x.shape or out.dtype != x.dtype:
+                raise ValueError("out shape/dtype must match result")
+            out.copy_(x)
+            x = out
+        if return_time:
+            return x, elapsed_ms
+        return x
+
     worker_count_use = cw_worker_count
     matrix_stats_use = dict(matrix_stats)
     if solve_kind in ("csr_cw", "transpose_cw"):
