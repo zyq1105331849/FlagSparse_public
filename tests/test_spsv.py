@@ -118,20 +118,23 @@ def _solve_kind_from_alg_num(alg_num):
 
 def _alg_label(alg_num):
     if alg_num is not None:
-        if (
-            int(alg_num) == 1
-            and fs_spsv_impl._is_rocm_runtime()
-            and not fs_spsv_impl.SPSV_ROCM_ENABLE_TRITON_CW
-        ):
-            return "ALG1/hipSPARSE"
-        return f"ALG{int(alg_num)}"
+        alg_num = int(alg_num)
+        if alg_num == 1:
+            return "ALG1/CW(HIP-translated)"
+        if alg_num == 2:
+            return "ALG2/CW-level"
+        if alg_num == 3:
+            return "ALG3/ROC"
+        if alg_num == 4:
+            return "ALG4/SMBLK"
+        if alg_num == 8:
+            return "ALG8/NNZ-balance"
+        return f"ALG{alg_num}"
     if (
         fs_spsv_impl._is_rocm_runtime()
         and not fs_spsv_impl.SPSV_ROCM_ENABLE_ADVANCED_AUTO
     ):
-        if not fs_spsv_impl.SPSV_ROCM_ENABLE_TRITON_CW:
-            return "AUTO->ALG1/hipSPARSE"
-        return "AUTO->ALG1/CW"
+        return "AUTO->ALG1/CW(HIP-translated)"
     return "AUTO"
 
 
@@ -197,14 +200,10 @@ def _allinone_filtered_avg_ms(times, fmt="CSR"):
 
 
 def _amortized_total_ms(analysis_ms, solve_ms, iters):
-    if (
-        analysis_ms is None
-        or solve_ms is None
-        or iters is None
-        or int(iters) <= 0
-    ):
+    del iters
+    if analysis_ms is None or solve_ms is None:
         return None
-    return (float(analysis_ms) / float(iters)) + float(solve_ms)
+    return float(analysis_ms) + float(solve_ms)
 
 
 def _sum_ms(analysis_ms, solve_ms, iters=None):
@@ -766,6 +765,67 @@ def _benchmark_flagsparse_spsv_csr_reuse(
     )
 
 
+def _prepare_flagsparse_spsv_workspace_for_b(descr, workspace, b):
+    del b
+    if descr.solve_kind == "transpose_cw":
+        fs_spsv_impl.flagsparse_spsv_preprocess_csr(descr, workspace=workspace)
+
+
+def _reanalyze_flagsparse_spsv_workspace(descr, workspace):
+    if descr.solve_kind == "transpose_cw":
+        fs_spsv_impl.flagsparse_spsv_preprocess_csr(descr, workspace=workspace)
+
+
+def _cleanup_flagsparse_spsv_workspace(workspace):
+    del workspace
+
+
+def _benchmark_flagsparse_spsv_full_round(
+    analyze_call,
+    make_workspace_call,
+    prepare_call,
+    analysis_extra_call,
+    solve_call,
+    cleanup_call,
+    warmup,
+    iters,
+):
+    warmup = max(0, int(warmup))
+    iters = max(1, int(iters))
+    x = None
+    setup_descr = analyze_call()
+    workspace = make_workspace_call(setup_descr)
+    prepare_call(setup_descr, workspace)
+    try:
+        for _ in range(warmup):
+            torch.cuda.synchronize()
+            descr = analyze_call()
+            analysis_extra_call(descr, workspace)
+            x = solve_call(descr, workspace)
+            torch.cuda.synchronize()
+
+        analysis_times = []
+        solve_times = []
+        for _ in range(iters):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            descr = analyze_call()
+            analysis_extra_call(descr, workspace)
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            x = solve_call(descr, workspace)
+            torch.cuda.synchronize()
+            t2 = time.perf_counter()
+            analysis_times.append((t1 - t0) * 1000.0)
+            solve_times.append((t2 - t1) * 1000.0)
+    finally:
+        cleanup_call(workspace)
+
+    analysis_ms = _allinone_filtered_avg_ms(analysis_times)
+    solve_ms = _allinone_filtered_avg_ms(solve_times)
+    return x, analysis_ms, solve_ms
+
+
 def _benchmark_flagsparse_spsv_csr(
     data,
     indices,
@@ -816,49 +876,38 @@ def _benchmark_flagsparse_spsv_csr_split(
         data.dtype,
         fmt="CSR",
     )
-    if op_mode != "N":
-        analysis_ms = fs_spsv_impl._analyze_spsv_csr(
+    def analyze_call():
+        fs_spsv_impl._clear_spsv_csr_preprocess_cache()
+        return fs_spsv_impl.flagsparse_spsv_analysis_csr(
             data_tri,
             indices_tri,
             indptr_tri,
-            b,
             shape,
             lower=lower,
             transpose=transpose,
             solve_kind=solve_kind,
-            clear_cache=True,
-            return_time=True,
+            clear_cache=False,
         )
-        x, solve_ms = _benchmark_flagsparse_spsv_csr(
-            data_tri,
-            indices_tri,
-            indptr_tri,
+
+    def solve_call(descr, workspace):
+        return fs_spsv_impl.flagsparse_spsv_solve_csr(
+            descr,
             b,
-            shape,
-            lower=lower,
-            transpose=transpose,
-            solve_kind=solve_kind,
-            warmup=warmup,
-            iters=iters,
+            workspace=workspace,
         )
-        return x, analysis_ms, solve_ms
-    descr, workspace, analysis_ms = _analyze_flagsparse_spsv_csr_reuse(
-        data_tri,
-        indices_tri,
-        indptr_tri,
-        shape,
-        lower=lower,
-        transpose=transpose,
-        solve_kind=solve_kind,
+
+    return _benchmark_flagsparse_spsv_full_round(
+        analyze_call,
+        fs_spsv_impl.flagsparse_spsv_create_workspace,
+        lambda descr, workspace: _prepare_flagsparse_spsv_workspace_for_b(
+            descr, workspace, b
+        ),
+        _reanalyze_flagsparse_spsv_workspace,
+        solve_call,
+        _cleanup_flagsparse_spsv_workspace,
+        warmup,
+        iters,
     )
-    x, solve_ms = _benchmark_flagsparse_spsv_csr_reuse(
-        descr,
-        workspace,
-        b,
-        warmup=warmup,
-        iters=iters,
-    )
-    return x, analysis_ms, solve_ms
 
 
 def _benchmark_flagsparse_spsv_coo_split(
@@ -892,49 +941,38 @@ def _benchmark_flagsparse_spsv_coo_split(
         data.dtype,
         fmt="COO",
     )
-    if trans_mode != "N":
-        analysis_ms = fs_spsv_impl._analyze_spsv_csr(
+    def analyze_call():
+        fs_spsv_impl._clear_spsv_csr_preprocess_cache()
+        return fs_spsv_impl.flagsparse_spsv_analysis_csr(
             data_tri,
             indices_tri,
             indptr_tri,
-            b,
             (n_rows, n_cols),
             lower=lower,
             transpose=transpose,
             solve_kind=solve_kind,
-            clear_cache=True,
-            return_time=True,
+            clear_cache=False,
         )
-        x, solve_ms = _benchmark_flagsparse_spsv_csr(
-            data_tri,
-            indices_tri,
-            indptr_tri,
+
+    def solve_call(descr, workspace):
+        return fs_spsv_impl.flagsparse_spsv_solve_csr(
+            descr,
             b,
-            (n_rows, n_cols),
-            lower=lower,
-            transpose=transpose,
-            solve_kind=solve_kind,
-            warmup=warmup,
-            iters=iters,
+            workspace=workspace,
         )
-        return x, analysis_ms, solve_ms
-    descr, workspace, analysis_ms = _analyze_flagsparse_spsv_csr_reuse(
-        data_tri,
-        indices_tri,
-        indptr_tri,
-        (n_rows, n_cols),
-        lower=lower,
-        transpose=transpose,
-        solve_kind=solve_kind,
+
+    return _benchmark_flagsparse_spsv_full_round(
+        analyze_call,
+        fs_spsv_impl.flagsparse_spsv_create_workspace,
+        lambda descr, workspace: _prepare_flagsparse_spsv_workspace_for_b(
+            descr, workspace, b
+        ),
+        _reanalyze_flagsparse_spsv_workspace,
+        solve_call,
+        _cleanup_flagsparse_spsv_workspace,
+        warmup,
+        iters,
     )
-    x, solve_ms = _benchmark_flagsparse_spsv_csr_reuse(
-        descr,
-        workspace,
-        b,
-        warmup=warmup,
-        iters=iters,
-    )
-    return x, analysis_ms, solve_ms
 
 
 def _benchmark_sparse_ref_lower_csr_or_coo(
@@ -961,6 +999,7 @@ def _benchmark_sparse_ref_lower_csr_or_coo(
             op="non",
             warmup=warmup,
             iters=iters,
+            fresh_each_iter=True,
         )
         return sparse_ref["ms"], sparse_ref["values"]
     if (
@@ -1035,6 +1074,7 @@ def _benchmark_sparse_ref_csr_with_op(
             op=op_mode,
             warmup=WARMUP,
             iters=ITERS,
+            fresh_each_iter=True,
         )
         if return_reason:
             return sparse_ref["ms"], sparse_ref["values"], sparse_ref.get("reason")
@@ -1252,10 +1292,10 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                         total += 1
 
                         total_ms = _sum_ms(analysis_ms, t_ms)
-                        pt_vs_solve = _safe_ratio(pytorch_ms, t_ms)
-                        hs_vs_solve = _safe_ratio(hipsparse_ms, t_ms)
                         pt_vs_total = _safe_ratio(pytorch_ms, total_ms)
                         hs_vs_total = _safe_ratio(hipsparse_ms, total_ms)
+                        pt_vs_solve = pt_vs_total
+                        hs_vs_solve = hs_vs_total
                         print(
                             f"{fmt:>5} {op_mode:>5} {n:>6} {_fmt_ms(analysis_ms):>12} {_fmt_ms(t_ms):>10} {_fmt_ms(total_ms):>10} {_fmt_ms(pytorch_ms):>10} "
                             f"{_fmt_ms(hipsparse_ms):>10} "
@@ -1407,8 +1447,8 @@ def _finalize_csv_row(
         "triton_total_ms": _sum_ms(analysis_ms, t_ms),
         "hipsparse_ms": hipsparse_ms,
         "pytorch_ms": pytorch_ms,
-        "hipsparse_speedup_solve": _safe_ratio(hipsparse_ms, t_ms),
-        "pytorch_speedup_solve": _safe_ratio(pytorch_ms, t_ms),
+        "hipsparse_speedup_solve": _safe_ratio(hipsparse_ms, _sum_ms(analysis_ms, t_ms)),
+        "pytorch_speedup_solve": _safe_ratio(pytorch_ms, _sum_ms(analysis_ms, t_ms)),
         "hipsparse_speedup_total": _safe_ratio(hipsparse_ms, _sum_ms(analysis_ms, t_ms)),
         "pytorch_speedup_total": _safe_ratio(pytorch_ms, _sum_ms(analysis_ms, t_ms)),
         "pt_status": _status_str(ok_pt, err_pt is not None),
@@ -1557,8 +1597,8 @@ def _finalize_csv_row_csr_full(
         "triton_total_ms": _sum_ms(analysis_ms, t_ms),
         "hipsparse_ms": hipsparse_ms,
         "pytorch_ms": pytorch_ms,
-        "hipsparse_speedup_solve": _safe_ratio(hipsparse_ms, t_ms),
-        "pytorch_speedup_solve": _safe_ratio(pytorch_ms, t_ms),
+        "hipsparse_speedup_solve": _safe_ratio(hipsparse_ms, _sum_ms(analysis_ms, t_ms)),
+        "pytorch_speedup_solve": _safe_ratio(pytorch_ms, _sum_ms(analysis_ms, t_ms)),
         "hipsparse_speedup_total": _safe_ratio(hipsparse_ms, _sum_ms(analysis_ms, t_ms)),
         "pytorch_speedup_total": _safe_ratio(pytorch_ms, _sum_ms(analysis_ms, t_ms)),
         "pt_status": _status_str(ok_pt, err_pt is not None),
@@ -1751,8 +1791,8 @@ def run_all_supported_spsv_csr_csv(
                 print(f"Per-matrix timeout: {effective_timeout} seconds")
                 print(
                     "RHS is generated directly. "
-                    "PT.total / HS.total are single official interface call times. "
-                    "PT.spdS and HS.spdS compare against FS.solve; PT.spdT and HS.spdT compare against FS.total. "
+                    "FS.total / HS.total both include fresh analysis/preparation + solve per timed round. "
+                    "PT.spdS/PT.spdT and HS.spdS/HS.spdT all compare against FS.total. "
                     "Err(Ref)=best |FlagSparse-reference|, Err(Res)=|op(A)*x-b|, "
                     "Err(PT)=|FlagSparse-PyTorch|, Err(HS)=|FlagSparse-hipSPARSE|. "
                     "PASS if PyTorch / hipSPARSE reference passes. Residual is diagnostic only."
@@ -1913,8 +1953,8 @@ def run_all_dtypes_spsv_coo_csv(
                 effective_timeout = _effective_spsv_case_timeout(case_timeout_seconds)
                 print(f"Per-matrix timeout: {effective_timeout} seconds")
                 print(
-                    "PT.total / HS.total are single official interface call times. "
-                    "PT.spdS and HS.spdS compare against FS.solve; PT.spdT and HS.spdT compare against FS.total."
+                    "FS.total / HS.total both include fresh analysis/preparation + solve per timed round. "
+                    "PT.spdS/PT.spdT and HS.spdS/HS.spdT all compare against FS.total."
                 )
                 print(
                     "Matrix metadata fields reuse the canonical triangular matrix, matching CSR CSV output."
@@ -2271,7 +2311,8 @@ def main():
         default=None,
         help=(
             "Algorithm selection compatible with allinone style. "
-            "Supported: 1=ALG1(csr_cw), 2=ALG2(csr_cw_levelschd), 3=ALG3(csr_roc), 4=ALG4(csr_smblk), 8=ALG8(csr_nnz_balance). "
+            "Supported: 1=ALG1(csr_cw, HIP-translated), 2=ALG2(csr_cw_levelschd), "
+            "3=ALG3(csr_roc), 4=ALG4(csr_smblk), 8=ALG8(csr_nnz_balance). "
             "Omit to use AUTO routing."
         ),
     )
