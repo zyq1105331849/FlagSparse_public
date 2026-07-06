@@ -120,7 +120,7 @@ def _alg_label(alg_num):
     if alg_num is not None:
         alg_num = int(alg_num)
         if alg_num == 1:
-            return "ALG1/CW(HIP-translated)"
+            return "ALG1/CW(Triton-no-spin)"
         if alg_num == 2:
             return "ALG2/CW-level"
         if alg_num == 3:
@@ -134,7 +134,7 @@ def _alg_label(alg_num):
         fs_spsv_impl._is_rocm_runtime()
         and not fs_spsv_impl.SPSV_ROCM_ENABLE_ADVANCED_AUTO
     ):
-        return "AUTO->ALG1/CW(HIP-translated)"
+        return "AUTO->ALG1/CW(Triton-no-spin)"
     return "AUTO"
 
 
@@ -2311,7 +2311,7 @@ def main():
         default=None,
         help=(
             "Algorithm selection compatible with allinone style. "
-            "Supported: 1=ALG1(csr_cw, HIP-translated), 2=ALG2(csr_cw_levelschd), "
+            "Supported: 1=ALG1(csr_cw), 2=ALG2(csr_cw_levelschd), "
             "3=ALG3(csr_roc), 4=ALG4(csr_smblk), 8=ALG8(csr_nnz_balance). "
             "Omit to use AUTO routing."
         ),
