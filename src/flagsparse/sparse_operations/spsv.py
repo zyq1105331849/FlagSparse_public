@@ -1213,7 +1213,6 @@ def _build_spsv_workspace_layout(n_rows, solve_kind, value_dtype=None):
     if solve_kind == "csr_cw_levelschd":
         return (
             _workspace_entry("ready", n_rows, torch.int32),
-            _workspace_entry("row_counter", 1, torch.int32),
         )
     if solve_kind == "csr_nnz_balance":
         if value_dtype is None:
@@ -1617,17 +1616,6 @@ def _resolve_cw_worker_count(n_rows, matrix_stats, n_rhs, cached_worker_count=No
         target,
         n_rows,
     )
-
-
-def _resolve_nontrans_cw_worker_count(n_rows, matrix_stats=None, cached_worker_count=None):
-    base = _resolve_cw_worker_count(
-        n_rows,
-        matrix_stats or {},
-        1,
-        cached_worker_count=cached_worker_count,
-    )
-    target = max(int(base), min(int(max(n_rows, 1)), 4096))
-    return _snap_cw_worker_count(target, n_rows)
 
 
 def _build_spsv_cw_matrix_stats(
@@ -2449,16 +2437,16 @@ def _select_spsv_runtime_plan(solve_plan, trans_mode, requested_solve_kind=None)
 
 @triton.jit
 def _publish_ready_flag_i32(flag_ptr, idx):
-    """Publish a ready flag after writing the row result."""
+    """Publish a ready flag through an atomic write-like operation."""
 
-    tl.atomic_or(flag_ptr + idx, 1, sem="release")
+    tl.atomic_add(flag_ptr + idx, 1)
 
 
 @triton.jit
 def _load_ready_flag_i32(flag_ptr, idx):
-    """Poll a ready flag with acquire semantics."""
+    """Mirror the original volatile/atomic polling pattern more closely."""
 
-    return tl.atomic_or(flag_ptr + idx, 0, sem="acquire")
+    return tl.atomic_add(flag_ptr + idx, 0)
 
 
 @triton.jit
@@ -2548,83 +2536,82 @@ def _spsv_csr_cw_kernel(
     row_counter_ptr,
     n_rows,
     LOWER: tl.constexpr,
+    REVERSE_ORDER: tl.constexpr,
     UNIT_DIAG: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
     DIAG_EPS: tl.constexpr,
 ):
-    logical_row = tl.atomic_add(row_counter_ptr, 1, sem="relaxed")
+    logical_row = tl.atomic_add(row_counter_ptr, 1)
     while logical_row < n_rows:
-        row = tl.where(LOWER, logical_row, n_rows - 1 - logical_row)
+        row = tl.where(REVERSE_ORDER, n_rows - 1 - logical_row, logical_row)
         start = tl.load(indptr_ptr + row)
         end = tl.load(indptr_ptr + row + 1)
-        ptr = tl.where(LOWER, start, end - 1)
-        step = tl.where(LOWER, 1, -1)
+        ptr = start
         if USE_FP64_ACC:
             rhs = tl.load(b_ptr + row).to(tl.float64)
             tmp_sum = tl.zeros((), dtype=tl.float64)
         else:
             rhs = tl.load(b_ptr + row).to(tl.float32)
             tmp_sum = tl.zeros((), dtype=tl.float32)
-
         row_done = 0
         while row_done == 0:
-            active = (ptr < end) if LOWER else (ptr >= start)
-            if active:
-                col = tl.load(indices_ptr + ptr)
-                if UNIT_DIAG:
-                    unit_stop = (col >= row) if LOWER else (col <= row)
-                    if unit_stop:
-                        out = rhs - tmp_sum
-                        out = tl.where(out == out, out, 0.0)
-                        tl.store(x_ptr + row, out, cache_modifier=".wt")
-                        tl.debug_barrier()
-                        _publish_ready_flag_i32(ready_ptr, row)
+            if UNIT_DIAG:
+                if ptr >= end:
+                    x_row = rhs - tmp_sum
+                    x_row = tl.where(x_row == x_row, x_row, 0.0)
+                    tl.store(x_ptr + row, x_row)
+                    row_done = 1
+                else:
+                    col = tl.load(indices_ptr + ptr)
+                    stop_at_diag = (col >= row) if LOWER else (col <= row)
+                    if stop_at_diag:
+                        x_row = rhs - tmp_sum
+                        x_row = tl.where(x_row == x_row, x_row, 0.0)
+                        tl.store(x_ptr + row, x_row)
                         row_done = 1
                     else:
-                        dep_ready = _load_ready_flag_i32(ready_ptr, col)
+                        dep_ready = tl.atomic_add(ready_ptr + col, 0)
                         while dep_ready != 1:
-                            dep_ready = _load_ready_flag_i32(ready_ptr, col)
+                            dep_ready = tl.atomic_add(ready_ptr + col, 0)
                         if USE_FP64_ACC:
-                            dep_x = tl.load(x_ptr + col, cache_modifier=".cv").to(tl.float64)
-                            val = tl.load(data_ptr + ptr).to(tl.float64)
+                            a = tl.load(data_ptr + ptr).to(tl.float64)
+                            y_dep = tl.load(x_ptr + col).to(tl.float64)
                         else:
-                            dep_x = tl.load(x_ptr + col, cache_modifier=".cv").to(tl.float32)
-                            val = tl.load(data_ptr + ptr).to(tl.float32)
-                        tmp_sum += dep_x * val
-                        ptr += step
+                            a = tl.load(data_ptr + ptr).to(tl.float32)
+                            y_dep = tl.load(x_ptr + col).to(tl.float32)
+                        tmp_sum += a * y_dep
+                        ptr += 1
+            else:
+                if ptr >= end:
+                    x_row = rhs * 0
+                    tl.store(x_ptr + row, x_row)
+                    row_done = 1
                 else:
+                    col = tl.load(indices_ptr + ptr)
                     if col == row:
                         if USE_FP64_ACC:
                             diag = tl.load(data_ptr + ptr).to(tl.float64)
                         else:
                             diag = tl.load(data_ptr + ptr).to(tl.float32)
                         diag_safe = tl.where(tl.abs(diag) < DIAG_EPS, 1.0, diag)
-                        out = (rhs - tmp_sum) / diag_safe
-                        out = tl.where(out == out, out, 0.0)
-                        tl.store(x_ptr + row, out, cache_modifier=".wt")
-                        tl.debug_barrier()
-                        _publish_ready_flag_i32(ready_ptr, row)
+                        x_row = (rhs - tmp_sum) / diag_safe
+                        x_row = tl.where(x_row == x_row, x_row, 0.0)
+                        tl.store(x_ptr + row, x_row)
                         row_done = 1
                     else:
-                        dep_ready = _load_ready_flag_i32(ready_ptr, col)
+                        dep_ready = tl.atomic_add(ready_ptr + col, 0)
                         while dep_ready != 1:
-                            dep_ready = _load_ready_flag_i32(ready_ptr, col)
+                            dep_ready = tl.atomic_add(ready_ptr + col, 0)
                         if USE_FP64_ACC:
-                            dep_x = tl.load(x_ptr + col, cache_modifier=".cv").to(tl.float64)
-                            val = tl.load(data_ptr + ptr).to(tl.float64)
+                            a = tl.load(data_ptr + ptr).to(tl.float64)
+                            y_dep = tl.load(x_ptr + col).to(tl.float64)
                         else:
-                            dep_x = tl.load(x_ptr + col, cache_modifier=".cv").to(tl.float32)
-                            val = tl.load(data_ptr + ptr).to(tl.float32)
-                        tmp_sum += dep_x * val
-                        ptr += step
-            else:
-                out = rhs - tmp_sum if UNIT_DIAG else rhs * 0
-                out = tl.where(out == out, out, 0.0)
-                tl.store(x_ptr + row, out, cache_modifier=".wt")
-                tl.debug_barrier()
-                _publish_ready_flag_i32(ready_ptr, row)
-                row_done = 1
-        logical_row = tl.atomic_add(row_counter_ptr, 1, sem="relaxed")
+                            a = tl.load(data_ptr + ptr).to(tl.float32)
+                            y_dep = tl.load(x_ptr + col).to(tl.float32)
+                        tmp_sum += a * y_dep
+                        ptr += 1
+        _publish_ready_flag_i32(ready_ptr, row)
+        logical_row = tl.atomic_add(row_counter_ptr, 1)
 
 
 @triton.jit
@@ -2638,17 +2625,17 @@ def _spsv_csr_cw_kernel_complex(
     row_counter_ptr,
     n_rows,
     LOWER: tl.constexpr,
+    REVERSE_ORDER: tl.constexpr,
     UNIT_DIAG: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
     DIAG_EPS: tl.constexpr,
 ):
-    logical_row = tl.atomic_add(row_counter_ptr, 1, sem="relaxed")
+    logical_row = tl.atomic_add(row_counter_ptr, 1)
+    lane2 = tl.arange(0, 2)
     while logical_row < n_rows:
-        row = tl.where(LOWER, logical_row, n_rows - 1 - logical_row)
+        row = tl.where(REVERSE_ORDER, n_rows - 1 - logical_row, logical_row)
         start = tl.load(indptr_ptr + row)
         end = tl.load(indptr_ptr + row + 1)
-        ptr = tl.where(LOWER, start, end - 1)
-        step = tl.where(LOWER, 1, -1)
         rhs_re = tl.load(b_ri_ptr + row * 2)
         rhs_im = tl.load(b_ri_ptr + row * 2 + 1)
         if USE_FP64_ACC:
@@ -2661,46 +2648,57 @@ def _spsv_csr_cw_kernel_complex(
             rhs_im = rhs_im.to(tl.float32)
             tmp_re = tl.zeros((), dtype=tl.float32)
             tmp_im = tl.zeros((), dtype=tl.float32)
-
+        ptr = start
         row_done = 0
         while row_done == 0:
-            active = (ptr < end) if LOWER else (ptr >= start)
-            if active:
-                col = tl.load(indices_ptr + ptr)
-                if UNIT_DIAG:
-                    unit_stop = (col >= row) if LOWER else (col <= row)
-                    if unit_stop:
-                        out_re = rhs_re - tmp_re
-                        out_im = rhs_im - tmp_im
-                        out_re = tl.where(out_re == out_re, out_re, 0.0)
-                        out_im = tl.where(out_im == out_im, out_im, 0.0)
-                        tl.store(x_ri_ptr + row * 2, out_re, cache_modifier=".wt")
-                        tl.store(x_ri_ptr + row * 2 + 1, out_im, cache_modifier=".wt")
-                        tl.debug_barrier()
-                        _publish_ready_flag_i32(ready_ptr, row)
+            if UNIT_DIAG:
+                if ptr >= end:
+                    x_re_out = rhs_re - tmp_re
+                    x_im_out = rhs_im - tmp_im
+                    x_re_out = tl.where(x_re_out == x_re_out, x_re_out, 0.0)
+                    x_im_out = tl.where(x_im_out == x_im_out, x_im_out, 0.0)
+                    out_vals = tl.where(lane2 == 0, x_re_out, x_im_out)
+                    tl.store(x_ri_ptr + row * 2 + lane2, out_vals)
+                    row_done = 1
+                else:
+                    col = tl.load(indices_ptr + ptr)
+                    stop_at_diag = (col >= row) if LOWER else (col <= row)
+                    if stop_at_diag:
+                        x_re_out = rhs_re - tmp_re
+                        x_im_out = rhs_im - tmp_im
+                        x_re_out = tl.where(x_re_out == x_re_out, x_re_out, 0.0)
+                        x_im_out = tl.where(x_im_out == x_im_out, x_im_out, 0.0)
+                        out_vals = tl.where(lane2 == 0, x_re_out, x_im_out)
+                        tl.store(x_ri_ptr + row * 2 + lane2, out_vals)
                         row_done = 1
                     else:
-                        dep_ready = _load_ready_flag_i32(ready_ptr, col)
+                        dep_ready = tl.atomic_add(ready_ptr + col, 0)
                         while dep_ready != 1:
-                            dep_ready = _load_ready_flag_i32(ready_ptr, col)
-                        dep_re = tl.load(x_ri_ptr + col * 2, cache_modifier=".cv")
-                        dep_im = tl.load(x_ri_ptr + col * 2 + 1, cache_modifier=".cv")
-                        val_re = tl.load(data_ri_ptr + ptr * 2)
-                        val_im = tl.load(data_ri_ptr + ptr * 2 + 1)
+                            dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                        x_re = tl.load(x_ri_ptr + col * 2)
+                        x_im = tl.load(x_ri_ptr + col * 2 + 1)
+                        a_re = tl.load(data_ri_ptr + ptr * 2)
+                        a_im = tl.load(data_ri_ptr + ptr * 2 + 1)
                         if USE_FP64_ACC:
-                            dep_re = dep_re.to(tl.float64)
-                            dep_im = dep_im.to(tl.float64)
-                            val_re = val_re.to(tl.float64)
-                            val_im = val_im.to(tl.float64)
+                            x_re = x_re.to(tl.float64)
+                            x_im = x_im.to(tl.float64)
+                            a_re = a_re.to(tl.float64)
+                            a_im = a_im.to(tl.float64)
                         else:
-                            dep_re = dep_re.to(tl.float32)
-                            dep_im = dep_im.to(tl.float32)
-                            val_re = val_re.to(tl.float32)
-                            val_im = val_im.to(tl.float32)
-                        tmp_re += dep_re * val_re - dep_im * val_im
-                        tmp_im += dep_re * val_im + dep_im * val_re
-                        ptr += step
+                            x_re = x_re.to(tl.float32)
+                            x_im = x_im.to(tl.float32)
+                            a_re = a_re.to(tl.float32)
+                            a_im = a_im.to(tl.float32)
+                        tmp_re += a_re * x_re - a_im * x_im
+                        tmp_im += a_re * x_im + a_im * x_re
+                        ptr += 1
+            else:
+                if ptr >= end:
+                    out_vals = tl.where(lane2 == 0, rhs_re * 0, rhs_im * 0)
+                    tl.store(x_ri_ptr + row * 2 + lane2, out_vals)
+                    row_done = 1
                 else:
+                    col = tl.load(indices_ptr + ptr)
                     if col == row:
                         diag_re = tl.load(data_ri_ptr + ptr * 2)
                         diag_im = tl.load(data_ri_ptr + ptr * 2 + 1)
@@ -2714,47 +2712,36 @@ def _spsv_csr_cw_kernel_complex(
                         num_im = rhs_im - tmp_im
                         den = diag_re * diag_re + diag_im * diag_im
                         den_safe = tl.where(den < (DIAG_EPS * DIAG_EPS), 1.0, den)
-                        out_re = (num_re * diag_re + num_im * diag_im) / den_safe
-                        out_im = (num_im * diag_re - num_re * diag_im) / den_safe
-                        out_re = tl.where(out_re == out_re, out_re, 0.0)
-                        out_im = tl.where(out_im == out_im, out_im, 0.0)
-                        tl.store(x_ri_ptr + row * 2, out_re, cache_modifier=".wt")
-                        tl.store(x_ri_ptr + row * 2 + 1, out_im, cache_modifier=".wt")
-                        tl.debug_barrier()
-                        _publish_ready_flag_i32(ready_ptr, row)
+                        x_re_out = (num_re * diag_re + num_im * diag_im) / den_safe
+                        x_im_out = (num_im * diag_re - num_re * diag_im) / den_safe
+                        x_re_out = tl.where(x_re_out == x_re_out, x_re_out, 0.0)
+                        x_im_out = tl.where(x_im_out == x_im_out, x_im_out, 0.0)
+                        out_vals = tl.where(lane2 == 0, x_re_out, x_im_out)
+                        tl.store(x_ri_ptr + row * 2 + lane2, out_vals)
                         row_done = 1
                     else:
-                        dep_ready = _load_ready_flag_i32(ready_ptr, col)
+                        dep_ready = tl.atomic_add(ready_ptr + col, 0)
                         while dep_ready != 1:
-                            dep_ready = _load_ready_flag_i32(ready_ptr, col)
-                        dep_re = tl.load(x_ri_ptr + col * 2, cache_modifier=".cv")
-                        dep_im = tl.load(x_ri_ptr + col * 2 + 1, cache_modifier=".cv")
-                        val_re = tl.load(data_ri_ptr + ptr * 2)
-                        val_im = tl.load(data_ri_ptr + ptr * 2 + 1)
+                            dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                        x_re = tl.load(x_ri_ptr + col * 2)
+                        x_im = tl.load(x_ri_ptr + col * 2 + 1)
+                        a_re = tl.load(data_ri_ptr + ptr * 2)
+                        a_im = tl.load(data_ri_ptr + ptr * 2 + 1)
                         if USE_FP64_ACC:
-                            dep_re = dep_re.to(tl.float64)
-                            dep_im = dep_im.to(tl.float64)
-                            val_re = val_re.to(tl.float64)
-                            val_im = val_im.to(tl.float64)
+                            x_re = x_re.to(tl.float64)
+                            x_im = x_im.to(tl.float64)
+                            a_re = a_re.to(tl.float64)
+                            a_im = a_im.to(tl.float64)
                         else:
-                            dep_re = dep_re.to(tl.float32)
-                            dep_im = dep_im.to(tl.float32)
-                            val_re = val_re.to(tl.float32)
-                            val_im = val_im.to(tl.float32)
-                        tmp_re += dep_re * val_re - dep_im * val_im
-                        tmp_im += dep_re * val_im + dep_im * val_re
-                        ptr += step
-            else:
-                out_re = rhs_re - tmp_re if UNIT_DIAG else rhs_re * 0
-                out_im = rhs_im - tmp_im if UNIT_DIAG else rhs_im * 0
-                out_re = tl.where(out_re == out_re, out_re, 0.0)
-                out_im = tl.where(out_im == out_im, out_im, 0.0)
-                tl.store(x_ri_ptr + row * 2, out_re, cache_modifier=".wt")
-                tl.store(x_ri_ptr + row * 2 + 1, out_im, cache_modifier=".wt")
-                tl.debug_barrier()
-                _publish_ready_flag_i32(ready_ptr, row)
-                row_done = 1
-        logical_row = tl.atomic_add(row_counter_ptr, 1, sem="relaxed")
+                            x_re = x_re.to(tl.float32)
+                            x_im = x_im.to(tl.float32)
+                            a_re = a_re.to(tl.float32)
+                            a_im = a_im.to(tl.float32)
+                        tmp_re += a_re * x_re - a_im * x_im
+                        tmp_im += a_re * x_im + a_im * x_re
+                        ptr += 1
+        _publish_ready_flag_i32(ready_ptr, row)
+        logical_row = tl.atomic_add(row_counter_ptr, 1)
 
 
 @triton.jit
@@ -3297,71 +3284,59 @@ def _spsv_csr_cw_levelschd_kernel(
     x_ptr,
     ready_ptr,
     n_rows,
-    LOWER: tl.constexpr,
-    UNIT_DIAG: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
     DIAG_EPS: tl.constexpr,
 ):
-    logical_row = tl.zeros((), dtype=tl.int64)
-    while logical_row < n_rows:
-        row = tl.load(row_map_ptr + logical_row)
-        start = tl.load(indptr_ptr + row)
-        end = tl.load(indptr_ptr + row + 1)
-        ptr = tl.where(LOWER, start, end - 1)
-        step = tl.where(LOWER, 1, -1)
-        if USE_FP64_ACC:
-            rhs = tl.load(b_ptr + row).to(tl.float64)
-            tmp_sum = tl.zeros((), dtype=tl.float64)
+    logical_row = tl.program_id(0)
+    if logical_row >= n_rows:
+        return
+    row = tl.load(row_map_ptr + logical_row)
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
+    ptr = start
+    if USE_FP64_ACC:
+        rhs = tl.load(b_ptr + row).to(tl.float64)
+        tmp_sum = tl.zeros((), dtype=tl.float64)
+    else:
+        rhs = tl.load(b_ptr + row).to(tl.float32)
+        tmp_sum = tl.zeros((), dtype=tl.float32)
+    row_done = 0
+    while row_done == 0:
+        if ptr >= end:
+            x_row = rhs * 0
+            if USE_FP64_ACC:
+                tl.atomic_add(x_ptr + row, x_row.to(tl.float64))
+            else:
+                tl.atomic_add(x_ptr + row, x_row.to(tl.float32))
+            row_done = 1
         else:
-            rhs = tl.load(b_ptr + row).to(tl.float32)
-            tmp_sum = tl.zeros((), dtype=tl.float32)
-        row_done = 0
-        while row_done == 0:
-            active = (ptr < end) if LOWER else (ptr >= start)
-            if not active:
-                x_row = rhs - tmp_sum if UNIT_DIAG else rhs * 0
+            col = tl.load(indices_ptr + ptr)
+            if col == row:
+                if USE_FP64_ACC:
+                    diag = tl.load(data_ptr + ptr).to(tl.float64)
+                else:
+                    diag = tl.load(data_ptr + ptr).to(tl.float32)
+                diag_safe = tl.where(tl.abs(diag) < DIAG_EPS, 1.0, diag)
+                x_row = (rhs - tmp_sum) / diag_safe
                 x_row = tl.where(x_row == x_row, x_row, 0.0)
-                tl.store(x_ptr + row, x_row)
+                if USE_FP64_ACC:
+                    tl.atomic_add(x_ptr + row, x_row.to(tl.float64))
+                else:
+                    tl.atomic_add(x_ptr + row, x_row.to(tl.float32))
                 row_done = 1
             else:
-                col = tl.load(indices_ptr + ptr)
-                if UNIT_DIAG:
-                    unit_stop = (col >= row) if LOWER else (col <= row)
-                    if unit_stop:
-                        x_row = rhs - tmp_sum
-                        x_row = tl.where(x_row == x_row, x_row, 0.0)
-                        tl.store(x_ptr + row, x_row)
-                        row_done = 1
-                    else:
-                        if USE_FP64_ACC:
-                            a = tl.load(data_ptr + ptr).to(tl.float64)
-                            y_dep = tl.load(x_ptr + col).to(tl.float64)
-                        else:
-                            a = tl.load(data_ptr + ptr).to(tl.float32)
-                            y_dep = tl.load(x_ptr + col).to(tl.float32)
-                        tmp_sum += a * y_dep
-                        ptr += step
+                dep_ready = _load_ready_flag_i32(ready_ptr, col)
+                while dep_ready != 1:
+                    dep_ready = _load_ready_flag_i32(ready_ptr, col)
+                if USE_FP64_ACC:
+                    a = tl.load(data_ptr + ptr).to(tl.float64)
+                    y_dep = _load_scalar_fp64(x_ptr, col).to(tl.float64)
                 else:
-                    if col == row:
-                        if USE_FP64_ACC:
-                            diag = tl.load(data_ptr + ptr).to(tl.float64)
-                        else:
-                            diag = tl.load(data_ptr + ptr).to(tl.float32)
-                        diag_safe = tl.where(tl.abs(diag) < DIAG_EPS, 1.0, diag)
-                        x_row = (rhs - tmp_sum) / diag_safe
-                        x_row = tl.where(x_row == x_row, x_row, 0.0)
-                        tl.store(x_ptr + row, x_row)
-                        row_done = 1
-                    else:
-                        if USE_FP64_ACC:
-                            a = tl.load(data_ptr + ptr).to(tl.float64)
-                            y_dep = tl.load(x_ptr + col).to(tl.float64)
-                        else:
-                            a = tl.load(data_ptr + ptr).to(tl.float32)
-                            y_dep = tl.load(x_ptr + col).to(tl.float32)
-                        tmp_sum += a * y_dep
-                        ptr += step
-        logical_row += 1
+                    a = tl.load(data_ptr + ptr).to(tl.float32)
+                    y_dep = _load_scalar_fp32(x_ptr, col).to(tl.float32)
+                tmp_sum += a * y_dep
+                ptr += 1
+    _publish_ready_flag_i32(ready_ptr, row)
 
 
 @triton.jit
@@ -3374,111 +3349,79 @@ def _spsv_csr_cw_levelschd_kernel_complex(
     x_ri_ptr,
     ready_ptr,
     n_rows,
-    LOWER: tl.constexpr,
-    UNIT_DIAG: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
     DIAG_EPS: tl.constexpr,
 ):
-    logical_row = tl.zeros((), dtype=tl.int64)
-    while logical_row < n_rows:
-        row = tl.load(row_map_ptr + logical_row)
-        start = tl.load(indptr_ptr + row)
-        end = tl.load(indptr_ptr + row + 1)
-        ptr = tl.where(LOWER, start, end - 1)
-        step = tl.where(LOWER, 1, -1)
-        rhs_re = tl.load(b_ri_ptr + row * 2)
-        rhs_im = tl.load(b_ri_ptr + row * 2 + 1)
-        if USE_FP64_ACC:
-            rhs_re = rhs_re.to(tl.float64)
-            rhs_im = rhs_im.to(tl.float64)
-            tmp_sum_re = tl.zeros((), dtype=tl.float64)
-            tmp_sum_im = tl.zeros((), dtype=tl.float64)
+    logical_row = tl.program_id(0)
+    if logical_row >= n_rows:
+        return
+    row = tl.load(row_map_ptr + logical_row)
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
+    ptr = start
+    rhs_re = tl.load(b_ri_ptr + row * 2)
+    rhs_im = tl.load(b_ri_ptr + row * 2 + 1)
+    if USE_FP64_ACC:
+        rhs_re = rhs_re.to(tl.float64)
+        rhs_im = rhs_im.to(tl.float64)
+        tmp_sum_re = tl.zeros((), dtype=tl.float64)
+        tmp_sum_im = tl.zeros((), dtype=tl.float64)
+    else:
+        rhs_re = rhs_re.to(tl.float32)
+        rhs_im = rhs_im.to(tl.float32)
+        tmp_sum_re = tl.zeros((), dtype=tl.float32)
+        tmp_sum_im = tl.zeros((), dtype=tl.float32)
+    row_done = 0
+    while row_done == 0:
+        if ptr >= end:
+            zero = rhs_re * 0
+            tl.atomic_add(x_ri_ptr + row * 2, zero)
+            tl.atomic_add(x_ri_ptr + row * 2 + 1, zero)
+            row_done = 1
         else:
-            rhs_re = rhs_re.to(tl.float32)
-            rhs_im = rhs_im.to(tl.float32)
-            tmp_sum_re = tl.zeros((), dtype=tl.float32)
-            tmp_sum_im = tl.zeros((), dtype=tl.float32)
-        row_done = 0
-        while row_done == 0:
-            active = (ptr < end) if LOWER else (ptr >= start)
-            if not active:
-                out_re = rhs_re - tmp_sum_re if UNIT_DIAG else rhs_re * 0
-                out_im = rhs_im - tmp_sum_im if UNIT_DIAG else rhs_im * 0
+            col = tl.load(indices_ptr + ptr)
+            if col == row:
+                diag_re = tl.load(data_ri_ptr + ptr * 2)
+                diag_im = tl.load(data_ri_ptr + ptr * 2 + 1)
+                if USE_FP64_ACC:
+                    diag_re = diag_re.to(tl.float64)
+                    diag_im = diag_im.to(tl.float64)
+                else:
+                    diag_re = diag_re.to(tl.float32)
+                    diag_im = diag_im.to(tl.float32)
+                sum_re = rhs_re - tmp_sum_re
+                sum_im = rhs_im - tmp_sum_im
+                den = diag_re * diag_re + diag_im * diag_im
+                den_safe = tl.where(den < (DIAG_EPS * DIAG_EPS), 1.0, den)
+                out_re = (sum_re * diag_re + sum_im * diag_im) / den_safe
+                out_im = (sum_im * diag_re - sum_re * diag_im) / den_safe
                 out_re = tl.where(out_re == out_re, out_re, 0.0)
                 out_im = tl.where(out_im == out_im, out_im, 0.0)
-                tl.store(x_ri_ptr + row * 2, out_re)
-                tl.store(x_ri_ptr + row * 2 + 1, out_im)
+                tl.atomic_add(x_ri_ptr + row * 2, out_re)
+                tl.atomic_add(x_ri_ptr + row * 2 + 1, out_im)
                 row_done = 1
             else:
-                col = tl.load(indices_ptr + ptr)
-                if UNIT_DIAG:
-                    unit_stop = (col >= row) if LOWER else (col <= row)
-                    if unit_stop:
-                        out_re = rhs_re - tmp_sum_re
-                        out_im = rhs_im - tmp_sum_im
-                        out_re = tl.where(out_re == out_re, out_re, 0.0)
-                        out_im = tl.where(out_im == out_im, out_im, 0.0)
-                        tl.store(x_ri_ptr + row * 2, out_re)
-                        tl.store(x_ri_ptr + row * 2 + 1, out_im)
-                        row_done = 1
-                    else:
-                        a_re = tl.load(data_ri_ptr + ptr * 2)
-                        a_im = tl.load(data_ri_ptr + ptr * 2 + 1)
-                        x_re = tl.load(x_ri_ptr + col * 2)
-                        x_im = tl.load(x_ri_ptr + col * 2 + 1)
-                        if USE_FP64_ACC:
-                            a_re = a_re.to(tl.float64)
-                            a_im = a_im.to(tl.float64)
-                            x_re = x_re.to(tl.float64)
-                            x_im = x_im.to(tl.float64)
-                        else:
-                            a_re = a_re.to(tl.float32)
-                            a_im = a_im.to(tl.float32)
-                            x_re = x_re.to(tl.float32)
-                            x_im = x_im.to(tl.float32)
-                        tmp_sum_re += a_re * x_re - a_im * x_im
-                        tmp_sum_im += a_re * x_im + a_im * x_re
-                        ptr += step
+                dep_ready = _load_ready_flag_i32(ready_ptr, col)
+                while dep_ready != 1:
+                    dep_ready = _load_ready_flag_i32(ready_ptr, col)
+                a_re = tl.load(data_ri_ptr + ptr * 2)
+                a_im = tl.load(data_ri_ptr + ptr * 2 + 1)
+                x_re = tl.atomic_add(x_ri_ptr + col * 2, 0.0)
+                x_im = tl.atomic_add(x_ri_ptr + col * 2 + 1, 0.0)
+                if USE_FP64_ACC:
+                    a_re = a_re.to(tl.float64)
+                    a_im = a_im.to(tl.float64)
+                    x_re = x_re.to(tl.float64)
+                    x_im = x_im.to(tl.float64)
                 else:
-                    if col == row:
-                        diag_re = tl.load(data_ri_ptr + ptr * 2)
-                        diag_im = tl.load(data_ri_ptr + ptr * 2 + 1)
-                        if USE_FP64_ACC:
-                            diag_re = diag_re.to(tl.float64)
-                            diag_im = diag_im.to(tl.float64)
-                        else:
-                            diag_re = diag_re.to(tl.float32)
-                            diag_im = diag_im.to(tl.float32)
-                        sum_re = rhs_re - tmp_sum_re
-                        sum_im = rhs_im - tmp_sum_im
-                        den = diag_re * diag_re + diag_im * diag_im
-                        den_safe = tl.where(den < (DIAG_EPS * DIAG_EPS), 1.0, den)
-                        out_re = (sum_re * diag_re + sum_im * diag_im) / den_safe
-                        out_im = (sum_im * diag_re - sum_re * diag_im) / den_safe
-                        out_re = tl.where(out_re == out_re, out_re, 0.0)
-                        out_im = tl.where(out_im == out_im, out_im, 0.0)
-                        tl.store(x_ri_ptr + row * 2, out_re)
-                        tl.store(x_ri_ptr + row * 2 + 1, out_im)
-                        row_done = 1
-                    else:
-                        a_re = tl.load(data_ri_ptr + ptr * 2)
-                        a_im = tl.load(data_ri_ptr + ptr * 2 + 1)
-                        x_re = tl.load(x_ri_ptr + col * 2)
-                        x_im = tl.load(x_ri_ptr + col * 2 + 1)
-                        if USE_FP64_ACC:
-                            a_re = a_re.to(tl.float64)
-                            a_im = a_im.to(tl.float64)
-                            x_re = x_re.to(tl.float64)
-                            x_im = x_im.to(tl.float64)
-                        else:
-                            a_re = a_re.to(tl.float32)
-                            a_im = a_im.to(tl.float32)
-                            x_re = x_re.to(tl.float32)
-                            x_im = x_im.to(tl.float32)
-                        tmp_sum_re += a_re * x_re - a_im * x_im
-                        tmp_sum_im += a_re * x_im + a_im * x_re
-                        ptr += step
-        logical_row += 1
+                    a_re = a_re.to(tl.float32)
+                    a_im = a_im.to(tl.float32)
+                    x_re = x_re.to(tl.float32)
+                    x_im = x_im.to(tl.float32)
+                tmp_sum_re += a_re * x_re - a_im * x_im
+                tmp_sum_im += a_re * x_im + a_im * x_re
+                ptr += 1
+    _publish_ready_flag_i32(ready_ptr, row)
 
 
 @triton.jit
@@ -3703,9 +3646,9 @@ def _triton_spsv_csr_cw_vector(
     row_counter.zero_()
     if n_rows == 0:
         return x
-    worker_count = _resolve_nontrans_cw_worker_count(
-        n_rows, matrix_stats, cached_worker_count=worker_count
-    )
+    if worker_count is None:
+        matrix_stats = matrix_stats or {}
+        worker_count = _resolve_cw_worker_count(n_rows, matrix_stats, 1)
     use_fp64_acc = data.dtype == torch.float64
     grid = (worker_count,)
     _spsv_csr_cw_kernel[grid](
@@ -3718,10 +3661,10 @@ def _triton_spsv_csr_cw_vector(
         row_counter,
         n_rows,
         LOWER=lower,
+        REVERSE_ORDER=not lower,
         UNIT_DIAG=unit_diagonal,
         USE_FP64_ACC=use_fp64_acc,
         DIAG_EPS=diag_eps,
-        num_warps=1,
     )
     return x
 
@@ -3760,9 +3703,9 @@ def _triton_spsv_csr_cw_vector_complex(
     use_fp64 = component_dtype == torch.float64
     x_ri = torch.view_as_real(x.contiguous()).reshape(-1).contiguous()
 
-    worker_count = _resolve_nontrans_cw_worker_count(
-        n_rows, matrix_stats, cached_worker_count=worker_count
-    )
+    if worker_count is None:
+        matrix_stats = matrix_stats or {}
+        worker_count = _resolve_cw_worker_count(n_rows, matrix_stats, 1)
     grid = (worker_count,)
     _spsv_csr_cw_kernel_complex[grid](
         data_ri,
@@ -3774,10 +3717,10 @@ def _triton_spsv_csr_cw_vector_complex(
         row_counter,
         n_rows,
         LOWER=lower,
+        REVERSE_ORDER=not lower,
         UNIT_DIAG=unit_diagonal,
         USE_FP64_ACC=use_fp64,
         DIAG_EPS=diag_eps,
-        num_warps=1,
     )
     return x
 
@@ -4034,29 +3977,30 @@ def _triton_spsv_csr_n_lo_cw_levelschd_vector(
     n_rows,
     *,
     lower=True,
-    unit_diagonal=False,
     diag_eps=1e-12,
-    worker_count=None,
-    matrix_stats=None,
     ready_in=None,
-    row_counter_in=None,
-    level_ptr=None,
 ):
-    del row_map, level_ptr
-    return _triton_spsv_csr_cw_vector(
+    x = torch.zeros_like(b_vec)
+    ready = ready_in if ready_in is not None else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
+    ready.zero_()
+    if n_rows == 0:
+        return x
+    use_fp64_acc = data.dtype == torch.float64
+    grid = (n_rows,)
+    _spsv_csr_cw_levelschd_kernel[grid](
         data,
         indices,
         indptr,
+        row_map,
         b_vec,
+        x,
+        ready,
         n_rows,
-        lower=lower,
-        unit_diagonal=unit_diagonal,
-        diag_eps=diag_eps,
-        worker_count=worker_count,
-        matrix_stats=matrix_stats,
-        ready_in=ready_in,
-        row_counter_in=row_counter_in,
+        USE_FP64_ACC=use_fp64_acc,
+        DIAG_EPS=diag_eps,
+        num_warps=1,
     )
+    return x
 
 
 def _triton_spsv_csr_n_lo_cw_levelschd_vector_complex(
@@ -4068,31 +4012,39 @@ def _triton_spsv_csr_n_lo_cw_levelschd_vector_complex(
     n_rows,
     *,
     lower=True,
-    unit_diagonal=False,
     diag_eps=1e-12,
-    worker_count=None,
-    matrix_stats=None,
     data_ri_in=None,
     ready_in=None,
-    row_counter_in=None,
-    level_ptr=None,
 ):
-    del row_map, level_ptr
-    return _triton_spsv_csr_cw_vector_complex(
-        data,
+    x = torch.zeros_like(b_vec)
+    ready = (
+        ready_in
+        if ready_in is not None
+        else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
+    )
+    ready.zero_()
+    if n_rows == 0:
+        return x
+    data_ri = data_ri_in if data_ri_in is not None else _complex_interleaved_view(data)
+    b_ri = torch.view_as_real(b_vec.contiguous()).reshape(-1).contiguous()
+    x_ri = torch.view_as_real(x.contiguous()).reshape(-1).contiguous()
+    component_dtype = _component_dtype_for_complex(data.dtype)
+    use_fp64 = component_dtype == torch.float64
+    grid = (n_rows,)
+    _spsv_csr_cw_levelschd_kernel_complex[grid](
+        data_ri,
         indices,
         indptr,
-        b_vec,
+        row_map,
+        b_ri,
+        x_ri,
+        ready,
         n_rows,
-        lower=lower,
-        unit_diagonal=unit_diagonal,
-        diag_eps=diag_eps,
-        worker_count=worker_count,
-        matrix_stats=matrix_stats,
-        data_ri_in=data_ri_in,
-        ready_in=ready_in,
-        row_counter_in=row_counter_in,
+        USE_FP64_ACC=use_fp64,
+        DIAG_EPS=diag_eps,
+        num_warps=1,
     )
+    return x
 
 
 def _triton_spsv_csr_n_lo_nnz_balance_vector(
@@ -4856,7 +4808,7 @@ def _execute_spsv_csr_plan(
 
     worker_count_use = cw_worker_count
     matrix_stats_use = dict(matrix_stats)
-    if solve_kind in ("csr_cw", "csr_cw_levelschd", "transpose_cw"):
+    if solve_kind in ("csr_cw", "transpose_cw"):
         worker_count_use = _resolve_cw_worker_count(
             n_rows,
             matrix_stats_use,
@@ -4986,14 +4938,9 @@ def _execute_spsv_csr_plan(
                     b_in,
                     n_rows,
                     lower=lower_eff,
-                    unit_diagonal=unit_diagonal,
                     diag_eps=diag_eps,
                     data_ri_in=complex_kernel_data_ri,
-                    worker_count=worker_count_use,
-                    matrix_stats=matrix_stats_use,
                     ready_in=ready_buf,
-                    row_counter_in=row_counter_buf,
-                    level_ptr=level_ptr32,
                     )
                 elif solve_kind == "csr_nnz_balance":
                     x = vec_complex(
@@ -5084,13 +5031,8 @@ def _execute_spsv_csr_plan(
                 b_in,
                 n_rows,
                 lower=lower_eff,
-                unit_diagonal=unit_diagonal,
                 diag_eps=diag_eps,
-                worker_count=worker_count_use,
-                matrix_stats=matrix_stats_use,
                 ready_in=ready_buf,
-                row_counter_in=row_counter_buf,
-                level_ptr=level_ptr32,
                 )
             elif solve_kind == "csr_nnz_balance":
                 x = vec_real(
