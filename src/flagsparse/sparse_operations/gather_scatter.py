@@ -27,8 +27,7 @@ SUPPORTED_SCATTER_VALUE_DTYPES = (
     torch.complex128,
 )
 DEFAULT_GATHER_BLOCK_SIZE = 256
-DEFAULT_GATHER_MAX_PROGRAMS = 2
-DEFAULT_GATHER_NUM_WARPS = 8
+DEFAULT_GATHER_NUM_WARPS = 4
 
 
 def _torch_current_stream_ptr():
@@ -83,13 +82,11 @@ def _gather_real_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    num_programs = tl.num_programs(axis=0)
-    for block_start in tl.range(pid * BLOCK_SIZE, nnz, num_programs * BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < nnz
-        indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
-        gathered_values = tl.load(dense_values_ptr + indices, mask=mask, other=0.0)
-        tl.store(sparse_values_ptr + offsets, gathered_values, mask=mask)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < nnz
+    indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
+    gathered_values = tl.load(dense_values_ptr + indices, mask=mask, other=0.0)
+    tl.store(sparse_values_ptr + offsets, gathered_values, mask=mask)
 
 
 @triton.jit
@@ -101,24 +98,22 @@ def _gather_complex_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    num_programs = tl.num_programs(axis=0)
-    for block_start in tl.range(pid * BLOCK_SIZE, nnz, num_programs * BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < nnz
-        indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < nnz
+    indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
 
-        dense_offsets = indices * 2
-        sparse_offsets = offsets * 2
+    dense_offsets = indices * 2
+    sparse_offsets = offsets * 2
 
-        gathered_real = tl.load(
-            dense_values_ri_ptr + dense_offsets, mask=mask, other=0.0
-        )
-        gathered_imag = tl.load(
-            dense_values_ri_ptr + dense_offsets + 1, mask=mask, other=0.0
-        )
+    gathered_real = tl.load(
+        dense_values_ri_ptr + dense_offsets, mask=mask, other=0.0
+    )
+    gathered_imag = tl.load(
+        dense_values_ri_ptr + dense_offsets + 1, mask=mask, other=0.0
+    )
 
-        tl.store(sparse_values_ri_ptr + sparse_offsets, gathered_real, mask=mask)
-        tl.store(sparse_values_ri_ptr + sparse_offsets + 1, gathered_imag, mask=mask)
+    tl.store(sparse_values_ri_ptr + sparse_offsets, gathered_real, mask=mask)
+    tl.store(sparse_values_ri_ptr + sparse_offsets + 1, gathered_imag, mask=mask)
 
 
 @triton.jit
@@ -179,9 +174,7 @@ def _triton_gather_impl(
             raise TypeError("out dtype must match gather output dtype")
         return out
 
-    grid = lambda meta: (
-        min(DEFAULT_GATHER_MAX_PROGRAMS, triton.cdiv(nnz, meta["BLOCK_SIZE"])),
-    )
+    grid = lambda meta: (triton.cdiv(nnz, meta["BLOCK_SIZE"]),)
 
     if not _is_complex_dtype(dense_vector.dtype):
         sparse_values = out
