@@ -26,7 +26,7 @@ DEFAULT_VALUE_DTYPES = "float16,bfloat16,float32,float64,complex64,complex128"
 DEFAULT_INDEX_DTYPES = "int32,int64"
 WARMUP = 20
 ITERS = 200
-KERNEL_TIMING_METHOD = "prepared_hip_event_current_stream"
+KERNEL_TIMING_METHOD = "prepared_hip_event_backend_stream"
 
 
 def _fmt_ms(value):
@@ -214,7 +214,7 @@ def run_cli(args):
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(
         f"Warmup: {args.warmup} | Iterations: {args.iters} | "
-        "Timing: prepared HIP-event current-stream for PT/FS/HS | "
+        "Timing: prepared HIP-event backend-stream for PT/FS/HS | "
         "HS(ms): direct hipSPARSE Gather kernel time"
     )
     print()

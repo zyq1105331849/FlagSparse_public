@@ -412,11 +412,17 @@ def _torch_current_stream_ptr():
     return None
 
 
-def _hip_event_record_current_stream(evt, call_name):
-    stream_ptr = _torch_current_stream_ptr()
-    if stream_ptr is None:
-        raise RuntimeError("could not resolve torch current CUDA/HIP stream pointer")
-    stream_args = (ctypes.c_void_p(stream_ptr), stream_ptr)
+def _hip_event_record_stream(evt, stream, call_name):
+    if stream == "current":
+        stream_ptr = _torch_current_stream_ptr()
+        if stream_ptr is None:
+            raise RuntimeError("could not resolve torch current CUDA/HIP stream pointer")
+    else:
+        stream_ptr = int(stream)
+    if stream_ptr == 0:
+        stream_args = (0, ctypes.c_void_p(0))
+    else:
+        stream_args = (ctypes.c_void_p(stream_ptr), stream_ptr)
     last_error = None
     for stream_arg in stream_args:
         try:
@@ -427,8 +433,12 @@ def _hip_event_record_current_stream(evt, call_name):
         except Exception as exc:
             last_error = exc
     raise RuntimeError(
-        f"{call_name} failed for torch current stream: {last_error}"
+        f"{call_name} failed for stream {stream_ptr}: {last_error}"
     ) from last_error
+
+
+def _hip_event_record_current_stream(evt, call_name):
+    _hip_event_record_stream(evt, "current", call_name)
 
 
 def _hipsparse_lookup(container_name, attr_names):
@@ -1874,7 +1884,9 @@ def _benchmark_prepared_cuda_op(prepare_fn, run_fn, destroy_fn, warmup, iters):
             destroy_fn(state)
 
 
-def _benchmark_prepared_hip_event_op(prepare_fn, run_fn, destroy_fn, warmup, iters):
+def _benchmark_prepared_hip_event_op(
+    prepare_fn, run_fn, destroy_fn, warmup, iters, event_stream="current"
+):
     if not _is_rocm_runtime() or not _hip_runtime_event_available():
         return _benchmark_prepared_cuda_op(
             prepare_fn, run_fn, destroy_fn, warmup=warmup, iters=iters
@@ -1894,10 +1906,10 @@ def _benchmark_prepared_hip_event_op(prepare_fn, run_fn, destroy_fn, warmup, ite
         torch.cuda.synchronize()
         start_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(start)")
         stop_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(stop)")
-        _hip_event_record_current_stream(start_evt, "hipEventRecord(start)")
+        _hip_event_record_stream(start_evt, event_stream, "hipEventRecord(start)")
         for _ in range(iters):
             output = run_fn(state)
-        _hip_event_record_current_stream(stop_evt, "hipEventRecord(stop)")
+        _hip_event_record_stream(stop_evt, event_stream, "hipEventRecord(stop)")
         _hip_check_result(hip.hipEventSynchronize(stop_evt), "hipEventSynchronize(stop)")
         return output, _hip_event_elapsed_ms(start_evt, stop_evt) / iters
     finally:

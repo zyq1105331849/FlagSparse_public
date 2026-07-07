@@ -34,7 +34,7 @@ from .sddmm_csr import benchmark_sddmm_case
 from .spsm import benchmark_spsm_case
 
 
-_GATHER_TIMING_METHOD = "prepared_hip_event_current_stream"
+_GATHER_TIMING_METHOD = "prepared_hip_event_backend_stream"
 
 
 def _noop_destroy(_state):

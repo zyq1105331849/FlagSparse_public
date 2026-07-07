@@ -34,17 +34,23 @@ def _torch_current_stream_ptr():
     return _common_mod._torch_current_stream_ptr()
 
 
-def _set_hipsparse_current_stream(handle):
+def _set_hipsparse_stream(handle, stream="current"):
     set_stream = getattr(hipsparse, "hipsparseSetStream", None)
     if set_stream is None:
         return "hipSPARSE binding does not expose hipsparseSetStream"
 
-    stream_ptr = _torch_current_stream_ptr()
-    if stream_ptr is None:
-        return "could not resolve torch current CUDA/HIP stream pointer"
+    if stream == "current":
+        stream_ptr = _torch_current_stream_ptr()
+        if stream_ptr is None:
+            return "could not resolve torch current CUDA/HIP stream pointer"
+    else:
+        stream_ptr = int(stream)
 
-    stream_args = [ctypes.c_void_p(stream_ptr), stream_ptr]
-    if HipPointer is not None:
+    if stream_ptr == 0:
+        stream_args = [0, ctypes.c_void_p(0)]
+    else:
+        stream_args = [ctypes.c_void_p(stream_ptr), stream_ptr]
+    if stream_ptr != 0 and HipPointer is not None:
         try:
             stream_args.append(HipPointer.fromObj(stream_ptr))
         except Exception:
@@ -59,7 +65,11 @@ def _set_hipsparse_current_stream(handle):
             last_error = exc
         except Exception as exc:
             last_error = exc
-    return f"hipsparseSetStream failed for torch current stream: {last_error}"
+    return f"hipsparseSetStream failed for stream {stream_ptr}: {last_error}"
+
+
+def _set_hipsparse_current_stream(handle):
+    return _set_hipsparse_stream(handle, "current")
 
 
 def _scatter_dtype_error_message():
@@ -415,7 +425,9 @@ def _hipsparse_create_dnvec_descriptor(dnvec_ref, size, values, value_type):
     )
 
 
-def _prepare_hipsparse_gather(dense_vector, indices, out=None, require_stream=False):
+def _prepare_hipsparse_gather(
+    dense_vector, indices, out=None, require_stream=False, stream="current"
+):
     dense_vector, indices = _prepare_hipsparse_gather_inputs(dense_vector, indices)
     skip_reason = _hipsparse_gather_scatter_skip_reason(
         dense_vector.dtype, indices.dtype, "gather"
@@ -451,7 +463,7 @@ def _prepare_hipsparse_gather(dense_vector, indices, out=None, require_stream=Fa
     success = False
     try:
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
-        stream_warning = _set_hipsparse_current_stream(handle)
+        stream_warning = _set_hipsparse_stream(handle, stream)
         if require_stream and stream_warning is not None:
             raise RuntimeError(stream_warning)
         ptr_type = type(handle)
@@ -544,12 +556,13 @@ def hipsparse_gather(dense_vector, indices, out=None, return_metadata=False):
 def benchmark_hipsparse_gather(dense_vector, indices, warmup, iters, out=None):
     return _benchmark_prepared_hip_event_op(
         lambda: _prepare_hipsparse_gather(
-            dense_vector, indices, out=out, require_stream=True
+            dense_vector, indices, out=out, require_stream=True, stream=0
         ),
         _run_hipsparse_gather_prepared,
         _destroy_hipsparse_gather_prepared,
         warmup=warmup,
         iters=iters,
+        event_stream=0,
     )
 
 
