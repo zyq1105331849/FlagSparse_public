@@ -120,7 +120,7 @@ def _alg_label(alg_num):
     if alg_num is not None:
         alg_num = int(alg_num)
         if alg_num == 1:
-            return "ALG1/CW(Triton-no-spin)"
+            return "ALG1/CW (ROCm: serial; CUDA: ready-flag)"
         if alg_num == 2:
             return "ALG2/CW-level"
         if alg_num == 3:
@@ -134,7 +134,7 @@ def _alg_label(alg_num):
         fs_spsv_impl._is_rocm_runtime()
         and not fs_spsv_impl.SPSV_ROCM_ENABLE_ADVANCED_AUTO
     ):
-        return "AUTO->ALG1/CW(Triton-no-spin)"
+        return "AUTO->ALG1/CW(Triton-serial)"
     return "AUTO"
 
 

@@ -2450,6 +2450,7 @@ def _triton_spsv_csr_cw_vector(
         UNIT_DIAG=unit_diagonal,
         USE_FP64_ACC=use_fp64_acc,
         DIAG_EPS=diag_eps,
+        SERIAL_EXECUTION=(worker_count == 1),
     )
     return x
 
@@ -2511,6 +2512,7 @@ def _triton_spsv_csr_cw_vector_complex(
         UNIT_DIAG=unit_diagonal,
         USE_FP64_ACC=use_fp64,
         DIAG_EPS=diag_eps,
+        SERIAL_EXECUTION=(worker_count == 1),
     )
     return x
 
@@ -3612,6 +3614,13 @@ def _execute_spsv_csr_plan(
             1,
             cached_worker_count=cw_worker_count,
         )
+    # ALG1/CW uses cross-program ready-flag polling when more than one program
+    # is launched.  Until every ROCm/Triton target has been validated for that
+    # progress model, run the non-transpose CW path as one program: rows are
+    # already sorted in dependency order during analysis, so its wait branch is
+    # compiled out and no cross-block spin remains.
+    if solve_kind == "csr_cw" and _is_rocm_runtime():
+        worker_count_use = 1
     complex_kernel_data_ri = None
     if torch.is_complex(data_in):
         if compute_dtype == solve_plan["kernel_data"].dtype:

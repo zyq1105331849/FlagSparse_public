@@ -20,8 +20,9 @@ def _spsv_csr_cw_kernel(
     UNIT_DIAG: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
     DIAG_EPS: tl.constexpr,
+    SERIAL_EXECUTION: tl.constexpr,
 ):
-    logical_row = tl.atomic_add(row_counter_ptr, 1)
+    logical_row = 0 if SERIAL_EXECUTION else tl.atomic_add(row_counter_ptr, 1)
     while logical_row < n_rows:
         row = tl.where(REVERSE_ORDER, n_rows - 1 - logical_row, logical_row)
         start = tl.load(indptr_ptr + row)
@@ -50,9 +51,10 @@ def _spsv_csr_cw_kernel(
                         tl.store(x_ptr + row, x_row)
                         row_done = 1
                     else:
-                        dep_ready = tl.atomic_add(ready_ptr + col, 0)
-                        while dep_ready != 1:
+                        if not SERIAL_EXECUTION:
                             dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                            while dep_ready != 1:
+                                dep_ready = tl.atomic_add(ready_ptr + col, 0)
                         if USE_FP64_ACC:
                             a = tl.load(data_ptr + ptr).to(tl.float64)
                             y_dep = tl.load(x_ptr + col).to(tl.float64)
@@ -79,9 +81,10 @@ def _spsv_csr_cw_kernel(
                         tl.store(x_ptr + row, x_row)
                         row_done = 1
                     else:
-                        dep_ready = tl.atomic_add(ready_ptr + col, 0)
-                        while dep_ready != 1:
+                        if not SERIAL_EXECUTION:
                             dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                            while dep_ready != 1:
+                                dep_ready = tl.atomic_add(ready_ptr + col, 0)
                         if USE_FP64_ACC:
                             a = tl.load(data_ptr + ptr).to(tl.float64)
                             y_dep = tl.load(x_ptr + col).to(tl.float64)
@@ -90,8 +93,11 @@ def _spsv_csr_cw_kernel(
                             y_dep = tl.load(x_ptr + col).to(tl.float32)
                         tmp_sum += a * y_dep
                         ptr += 1
-        _publish_ready_flag_i32(ready_ptr, row)
-        logical_row = tl.atomic_add(row_counter_ptr, 1)
+        if not SERIAL_EXECUTION:
+            _publish_ready_flag_i32(ready_ptr, row)
+            logical_row = tl.atomic_add(row_counter_ptr, 1)
+        else:
+            logical_row += 1
 
 @triton.jit
 def _spsv_csr_cw_kernel_complex(
@@ -108,8 +114,9 @@ def _spsv_csr_cw_kernel_complex(
     UNIT_DIAG: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
     DIAG_EPS: tl.constexpr,
+    SERIAL_EXECUTION: tl.constexpr,
 ):
-    logical_row = tl.atomic_add(row_counter_ptr, 1)
+    logical_row = 0 if SERIAL_EXECUTION else tl.atomic_add(row_counter_ptr, 1)
     lane2 = tl.arange(0, 2)
     while logical_row < n_rows:
         row = tl.where(REVERSE_ORDER, n_rows - 1 - logical_row, logical_row)
@@ -151,9 +158,10 @@ def _spsv_csr_cw_kernel_complex(
                         tl.store(x_ri_ptr + row * 2 + lane2, out_vals)
                         row_done = 1
                     else:
-                        dep_ready = tl.atomic_add(ready_ptr + col, 0)
-                        while dep_ready != 1:
+                        if not SERIAL_EXECUTION:
                             dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                            while dep_ready != 1:
+                                dep_ready = tl.atomic_add(ready_ptr + col, 0)
                         x_re = tl.load(x_ri_ptr + col * 2)
                         x_im = tl.load(x_ri_ptr + col * 2 + 1)
                         a_re = tl.load(data_ri_ptr + ptr * 2)
@@ -199,9 +207,10 @@ def _spsv_csr_cw_kernel_complex(
                         tl.store(x_ri_ptr + row * 2 + lane2, out_vals)
                         row_done = 1
                     else:
-                        dep_ready = tl.atomic_add(ready_ptr + col, 0)
-                        while dep_ready != 1:
+                        if not SERIAL_EXECUTION:
                             dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                            while dep_ready != 1:
+                                dep_ready = tl.atomic_add(ready_ptr + col, 0)
                         x_re = tl.load(x_ri_ptr + col * 2)
                         x_im = tl.load(x_ri_ptr + col * 2 + 1)
                         a_re = tl.load(data_ri_ptr + ptr * 2)
@@ -219,5 +228,8 @@ def _spsv_csr_cw_kernel_complex(
                         tmp_re += a_re * x_re - a_im * x_im
                         tmp_im += a_re * x_im + a_im * x_re
                         ptr += 1
-        _publish_ready_flag_i32(ready_ptr, row)
-        logical_row = tl.atomic_add(row_counter_ptr, 1)
+        if not SERIAL_EXECUTION:
+            _publish_ready_flag_i32(ready_ptr, row)
+            logical_row = tl.atomic_add(row_counter_ptr, 1)
+        else:
+            logical_row += 1
