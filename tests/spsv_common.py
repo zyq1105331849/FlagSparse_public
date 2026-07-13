@@ -254,6 +254,37 @@ def _csv_export_row_spsv(row):
     }
 
 
+SPSV_CSV_FIELDNAMES = (
+    "matrix", "value_dtype", "index_dtype", "opA", "n_rows", "n_cols",
+    "nnz", "analysis_ms", "solve_ms", "triton_total_ms", "hipsparse_ms",
+    "pytorch_ms", "hipsparse_speedup_solve", "pytorch_speedup_solve",
+    "hipsparse_speedup_total", "pytorch_speedup_total", "pt_status",
+    "hs_status", "status", "err_ref", "err_res", "err_pt", "err_hs",
+    "pytorch_reason", "hipsparse_reason", "error",
+)
+
+
+def _open_spsv_csv_checkpoint(csv_path):
+    """Create a CSV and make each later case result durable immediately."""
+    csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+    writer = csv.DictWriter(csv_file, fieldnames=SPSV_CSV_FIELDNAMES)
+    writer.writeheader()
+    csv_file.flush()
+    os.fsync(csv_file.fileno())
+    return csv_file, writer
+
+
+def _checkpoint_spsv_csv_row(csv_file, writer, row):
+    writer.writerow(
+        {
+            key: "" if value is None else value
+            for key, value in _csv_export_row_spsv(row).items()
+        }
+    )
+    csv_file.flush()
+    os.fsync(csv_file.fileno())
+
+
 def _empty_csv_case_row_spsv(path, value_dtype, index_dtype, op_mode, status, error):
     return {
         "matrix": os.path.basename(path),
@@ -1763,6 +1794,7 @@ def run_all_supported_spsv_csr_csv(
     selected_value_dtypes = value_dtypes or CSR_FULL_VALUE_DTYPES
     selected_index_dtypes = index_dtypes or CSR_FULL_INDEX_DTYPES
     selected_op_modes = op_modes or SPSV_OP_MODES
+    checkpoint_file, checkpoint_writer = _open_spsv_csv_checkpoint(csv_path)
     for value_dtype in selected_value_dtypes:
         for index_dtype in selected_index_dtypes:
             supported_op_modes = [
@@ -1826,6 +1858,7 @@ def run_all_supported_spsv_csr_csv(
                         if row["status"] == "SKIP" and row.get("error", "").startswith("timed out"):
                             _print_spsv_timeout(path, case_timeout_seconds)
                         rows_out.append(row)
+                        _checkpoint_spsv_csv_row(checkpoint_file, checkpoint_writer, row)
                         name = os.path.basename(path)[:27]
                         if len(os.path.basename(path)) > 27:
                             name = name + "…"
@@ -1855,11 +1888,11 @@ def run_all_supported_spsv_csr_csv(
                     except Exception as e:
                         err_msg = str(e)
                         status = "SKIP" if "SpSV requires square matrices" in err_msg else "ERROR"
-                        rows_out.append(
-                            _empty_csv_case_row_spsv(
-                                path, value_dtype, index_dtype, op_mode, status, err_msg
-                            )
+                        row = _empty_csv_case_row_spsv(
+                            path, value_dtype, index_dtype, op_mode, status, err_msg
                         )
+                        rows_out.append(row)
+                        _checkpoint_spsv_csv_row(checkpoint_file, checkpoint_writer, row)
                         name = os.path.basename(path)[:27]
                         if len(os.path.basename(path)) > 27:
                             name = name + "…"
@@ -1871,39 +1904,7 @@ def run_all_supported_spsv_csr_csv(
                         )
                         print(f"  {status}: {e}")
                 print("-" * 150)
-    fieldnames = [
-        "matrix",
-        "value_dtype",
-        "index_dtype",
-        "opA",
-        "n_rows",
-        "n_cols",
-        "nnz",
-        "analysis_ms",
-        "solve_ms",
-        "triton_total_ms",
-        "hipsparse_ms",
-        "pytorch_ms",
-        "hipsparse_speedup_solve",
-        "pytorch_speedup_solve",
-        "hipsparse_speedup_total",
-        "pytorch_speedup_total",
-        "pt_status",
-        "hs_status",
-        "status",
-        "err_ref",
-        "err_res",
-        "err_pt",
-        "err_hs",
-        "pytorch_reason",
-        "hipsparse_reason",
-        "error",
-    ]
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows_out:
-            w.writerow({k: ("" if v is None else v) for k, v in _csv_export_row_spsv(r).items()})
+    checkpoint_file.close()
     print(f"Wrote {len(rows_out)} rows to {csv_path}")
 
 

@@ -2112,16 +2112,6 @@ def _prepare_spsv_csr_system(
                     n_rows,
                     lower=lower,
                     unit_diagonal=unit_diagonal,
-                    minimal=True,
-                )
-            elif int(level_meta["level_ptr32"].numel()) > 1 or int(level_meta["indegree_init32"].numel()) > 0:
-                level_meta = _build_spsv_level_schedule_metadata(
-                    indices64,
-                    indptr64,
-                    n_rows,
-                    lower=lower,
-                    unit_diagonal=unit_diagonal,
-                    minimal=True,
                 )
             matrix_stats = level_meta["matrix_stats"]
             default_solve_kind = "csr_roc"
@@ -2591,6 +2581,7 @@ def _triton_spsv_csr_n_lo_roc_vector(
                 USE_FP64_ACC=use_fp64_acc,
                 DIAG_EPS=diag_eps,
                 WARP_SIZE=32,
+                LEVEL_SCHEDULED=True,
                 num_warps=1,
             )
     else:
@@ -2607,6 +2598,7 @@ def _triton_spsv_csr_n_lo_roc_vector(
             USE_FP64_ACC=use_fp64_acc,
             DIAG_EPS=diag_eps,
             WARP_SIZE=32,
+            LEVEL_SCHEDULED=False,
             num_warps=1,
         )
     return x
@@ -2660,6 +2652,7 @@ def _triton_spsv_csr_n_lo_roc_vector_complex(
                 USE_FP64_ACC=use_fp64,
                 DIAG_EPS=diag_eps,
                 WARP_SIZE=32,
+                LEVEL_SCHEDULED=True,
                 num_warps=1,
             )
     else:
@@ -2676,6 +2669,7 @@ def _triton_spsv_csr_n_lo_roc_vector_complex(
             USE_FP64_ACC=use_fp64,
             DIAG_EPS=diag_eps,
             WARP_SIZE=32,
+            LEVEL_SCHEDULED=False,
             num_warps=1,
         )
     return x
