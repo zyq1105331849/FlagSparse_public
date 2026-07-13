@@ -667,7 +667,11 @@ def _prepare_spsm_coo_inputs(data, row, col, B, shape, opA, opB, major):
 
 
 def _complex_interleaved_view(tensor):
-    return torch.view_as_real(tensor.contiguous()).reshape(-1).contiguous()
+    # On the DTK PyTorch build, values() from a sparse CSR tensor reports a
+    # strided layout but may still dispatch view_as_real through the sparse CSR
+    # backend.  Clone first to materialize an ordinary dense complex tensor.
+    dense_tensor = tensor.contiguous().clone()
+    return torch.view_as_real(dense_tensor).reshape(-1).contiguous()
 
 
 def _tensor_cache_token(tensor):
