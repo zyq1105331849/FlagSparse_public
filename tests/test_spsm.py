@@ -45,6 +45,39 @@ def _dtype_name(dtype):
     return str(dtype).replace("torch.", "")
 
 
+def _parse_dtype_filter(spec, allowed, option_name):
+    """Parse a comma-separated CLI dtype list without silently widening support."""
+    if spec is None:
+        return list(allowed)
+    name_to_dtype = {
+        "float": torch.float32,
+        "float32": torch.float32,
+        "double": torch.float64,
+        "float64": torch.float64,
+        "complex64": torch.complex64,
+        "complex128": torch.complex128,
+        "int32": torch.int32,
+        "int64": torch.int64,
+    }
+    result = []
+    for raw_name in spec.split(","):
+        name = raw_name.strip().lower()
+        dtype = name_to_dtype.get(name)
+        if dtype is None:
+            raise ValueError(f"{option_name}: unsupported dtype name {raw_name!r}")
+        if dtype not in allowed:
+            allowed_names = ",".join(_dtype_name(item) for item in allowed)
+            raise ValueError(
+                f"{option_name}: {name} is not supported by this SpSM backend "
+                f"(supported: {allowed_names})"
+            )
+        if dtype not in result:
+            result.append(dtype)
+    if not result:
+        raise ValueError(f"{option_name}: at least one dtype is required")
+    return result
+
+
 def _tol(dtype):
     if dtype in (torch.float32, torch.complex64):
         return 1e-4, 1e-3
@@ -1094,6 +1127,8 @@ def run_all_dtypes_spsm_csv(
     case_timeout_seconds=SPSM_CASE_TIMEOUT_SECONDS,
     warmup=WARMUP,
     iters=ITERS,
+    value_dtypes=None,
+    index_dtypes=None,
 ):
     if not torch.cuda.is_available():
         print("CUDA/ROCm device is not available.")
@@ -1103,6 +1138,8 @@ def run_all_dtypes_spsm_csv(
     ITERS = max(1, int(iters))
     rows_out = []
     fmt = "coo" if use_coo else "csr"
+    value_dtypes = list(CSV_VALUE_DTYPES if value_dtypes is None else value_dtypes)
+    index_dtypes = list(CSV_INDEX_DTYPES if index_dtypes is None else index_dtypes)
 
     print("=" * 176)
     if fs_spsm_impl._is_rocm_runtime():
@@ -1134,8 +1171,8 @@ def run_all_dtypes_spsm_csv(
     )
     print("-" * 176)
 
-    for value_dtype in CSV_VALUE_DTYPES:
-        for index_dtype in CSV_INDEX_DTYPES:
+    for value_dtype in value_dtypes:
+        for index_dtype in index_dtypes:
             for path in mtx_paths:
                 base = {
                     "matrix": os.path.basename(path),
@@ -1241,6 +1278,18 @@ def main():
     parser.add_argument("--csv-csr", type=str, default=None, metavar="FILE")
     parser.add_argument("--csv-coo", type=str, default=None, metavar="FILE")
     parser.add_argument(
+        "--value-dtypes",
+        type=str,
+        default=None,
+        help="comma-separated value dtypes: float,double,complex64,complex128",
+    )
+    parser.add_argument(
+        "--index-dtypes",
+        type=str,
+        default=None,
+        help="comma-separated index dtypes (currently int32 only)",
+    )
+    parser.add_argument(
         "--ops",
         type=str,
         default="NON",
@@ -1267,6 +1316,12 @@ def main():
     args = parser.parse_args()
     WARMUP = max(0, int(args.warmup))
     ITERS = max(1, int(args.iters))
+    value_dtypes = _parse_dtype_filter(
+        args.value_dtypes, CSV_VALUE_DTYPES, "--value-dtypes"
+    )
+    index_dtypes = _parse_dtype_filter(
+        args.index_dtypes, CSV_INDEX_DTYPES, "--index-dtypes"
+    )
 
     ops = _parse_ops_filter(args.ops)
     if any(op != "NON" for op in ops):
@@ -1297,6 +1352,8 @@ def main():
             case_timeout_seconds=args.case_timeout_seconds,
             warmup=WARMUP,
             iters=ITERS,
+            value_dtypes=value_dtypes,
+            index_dtypes=index_dtypes,
         )
         return
 
@@ -1314,6 +1371,8 @@ def main():
             case_timeout_seconds=args.case_timeout_seconds,
             warmup=WARMUP,
             iters=ITERS,
+            value_dtypes=value_dtypes,
+            index_dtypes=index_dtypes,
         )
         return
 
