@@ -1496,7 +1496,16 @@ def _finalize_csv_row(
     return row, pt_skip_reason
 
 
-def _run_one_csv_row_csr_full(path, value_dtype, index_dtype, op_mode, device, lower=True, alg_num=None):
+def _run_one_csv_row_csr_full(
+    path,
+    value_dtype,
+    index_dtype,
+    op_mode,
+    device,
+    lower=True,
+    alg_num=None,
+    fs_only=False,
+):
     data, indices, indptr, shape = _load_mtx_to_csr_torch(
         path, dtype=value_dtype, device=device, lower=lower
     )
@@ -1543,6 +1552,7 @@ def _run_one_csv_row_csr_full(path, value_dtype, index_dtype, op_mode, device, l
         n_rows,
         n_cols,
         lower=lower,
+        fs_only=fs_only,
     )
 
 
@@ -1562,6 +1572,7 @@ def _finalize_csv_row_csr_full(
     n_rows,
     n_cols,
     lower=True,
+    fs_only=False,
 ):
     atol, rtol = _tol_for_dtype(value_dtype)
     err_res, _ok_res = _solution_residual_metrics(
@@ -1572,15 +1583,19 @@ def _finalize_csv_row_csr_full(
     err_pt = None
     ok_pt = False
     pt_skip_reason = None
-    x_ref, pytorch_ms, _pt_backend, pt_skip_reason = _benchmark_pytorch_reference(
-        data,
-        indices,
-        indptr,
-        shape,
-        b,
-        lower=lower,
-        op_mode=op_mode,
-    )
+    x_ref = None
+    if fs_only:
+        pt_skip_reason = "disabled by --fs-only"
+    else:
+        x_ref, pytorch_ms, _pt_backend, pt_skip_reason = _benchmark_pytorch_reference(
+            data,
+            indices,
+            indptr,
+            shape,
+            b,
+            lower=lower,
+            op_mode=op_mode,
+        )
     if x_ref is not None:
         x_cmp = x
         x_ref_cmp = x_ref
@@ -1596,9 +1611,12 @@ def _finalize_csv_row_csr_full(
     ok_hs = False
     x_hs_t = None
     hs_skip_reason = None
-    hipsparse_ms, x_hs_t, hs_skip_reason = _benchmark_sparse_ref_csr_with_op(
-        data, indices, indptr, shape, b, op_mode, lower, return_reason=True
-    )
+    if fs_only:
+        hs_skip_reason = "disabled by --fs-only"
+    else:
+        hipsparse_ms, x_hs_t, hs_skip_reason = _benchmark_sparse_ref_csr_with_op(
+            data, indices, indptr, shape, b, op_mode, lower, return_reason=True
+        )
     if x_hs_t is not None:
         x_cmp = x
         x_hs_cmp = x_hs_t
@@ -1609,8 +1627,8 @@ def _finalize_csv_row_csr_full(
         )
         ok_hs = torch.allclose(x_cmp, x_hs_cmp, atol=atol, rtol=rtol)
 
-    status = "PASS" if (ok_pt or ok_hs) else "FAIL"
-    if (not ok_pt) and (not ok_hs) and (err_pt is None and err_hs is None):
+    status = "FS_ONLY" if fs_only else ("PASS" if (ok_pt or ok_hs) else "FAIL")
+    if (not fs_only) and (not ok_pt) and (not ok_hs) and (err_pt is None and err_hs is None):
         status = "REF_FAIL"
     ref_errors = [err for err in (err_pt, err_hs) if err is not None]
     err_ref = min(ref_errors) if ref_errors else None
@@ -1657,6 +1675,7 @@ def _run_spsv_csv_case_worker(
     alg_num,
     warmup,
     iters,
+    fs_only,
 ):
     global WARMUP, ITERS
     WARMUP = max(0, int(warmup))
@@ -1674,6 +1693,7 @@ def _run_spsv_csv_case_worker(
                 device,
                 lower=lower,
                 alg_num=alg_num,
+                fs_only=fs_only,
             )
         elif fmt == "coo":
             row, pt_skip = _run_one_csv_row_coo(
@@ -1701,6 +1721,7 @@ def _run_spsv_csv_case_with_timeout(
     lower,
     alg_num,
     timeout_seconds,
+    fs_only=False,
 ):
     timeout_seconds = max(
         1, min(int(timeout_seconds), int(SPSV_MAX_CASE_TIMEOUT_SECONDS))
@@ -1720,6 +1741,7 @@ def _run_spsv_csv_case_with_timeout(
             alg_num,
             WARMUP,
             ITERS,
+            fs_only,
         ),
     )
     proc.start()
@@ -1785,6 +1807,7 @@ def run_all_supported_spsv_csr_csv(
     op_modes=None,
     alg_num=None,
     case_timeout_seconds=SPSV_CASE_TIMEOUT_SECONDS,
+    fs_only=False,
 ):
     if not torch.cuda.is_available():
         print("CUDA/ROCm device is not available.")
@@ -1811,24 +1834,33 @@ def run_all_supported_spsv_csr_csv(
                     f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}  |  CSR  |  triA={'LOWER' if lower else 'UPPER'}  |  opA={op_mode}"
                 )
                 print(f"Algorithm: {_alg_label(alg_num)}")
-                print(
-                    "Formats: FlagSparse=CSR, hipSPARSE=CSR ref, "
-                    "PyTorch(ms)=official sparse solve reference"
-                )
+                if fs_only:
+                    print("Formats: FlagSparse=CSR only (hipSPARSE and PyTorch references disabled)")
+                else:
+                    print(
+                        "Formats: FlagSparse=CSR, hipSPARSE=CSR ref, "
+                        "PyTorch(ms)=official sparse solve reference"
+                    )
                 print(
                     f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
                     "(override with --warmup/--iters)"
                 )
                 effective_timeout = _effective_spsv_case_timeout(case_timeout_seconds)
                 print(f"Per-matrix timeout: {effective_timeout} seconds")
-                print(
-                    "RHS is generated directly. "
-                    "FS.total / HS.total both include fresh analysis/preparation + solve per timed round. "
-                    "PT.spdS/PT.spdT and HS.spdS/HS.spdT all compare against FS.total. "
-                    "Err(Ref)=best |FlagSparse-reference|, Err(Res)=|op(A)*x-b|, "
-                    "Err(PT)=|FlagSparse-PyTorch|, Err(HS)=|FlagSparse-hipSPARSE|. "
-                    "PASS if PyTorch / hipSPARSE reference passes. Residual is diagnostic only."
-                )
+                if fs_only:
+                    print(
+                        "RHS is generated directly. FS_ONLY means no external reference was run; "
+                        "Err(Res)=|op(A)*x-b| is diagnostic only."
+                    )
+                else:
+                    print(
+                        "RHS is generated directly. "
+                        "FS.total / HS.total both include fresh analysis/preparation + solve per timed round. "
+                        "PT.spdS/PT.spdT and HS.spdS/HS.spdT all compare against FS.total. "
+                        "Err(Ref)=best |FlagSparse-reference|, Err(Res)=|op(A)*x-b|, "
+                        "Err(PT)=|FlagSparse-PyTorch|, Err(HS)=|FlagSparse-hipSPARSE|. "
+                        "PASS if PyTorch / hipSPARSE reference passes. Residual is diagnostic only."
+                    )
                 print("-" * 150)
                 print(
                     f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
@@ -1854,6 +1886,7 @@ def run_all_supported_spsv_csr_csv(
                             lower,
                             alg_num,
                             case_timeout_seconds,
+                            fs_only=fs_only,
                         )
                         if row["status"] == "SKIP" and row.get("error", "").startswith("timed out"):
                             _print_spsv_timeout(path, case_timeout_seconds)
@@ -2330,6 +2363,11 @@ def main():
         help="Comma-separated index dtype filter for CSR CSV, e.g. int32,int64",
     )
     parser.add_argument(
+        "--fs-only",
+        action="store_true",
+        help="For --csv-csr, benchmark FlagSparse only; do not run hipSPARSE or PyTorch references",
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         default=WARMUP,
@@ -2432,6 +2470,7 @@ def main():
             op_modes=op_modes,
             alg_num=args.alg_num,
             case_timeout_seconds=args.case_timeout_seconds,
+            fs_only=args.fs_only,
         )
         return
     if args.csv_coo:
