@@ -55,6 +55,13 @@ def _spsv_env_flag(name, default="0"):
     return str(os.environ.get(name, default)).lower() in ("1", "true", "yes", "on")
 
 
+def _spsv_env_warp_size(name, default):
+    value = int(os.environ.get(name, default))
+    if value not in (32, 64):
+        raise ValueError(f"{name} must be 32 or 64, got {value}")
+    return value
+
+
 SPSV_PROMOTE_FP32_TO_FP64 = _spsv_env_flag("FLAGSPARSE_SPSV_PROMOTE_FP32_TO_FP64", "0")
 SPSV_PROMOTE_TRANSPOSE_FP32_TO_FP64 = _spsv_env_flag(
     "FLAGSPARSE_SPSV_PROMOTE_TRANSPOSE_FP32_TO_FP64", "0"
@@ -64,6 +71,9 @@ SPSV_PROMOTE_TRANSPOSE_COMPLEX64_TO_COMPLEX128 = _spsv_env_flag(
 )
 SPSV_ROCM_ENABLE_ADVANCED_AUTO = _spsv_env_flag(
     "FLAGSPARSE_SPSV_ROCM_ENABLE_ADVANCED_AUTO", "0"
+)
+SPSV_ROCM_ALG3_WARP_SIZE = _spsv_env_warp_size(
+    "FLAGSPARSE_SPSV_ROCM_ALG3_WARP_SIZE", "64"
 )
 _SPSV_CSR_PREPROCESS_CACHE = OrderedDict()
 _SPSV_CSR_PREPROCESS_CACHE_SIZE = 8
@@ -2560,6 +2570,7 @@ def _triton_spsv_csr_n_lo_roc_vector(
     if n_rows == 0:
         return x
     use_fp64_acc = data.dtype == torch.float64
+    warp_size = SPSV_ROCM_ALG3_WARP_SIZE if _is_rocm_runtime() else 32
     if level_ptr is not None and int(level_ptr.numel()) > 1:
         level_ptr_cpu = level_ptr.detach().to("cpu")
         for level_id in range(int(level_ptr_cpu.numel()) - 1):
@@ -2580,7 +2591,7 @@ def _triton_spsv_csr_n_lo_roc_vector(
                 LOWER=lower,
                 USE_FP64_ACC=use_fp64_acc,
                 DIAG_EPS=diag_eps,
-                WARP_SIZE=32,
+                WARP_SIZE=warp_size,
                 LEVEL_SCHEDULED=True,
                 num_warps=1,
             )
@@ -2597,7 +2608,7 @@ def _triton_spsv_csr_n_lo_roc_vector(
             LOWER=lower,
             USE_FP64_ACC=use_fp64_acc,
             DIAG_EPS=diag_eps,
-            WARP_SIZE=32,
+            WARP_SIZE=warp_size,
             LEVEL_SCHEDULED=False,
             num_warps=1,
         )
@@ -2631,6 +2642,7 @@ def _triton_spsv_csr_n_lo_roc_vector_complex(
     x_ri = torch.view_as_real(x.contiguous()).reshape(-1).contiguous()
     component_dtype = _component_dtype_for_complex(data.dtype)
     use_fp64 = component_dtype == torch.float64
+    warp_size = SPSV_ROCM_ALG3_WARP_SIZE if _is_rocm_runtime() else 32
     if level_ptr is not None and int(level_ptr.numel()) > 1:
         level_ptr_cpu = level_ptr.detach().to("cpu")
         for level_id in range(int(level_ptr_cpu.numel()) - 1):
@@ -2651,7 +2663,7 @@ def _triton_spsv_csr_n_lo_roc_vector_complex(
                 LOWER=lower,
                 USE_FP64_ACC=use_fp64,
                 DIAG_EPS=diag_eps,
-                WARP_SIZE=32,
+                WARP_SIZE=warp_size,
                 LEVEL_SCHEDULED=True,
                 num_warps=1,
             )
@@ -2668,7 +2680,7 @@ def _triton_spsv_csr_n_lo_roc_vector_complex(
             LOWER=lower,
             USE_FP64_ACC=use_fp64,
             DIAG_EPS=diag_eps,
-            WARP_SIZE=32,
+            WARP_SIZE=warp_size,
             LEVEL_SCHEDULED=False,
             num_warps=1,
         )

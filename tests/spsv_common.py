@@ -124,6 +124,8 @@ def _alg_label(alg_num):
         if alg_num == 2:
             return "ALG2/CW-level"
         if alg_num == 3:
+            if fs_spsv_impl._is_rocm_runtime():
+                return f"ALG3/ROC (ROCm WARP_SIZE={fs_spsv_impl.SPSV_ROCM_ALG3_WARP_SIZE})"
             return "ALG3/ROC"
         if alg_num == 4:
             return "ALG4/SMBLK"
