@@ -2859,25 +2859,10 @@ def _triton_spsv_csr_n_lo_nnz_balance_vector(
     tmp_sum_in=None,
     ready_in=None,
     indegree_in=None,
-    indptr=None,
-    level_row_map=None,
-    level_ptr=None,
 ):
     x = torch.zeros_like(b_vec)
     if n_rows == 0:
         return x
-    if indptr is not None and level_row_map is not None and level_ptr is not None:
-        return _triton_spsv_csr_n_lo_cw_levelschd_vector(
-            data,
-            indices,
-            indptr,
-            level_row_map,
-            b_vec,
-            n_rows,
-            lower=lower,
-            diag_eps=diag_eps,
-            ready_in=ready_in,
-        )
     tmp_sum = tmp_sum_in if tmp_sum_in is not None else torch.zeros_like(b_vec)
     ready = ready_in if ready_in is not None else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
     indegree = (
@@ -2924,26 +2909,10 @@ def _triton_spsv_csr_n_lo_nnz_balance_vector_complex(
     tmp_sum_in=None,
     ready_in=None,
     indegree_in=None,
-    indptr=None,
-    level_row_map=None,
-    level_ptr=None,
 ):
     x = torch.zeros_like(b_vec)
     if n_rows == 0:
         return x
-    if indptr is not None and level_row_map is not None and level_ptr is not None:
-        return _triton_spsv_csr_n_lo_cw_levelschd_vector_complex(
-            data,
-            indices,
-            indptr,
-            level_row_map,
-            b_vec,
-            n_rows,
-            lower=lower,
-            diag_eps=diag_eps,
-            data_ri_in=data_ri_in,
-            ready_in=ready_in,
-        )
     tmp_sum = tmp_sum_in if tmp_sum_in is not None else torch.zeros_like(b_vec)
     ready = (
         ready_in
@@ -3733,7 +3702,6 @@ def _execute_spsv_csr_plan(
                     b_in,
                     n_rows,
                     lower=lower_eff,
-                    unit_diagonal=unit_diagonal,
                     diag_eps=diag_eps,
                     data_ri_in=complex_kernel_data_ri,
                     ready_in=ready_buf,
@@ -3766,9 +3734,6 @@ def _execute_spsv_csr_plan(
                     tmp_sum_in=tmp_sum_buf,
                     ready_in=ready_buf,
                     indegree_in=indegree_buf,
-                    indptr=kernel_indptr,
-                    level_row_map=level_row_map32,
-                    level_ptr=level_ptr32,
                     )
                 else:
                     x = vec_complex(
@@ -3857,9 +3822,6 @@ def _execute_spsv_csr_plan(
                 tmp_sum_in=tmp_sum_buf,
                 ready_in=ready_buf,
                 indegree_in=indegree_buf,
-                indptr=kernel_indptr,
-                level_row_map=level_row_map32,
-                level_ptr=level_ptr32,
                 )
             else:
                 x = vec_real(
