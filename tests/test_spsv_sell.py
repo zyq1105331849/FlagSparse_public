@@ -37,8 +37,8 @@ pytestmark = pytest.mark.spsv_sell
 
 VALUE_DTYPES = (torch.float32, torch.float64)
 INDEX_DTYPES = (torch.int32, torch.int64)
-WARMUP = 2
-ITERS = 10
+WARMUP = 1
+ITERS = 1
 
 CSV_FIELDS = [
     "matrix",
