@@ -3620,10 +3620,10 @@ def _execute_spsv_csr_plan(
             1,
             cached_worker_count=cw_worker_count,
         )
-    # Exercise the CUDA-style persistent-worker path on ROCm/DCU.  More than one
-    # program enables dynamic row-counter scheduling and ready-flag polling.
+    # Keep ALG1 serial on ROCm/DCU because cross-program ready-flag polling does
+    # not make forward progress reliably on the current gfx936 Triton stack.
     if solve_kind == "csr_cw" and _is_rocm_runtime():
-        worker_count_use = max(1, min(int(n_rows), 4))
+        worker_count_use = 1
     complex_kernel_data_ri = None
     if torch.is_complex(data_in):
         if compute_dtype == solve_plan["kernel_data"].dtype:

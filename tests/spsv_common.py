@@ -120,7 +120,7 @@ def _alg_label(alg_num):
     if alg_num is not None:
         alg_num = int(alg_num)
         if alg_num == 1:
-            return "ALG1/CW (ROCm: 4-worker ready-flag; CUDA: ready-flag)"
+            return "ALG1/CW (ROCm: serial; CUDA: ready-flag)"
         if alg_num == 2:
             return "ALG2/CW-level"
         if alg_num == 3:
