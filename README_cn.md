@@ -115,12 +115,18 @@ python tests/test_spgemm.py <目录/> --csv results.csv    # 可选：--dtype fl
 # 常用选项：--dtype、--index-dtype、--warmup、--iters、--input-mode、--adaptive-loops、--no-cusparse、--ref-blocked-retry、--ref-isolated-retry、--ref-block-rows、--compare-device、--run-api-checks
 ```
 
-**test_spsv.py** - SpSV（三角求解；**仅方阵**）。CSR 与 COO 共用本脚本；**不存在** `test_spsv_coo.py`。
+**test_spsv.py** - CSR/COO SpSV（三角求解；**仅方阵**）。
+
+**test_spsv_sell.py** - 下三角、实数、原生列主序 SELL SpSV。CSV 和终端字段
+与 CSR SpSV 保持一致；`FlagSparse_ms` 与 `cuSPARSE_ms` 都统计每轮完整的
+准备/分析加求解，静态 descriptor 与 SELL 转换不计时。
 
 ```bash
 python tests/test_spsv.py --synthetic
 python tests/test_spsv.py <目录/> --csv-csr spsv.csv
 python tests/test_spsv.py <目录/> --csv-coo out.csv     # 列与 CSR 相同
+pytest -q -s tests/test_spsv_sell.py
+python tests/test_spsv_sell.py <目录或文件.mtx> --csv sell.csv --slice-size 32
 ```
 
 **test_spsm.py** - SpSM（三角矩阵-稠密矩阵求解；**仅方阵**）：
