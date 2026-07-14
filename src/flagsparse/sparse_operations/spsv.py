@@ -3623,7 +3623,7 @@ def _execute_spsv_csr_plan(
     # Exercise the CUDA-style persistent-worker path on ROCm/DCU.  More than one
     # program enables dynamic row-counter scheduling and ready-flag polling.
     if solve_kind == "csr_cw" and _is_rocm_runtime():
-        worker_count_use = max(1, min(int(n_rows), 32))
+        worker_count_use = max(1, min(int(n_rows), 4))
     complex_kernel_data_ri = None
     if torch.is_complex(data_in):
         if compute_dtype == solve_plan["kernel_data"].dtype:
