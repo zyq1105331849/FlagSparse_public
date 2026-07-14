@@ -9,14 +9,16 @@ import os
 import sys
 from pathlib import Path
 
-import pytest
-import torch
-
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
 for path in (_PROJECT_ROOT, _SRC_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
+
+import torch
+
+if __name__ != "__main__":
+    import pytest
 
 import flagsparse as fs
 from flagsparse.sparse_operations import spsv as spsv_impl
@@ -33,7 +35,8 @@ from tests.test_spsv import (
 )
 
 
-pytestmark = pytest.mark.spsv_sell
+if __name__ != "__main__":
+    pytestmark = pytest.mark.spsv_sell
 
 VALUE_DTYPES = (torch.float32, torch.float64)
 INDEX_DTYPES = (torch.int32, torch.int64)
@@ -516,9 +519,6 @@ def _print_record(record):
     )
 
 
-@pytest.mark.parametrize("value_dtype", VALUE_DTYPES)
-@pytest.mark.parametrize("index_dtype", INDEX_DTYPES)
-@pytest.mark.parametrize("slice_size", (8, 32))
 def test_spsv_sell_matches_cusparse(value_dtype, index_dtype, slice_size):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
@@ -552,6 +552,18 @@ def test_spsv_sell_matches_cusparse(value_dtype, index_dtype, slice_size):
     assert record["cuSPARSE_ms"] > 0.0
     _print_header(slice_size, value_dtype, index_dtype)
     _print_record(record)
+
+
+if __name__ != "__main__":
+    test_spsv_sell_matches_cusparse = pytest.mark.parametrize(
+        "value_dtype", VALUE_DTYPES
+    )(
+        pytest.mark.parametrize("index_dtype", INDEX_DTYPES)(
+            pytest.mark.parametrize("slice_size", (8, 32))(
+                test_spsv_sell_matches_cusparse
+            )
+        )
+    )
 
 
 def _expand_mtx_paths(inputs):
