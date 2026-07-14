@@ -51,8 +51,6 @@ CSV_FIELDS = [
     "n_rows",
     "n_cols",
     "nnz",
-    "FlagSparse_analysis_ms",
-    "FlagSparse_solve_ms",
     "FlagSparse_ms",
     "cuSPARSE_ms",
     "PyTorch_ms",
@@ -454,10 +452,6 @@ def _run_case(
         "n_rows": n_rows,
         "n_cols": n_rows,
         "nnz": int(values.numel()),
-        # SELL has no separate Triton symbolic-analysis API.  The full timed
-        # call (workspace reset + solve) is reported in FlagSparse_ms.
-        "FlagSparse_analysis_ms": None,
-        "FlagSparse_solve_ms": None,
         "FlagSparse_ms": triton_ms,
         "cuSPARSE_ms": cusparse_ms,
         "PyTorch_ms": None,
@@ -485,16 +479,12 @@ def _print_header(slice_size, value_dtype, index_dtype):
         f"Benchmark schedule: warmup={WARMUP}, iter={ITERS}; "
         "FS.ms and CU.ms both include every per-call analysis/preparation + solve."
     )
-    print(
-        "SELL has no separate Triton symbolic analysis, so FS.an and FS.sol are N/A; "
-        "CU.spdT = CU.ms / FS.ms."
-    )
+    print("CU.spd = CU.ms / FS.ms; PT.spd = PT.ms / FS.ms.")
     print("-" * 144)
     print(
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
-        f"{'FS.an':>11} {'FS.sol':>10} {'FS.ms':>10} "
-        f"{'CU.ms':>10} {'PT.ms':>10} {'CU.spdS':>10} {'PT.spdS':>10} "
-        f"{'CU.spdT':>10} {'PT.spdT':>10} {'Status':>6} "
+        f"{'FS.ms':>10} {'CU.ms':>10} {'PT.ms':>10} "
+        f"{'CU.spd':>10} {'PT.spd':>10} {'Status':>6} "
         f"{'Eref':>10} {'Eres':>10} {'Ept':>10} {'Ecu':>10}"
     )
     print("-" * 144)
@@ -506,11 +496,9 @@ def _print_record(record):
     print(
         f"{name:<28} {record['n_rows']:>7} {record['n_cols']:>7} "
         f"{record['nnz']:>10} "
-        f"{_fmt_ms(record['FlagSparse_analysis_ms']):>11} "
-        f"{_fmt_ms(record['FlagSparse_solve_ms']):>10} "
         f"{_fmt_ms(record['FlagSparse_ms']):>10} "
         f"{_fmt_ms(record['cuSPARSE_ms']):>10} "
-        f"{_fmt_ms(record['PyTorch_ms']):>10} {'N/A':>10} {'N/A':>10} "
+        f"{_fmt_ms(record['PyTorch_ms']):>10} "
         f"{_fmt_ratio(record['FlagSparse_vs_cuSPARSE_speedup']):>10} "
         f"{_fmt_ratio(record['FlagSparse_vs_PyTorch_speedup']):>10} "
         f"{record['status']:>6} {_fmt_err(record['err_ref']):>10} "
