@@ -234,15 +234,11 @@ def _csv_export_row_spsv(row):
         "n_rows": row.get("n_rows"),
         "n_cols": row.get("n_cols"),
         "nnz": row.get("nnz"),
-        "analysis_ms": row.get("analysis_ms"),
-        "solve_ms": row.get("solve_ms"),
-        "triton_total_ms": row.get("triton_total_ms"),
-        "hipsparse_ms": row.get("hipsparse_ms"),
+        "flagsparse_ms": row.get("flagsparse_ms"),
         "pytorch_ms": row.get("pytorch_ms"),
-        "hipsparse_speedup_solve": row.get("hipsparse_speedup_solve"),
-        "pytorch_speedup_solve": row.get("pytorch_speedup_solve"),
-        "hipsparse_speedup_total": row.get("hipsparse_speedup_total"),
-        "pytorch_speedup_total": row.get("pytorch_speedup_total"),
+        "hipsparse_ms": row.get("hipsparse_ms"),
+        "pytorch_speedup": row.get("pytorch_speedup"),
+        "hipsparse_speedup": row.get("hipsparse_speedup"),
         "pt_status": row.get("pt_status"),
         "hs_status": row.get("hs_status"),
         "status": row.get("status"),
@@ -258,9 +254,8 @@ def _csv_export_row_spsv(row):
 
 SPSV_CSV_FIELDNAMES = (
     "matrix", "value_dtype", "index_dtype", "opA", "n_rows", "n_cols",
-    "nnz", "analysis_ms", "solve_ms", "triton_total_ms", "hipsparse_ms",
-    "pytorch_ms", "hipsparse_speedup_solve", "pytorch_speedup_solve",
-    "hipsparse_speedup_total", "pytorch_speedup_total", "pt_status",
+    "nnz", "flagsparse_ms", "pytorch_ms", "hipsparse_ms",
+    "pytorch_speedup", "hipsparse_speedup", "pt_status",
     "hs_status", "status", "err_ref", "err_res", "err_pt", "err_hs",
     "pytorch_reason", "hipsparse_reason", "error",
 )
@@ -296,15 +291,11 @@ def _empty_csv_case_row_spsv(path, value_dtype, index_dtype, op_mode, status, er
         "n_rows": "ERR",
         "n_cols": "ERR",
         "nnz": "ERR",
-        "analysis_ms": None,
-        "solve_ms": None,
-        "triton_total_ms": None,
-        "hipsparse_ms": None,
+        "flagsparse_ms": None,
         "pytorch_ms": None,
-        "hipsparse_speedup_solve": None,
-        "pytorch_speedup_solve": None,
-        "hipsparse_speedup_total": None,
-        "pytorch_speedup_total": None,
+        "hipsparse_ms": None,
+        "pytorch_speedup": None,
+        "hipsparse_speedup": None,
         "pt_status": "N/A",
         "hs_status": "N/A",
         "status": status,
@@ -1186,8 +1177,8 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
     print()
 
     hdr = (
-        f"{'Fmt':>5} {'opA':>5} {'N':>6} {'FS.analysis':>12} {'FS.solve':>10} {'FS.total':>10} "
-        f"{'PT.total':>10} {'HS.total':>10} {'PT.spdS':>10} {'HS.spdS':>10} {'PT.spdT':>10} {'HS.spdT':>10} "
+        f"{'Fmt':>5} {'opA':>5} {'N':>6} {'FS.ms':>10} {'PT.ms':>10} {'HS.ms':>10} "
+        f"{'PT.spd':>10} {'HS.spd':>10} "
         f"{'Status':>8} {'Err(PT)':>12} {'Err(HS)':>12}"
     )
 
@@ -1324,15 +1315,12 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                             failed += 1
                         total += 1
 
-                        total_ms = _sum_ms(analysis_ms, t_ms)
-                        pt_vs_total = _safe_ratio(pytorch_ms, total_ms)
-                        hs_vs_total = _safe_ratio(hipsparse_ms, total_ms)
-                        pt_vs_solve = pt_vs_total
-                        hs_vs_solve = hs_vs_total
+                        flagsparse_ms = _sum_ms(analysis_ms, t_ms)
+                        pytorch_speedup = _safe_ratio(pytorch_ms, flagsparse_ms)
+                        hipsparse_speedup = _safe_ratio(hipsparse_ms, flagsparse_ms)
                         print(
-                            f"{fmt:>5} {op_mode:>5} {n:>6} {_fmt_ms(analysis_ms):>12} {_fmt_ms(t_ms):>10} {_fmt_ms(total_ms):>10} {_fmt_ms(pytorch_ms):>10} "
-                            f"{_fmt_ms(hipsparse_ms):>10} "
-                            f"{_fmt_ratio(pt_vs_solve):>10} {_fmt_ratio(hs_vs_solve):>10} {_fmt_ratio(pt_vs_total):>10} {_fmt_ratio(hs_vs_total):>10} "
+                            f"{fmt:>5} {op_mode:>5} {n:>6} {_fmt_ms(flagsparse_ms):>10} {_fmt_ms(pytorch_ms):>10} "
+                            f"{_fmt_ms(hipsparse_ms):>10} {_fmt_ratio(pytorch_speedup):>10} {_fmt_ratio(hipsparse_speedup):>10} "
                             f"{status:>8} {_fmt_err(err_pt):>12} {_fmt_err(err_hs):>12}"
                         )
                         # Synthetic benchmark keeps the main row compact; PyTorch fallback notes
@@ -1466,6 +1454,7 @@ def _finalize_csv_row(
         status = "REF_FAIL"
     ref_errors = [err for err in (err_pt, err_hs) if err is not None]
     err_ref = min(ref_errors) if ref_errors else None
+    flagsparse_ms = _sum_ms(analysis_ms, t_ms)
 
     row = {
         "matrix": os.path.basename(path),
@@ -1475,15 +1464,11 @@ def _finalize_csv_row(
         "n_rows": n_rows,
         "n_cols": n_cols,
         "nnz": int(data.numel()),
-        "analysis_ms": analysis_ms,
-        "solve_ms": t_ms,
-        "triton_total_ms": _sum_ms(analysis_ms, t_ms),
-        "hipsparse_ms": hipsparse_ms,
+        "flagsparse_ms": flagsparse_ms,
         "pytorch_ms": pytorch_ms,
-        "hipsparse_speedup_solve": _safe_ratio(hipsparse_ms, _sum_ms(analysis_ms, t_ms)),
-        "pytorch_speedup_solve": _safe_ratio(pytorch_ms, _sum_ms(analysis_ms, t_ms)),
-        "hipsparse_speedup_total": _safe_ratio(hipsparse_ms, _sum_ms(analysis_ms, t_ms)),
-        "pytorch_speedup_total": _safe_ratio(pytorch_ms, _sum_ms(analysis_ms, t_ms)),
+        "hipsparse_ms": hipsparse_ms,
+        "pytorch_speedup": _safe_ratio(pytorch_ms, flagsparse_ms),
+        "hipsparse_speedup": _safe_ratio(hipsparse_ms, flagsparse_ms),
         "pt_status": _status_str(ok_pt, err_pt is not None),
         "hs_status": _status_str(ok_hs, err_hs is not None),
         "status": status,
@@ -1634,6 +1619,7 @@ def _finalize_csv_row_csr_full(
         status = "REF_FAIL"
     ref_errors = [err for err in (err_pt, err_hs) if err is not None]
     err_ref = min(ref_errors) if ref_errors else None
+    flagsparse_ms = _sum_ms(analysis_ms, t_ms)
 
     row = {
         "matrix": os.path.basename(path),
@@ -1643,15 +1629,11 @@ def _finalize_csv_row_csr_full(
         "n_rows": n_rows,
         "n_cols": n_cols,
         "nnz": int(data.numel()),
-        "analysis_ms": analysis_ms,
-        "solve_ms": t_ms,
-        "triton_total_ms": _sum_ms(analysis_ms, t_ms),
-        "hipsparse_ms": hipsparse_ms,
+        "flagsparse_ms": flagsparse_ms,
         "pytorch_ms": pytorch_ms,
-        "hipsparse_speedup_solve": _safe_ratio(hipsparse_ms, _sum_ms(analysis_ms, t_ms)),
-        "pytorch_speedup_solve": _safe_ratio(pytorch_ms, _sum_ms(analysis_ms, t_ms)),
-        "hipsparse_speedup_total": _safe_ratio(hipsparse_ms, _sum_ms(analysis_ms, t_ms)),
-        "pytorch_speedup_total": _safe_ratio(pytorch_ms, _sum_ms(analysis_ms, t_ms)),
+        "hipsparse_ms": hipsparse_ms,
+        "pytorch_speedup": _safe_ratio(pytorch_ms, flagsparse_ms),
+        "hipsparse_speedup": _safe_ratio(hipsparse_ms, flagsparse_ms),
         "pt_status": _status_str(ok_pt, err_pt is not None),
         "hs_status": _status_str(ok_hs, err_hs is not None),
         "status": status,
@@ -1857,8 +1839,8 @@ def run_all_supported_spsv_csr_csv(
                 else:
                     print(
                         "RHS is generated directly. "
-                        "FS.total / HS.total both include fresh analysis/preparation + solve per timed round. "
-                        "PT.spdS/PT.spdT and HS.spdS/HS.spdT all compare against FS.total. "
+                        "FS.ms / HS.ms both include fresh analysis/preparation + solve per timed round. "
+                        "PT.spd=PT.ms/FS.ms and HS.spd=HS.ms/FS.ms. "
                         "Err(Ref)=best |FlagSparse-reference|, Err(Res)=|op(A)*x-b|, "
                         "Err(PT)=|FlagSparse-PyTorch|, Err(HS)=|FlagSparse-hipSPARSE|. "
                         "PASS if PyTorch / hipSPARSE reference passes. Residual is diagnostic only."
@@ -1866,8 +1848,7 @@ def run_all_supported_spsv_csr_csv(
                 print("-" * 150)
                 print(
                     f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
-                    f"{'FS.analysis':>11} {'FS.solve':>10} {'FS.total':>10} {'HS.total':>10} {'PT.total':>10} "
-                    f"{'HS.spdS':>10} {'PT.spdS':>10} {'HS.spdT':>10} {'PT.spdT':>10} "
+                    f"{'FS.ms':>10} {'PT.ms':>10} {'HS.ms':>10} {'PT.spd':>10} {'HS.spd':>10} "
                     f"{'Status':>6} {'Err(Ref)':>10} {'Err(Res)':>10} {'Err(PT)':>10} {'Err(HS)':>10}"
                 )
                 print("-" * 150)
@@ -1899,18 +1880,16 @@ def run_all_supported_spsv_csr_csv(
                             name = name + "…"
                         n_rows, n_cols = row["n_rows"], row["n_cols"]
                         nnz = row["nnz"]
-                        analysis_ms = row["analysis_ms"]
-                        t_ms = row["solve_ms"]
-                        total_ms = row["triton_total_ms"]
-                        hipsparse_ms = row["hipsparse_ms"]
+                        flagsparse_ms = row["flagsparse_ms"]
                         pytorch_ms = row["pytorch_ms"]
+                        hipsparse_ms = row["hipsparse_ms"]
                         err_ref, err_res = row["err_ref"], row["err_res"]
                         err_pt, err_hs = row["err_pt"], row["err_hs"]
                         status = row["status"]
                         print(
                             f"{name:<28} {n_rows:>7} {n_cols:>7} {nnz:>10} "
-                            f"{_fmt_ms(analysis_ms):>11} {_fmt_ms(t_ms):>10} {_fmt_ms(total_ms):>10} {_fmt_ms(hipsparse_ms):>10} {_fmt_ms(pytorch_ms):>10} "
-                            f"{_fmt_ratio(row['hipsparse_speedup_solve']):>10} {_fmt_ratio(row['pytorch_speedup_solve']):>10} {_fmt_ratio(row['hipsparse_speedup_total']):>10} {_fmt_ratio(row['pytorch_speedup_total']):>10} "
+                            f"{_fmt_ms(flagsparse_ms):>10} {_fmt_ms(pytorch_ms):>10} {_fmt_ms(hipsparse_ms):>10} "
+                            f"{_fmt_ratio(row['pytorch_speedup']):>10} {_fmt_ratio(row['hipsparse_speedup']):>10} "
                             f"{status:>6} {_fmt_err(err_ref):>10} {_fmt_err(err_res):>10} {_fmt_err(err_pt):>10} {_fmt_err(err_hs):>10}"
                         )
                         if status in ("FAIL", "REF_FAIL"):
@@ -1933,8 +1912,8 @@ def run_all_supported_spsv_csr_csv(
                             name = name + "…"
                         print(
                             f"{name:<28} {'ERR':>7} {'ERR':>7} {'ERR':>10} "
-                            f"{_fmt_ms(None):>11} {_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} "
-                            f"{'N/A':>10} {'N/A':>10} {'N/A':>10} {'N/A':>10} "
+                            f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} "
+                            f"{'N/A':>10} {'N/A':>10} "
                             f"{status:>6} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10}"
                         )
                         print(f"  {status}: {e}")
@@ -1989,8 +1968,8 @@ def run_all_dtypes_spsv_coo_csv(
                 effective_timeout = _effective_spsv_case_timeout(case_timeout_seconds)
                 print(f"Per-matrix timeout: {effective_timeout} seconds")
                 print(
-                    "FS.total / HS.total both include fresh analysis/preparation + solve per timed round. "
-                    "PT.spdS/PT.spdT and HS.spdS/HS.spdT all compare against FS.total."
+                    "FS.ms / HS.ms both include fresh analysis/preparation + solve per timed round. "
+                    "PT.spd=PT.ms/FS.ms and HS.spd=HS.ms/FS.ms."
                 )
                 print(
                     "Matrix metadata fields reuse the canonical triangular matrix, matching CSR CSV output."
@@ -2003,8 +1982,7 @@ def run_all_dtypes_spsv_coo_csv(
                 print("-" * 150)
                 print(
                     f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
-                    f"{'FS.analysis':>11} {'FS.solve':>10} {'FS.total':>10} {'HS.total':>10} {'PT.total':>10} "
-                    f"{'HS.spdS':>10} {'PT.spdS':>10} {'HS.spdT':>10} {'PT.spdT':>10} "
+                    f"{'FS.ms':>10} {'PT.ms':>10} {'HS.ms':>10} {'PT.spd':>10} {'HS.spd':>10} "
                     f"{'Status':>6} {'Err(Ref)':>10} {'Err(Res)':>10} {'Err(PT)':>10} {'Err(HS)':>10}"
                 )
                 print("-" * 150)
@@ -2034,18 +2012,16 @@ def run_all_dtypes_spsv_coo_csv(
                             name = name + "…"
                         n_rows, n_cols = row["n_rows"], row["n_cols"]
                         nnz = row["nnz"]
-                        analysis_ms = row["analysis_ms"]
-                        t_ms = row["solve_ms"]
-                        total_ms = row["triton_total_ms"]
-                        hipsparse_ms = row["hipsparse_ms"]
+                        flagsparse_ms = row["flagsparse_ms"]
                         pytorch_ms = row["pytorch_ms"]
+                        hipsparse_ms = row["hipsparse_ms"]
                         err_ref, err_res = row["err_ref"], row["err_res"]
                         err_pt, err_hs = row["err_pt"], row["err_hs"]
                         status = row["status"]
                         print(
                             f"{name:<28} {n_rows:>7} {n_cols:>7} {nnz:>10} "
-                            f"{_fmt_ms(analysis_ms):>11} {_fmt_ms(t_ms):>10} {_fmt_ms(total_ms):>10} {_fmt_ms(hipsparse_ms):>10} {_fmt_ms(pytorch_ms):>10} "
-                            f"{_fmt_ratio(row['hipsparse_speedup_solve']):>10} {_fmt_ratio(row['pytorch_speedup_solve']):>10} {_fmt_ratio(row['hipsparse_speedup_total']):>10} {_fmt_ratio(row['pytorch_speedup_total']):>10} "
+                            f"{_fmt_ms(flagsparse_ms):>10} {_fmt_ms(pytorch_ms):>10} {_fmt_ms(hipsparse_ms):>10} "
+                            f"{_fmt_ratio(row['pytorch_speedup']):>10} {_fmt_ratio(row['hipsparse_speedup']):>10} "
                             f"{status:>6} {_fmt_err(err_ref):>10} {_fmt_err(err_res):>10} {_fmt_err(err_pt):>10} {_fmt_err(err_hs):>10}"
                         )
                         if status in ("FAIL", "REF_FAIL"):
@@ -2068,41 +2044,13 @@ def run_all_dtypes_spsv_coo_csv(
                             name = name + "…"
                         print(
                             f"{name:<28} {'ERR':>7} {'ERR':>7} {'ERR':>10} "
-                            f"{_fmt_ms(None):>11} {_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} "
-                            f"{'N/A':>10} {'N/A':>10} {'N/A':>10} {'N/A':>10} {status:>6} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10}"
+                            f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} "
+                            f"{'N/A':>10} {'N/A':>10} {status:>6} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10}"
                         )
                         print(f"  {status}: {e}")
                 print("-" * 150)
-    fieldnames = [
-        "matrix",
-        "value_dtype",
-        "index_dtype",
-        "opA",
-        "n_rows",
-        "n_cols",
-        "nnz",
-        "analysis_ms",
-        "solve_ms",
-        "triton_total_ms",
-        "hipsparse_ms",
-        "pytorch_ms",
-        "hipsparse_speedup_solve",
-        "pytorch_speedup_solve",
-        "hipsparse_speedup_total",
-        "pytorch_speedup_total",
-        "pt_status",
-        "hs_status",
-        "status",
-        "err_ref",
-        "err_res",
-        "err_pt",
-        "err_hs",
-        "pytorch_reason",
-        "hipsparse_reason",
-        "error",
-    ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = csv.DictWriter(f, fieldnames=SPSV_CSV_FIELDNAMES)
         w.writeheader()
         for r in rows_out:
             w.writerow({k: ("" if v is None else v) for k, v in _csv_export_row_spsv(r).items()})

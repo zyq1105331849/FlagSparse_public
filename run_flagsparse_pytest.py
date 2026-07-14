@@ -635,6 +635,7 @@ def summarize_performance_csv(path: Path) -> dict[str, object]:
                 "opt_speedup_vs_pytorch",
                 "base_vs_alg2_speedup",
                 "base_vs_alg1_speedup",
+                "pytorch_speedup",
                 "pytorch_speedup_total",
                 "pytorch_speedup_solve",
             ]
