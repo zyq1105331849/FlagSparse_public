@@ -344,13 +344,7 @@ def _benchmark_cuda_graph_op(
     repeats=10,
     capture_setup=None,
 ):
-    """Measure allocation-free CUDA work without Python/FFI launch gaps.
-
-    A graph contains ``graph_batch`` copies of ``op``. CUDA events measure one
-    replay at a time, and the reported value is the median replay duration
-    divided by ``graph_batch``. Descriptor creation, Python calls, ctypes calls,
-    graph capture, and graph instantiation are outside the timed interval.
-    """
+    """Measure allocation-free CUDA work without Python/FFI launch gaps."""
     graph_batch = max(1, int(graph_batch))
     warmup = max(0, int(warmup))
     repeats = max(1, int(repeats))
@@ -362,7 +356,6 @@ def _benchmark_cuda_graph_op(
     with torch.cuda.stream(capture_stream):
         if capture_setup is not None:
             capture_setup()
-        # Materialize lazy/JIT state before capture.
         op()
     capture_stream.synchronize()
 
@@ -371,7 +364,6 @@ def _benchmark_cuda_graph_op(
             op()
     capture_stream.synchronize()
 
-    # Warm the instantiated graph before collecting samples.
     with torch.cuda.stream(capture_stream):
         for _ in range(warmup):
             graph.replay()
