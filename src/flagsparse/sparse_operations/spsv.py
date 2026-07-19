@@ -62,6 +62,13 @@ def _spsv_env_warp_size(name, default):
     return value
 
 
+def _spsv_env_positive_int(name, default):
+    value = int(os.environ.get(name, default))
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return value
+
+
 SPSV_PROMOTE_FP32_TO_FP64 = _spsv_env_flag("FLAGSPARSE_SPSV_PROMOTE_FP32_TO_FP64", "0")
 SPSV_PROMOTE_TRANSPOSE_FP32_TO_FP64 = _spsv_env_flag(
     "FLAGSPARSE_SPSV_PROMOTE_TRANSPOSE_FP32_TO_FP64", "0"
@@ -74,6 +81,12 @@ SPSV_ROCM_ENABLE_ADVANCED_AUTO = _spsv_env_flag(
 )
 SPSV_ROCM_ALG3_WARP_SIZE = _spsv_env_warp_size(
     "FLAGSPARSE_SPSV_ROCM_ALG3_WARP_SIZE", "64"
+)
+SPSV_ROCM_ALG4_WARP_SIZE = _spsv_env_warp_size(
+    "FLAGSPARSE_SPSV_ROCM_ALG4_WARP_SIZE", "64"
+)
+SPSV_ROCM_ALG4_WORKER_COUNT = _spsv_env_positive_int(
+    "FLAGSPARSE_SPSV_ROCM_ALG4_WORKER_COUNT", "4"
 )
 _SPSV_CSR_PREPROCESS_CACHE = OrderedDict()
 _SPSV_CSR_PREPROCESS_CACHE_SIZE = 8
@@ -2706,7 +2719,12 @@ def _triton_spsv_csr_n_lo_smblk_vector(
     if n_rows == 0:
         return x
     use_fp64_acc = data.dtype == torch.float64
-    _spsv_csr_smblk_kernel[(n_rows,)](
+    is_rocm = _is_rocm_runtime()
+    warp_size = SPSV_ROCM_ALG4_WARP_SIZE if is_rocm else 32
+    worker_count = min(
+        n_rows, SPSV_ROCM_ALG4_WORKER_COUNT if is_rocm else n_rows
+    )
+    _spsv_csr_smblk_kernel[(worker_count,)](
         data,
         indices,
         indptr,
@@ -2718,7 +2736,8 @@ def _triton_spsv_csr_n_lo_smblk_vector(
         REVERSE_ORDER=not lower,
         USE_FP64_ACC=use_fp64_acc,
         DIAG_EPS=diag_eps,
-        WARP_SIZE=32,
+        WARP_SIZE=warp_size,
+        NUM_WORKERS=worker_count,
         num_warps=1,
     )
     return x
@@ -2748,7 +2767,12 @@ def _triton_spsv_csr_n_lo_smblk_vector_complex(
     x_ri = torch.view_as_real(x.contiguous()).reshape(-1).contiguous()
     component_dtype = _component_dtype_for_complex(data.dtype)
     use_fp64 = component_dtype == torch.float64
-    _spsv_csr_smblk_kernel_complex[(n_rows,)](
+    is_rocm = _is_rocm_runtime()
+    warp_size = SPSV_ROCM_ALG4_WARP_SIZE if is_rocm else 32
+    worker_count = min(
+        n_rows, SPSV_ROCM_ALG4_WORKER_COUNT if is_rocm else n_rows
+    )
+    _spsv_csr_smblk_kernel_complex[(worker_count,)](
         data_ri,
         indices,
         indptr,
@@ -2760,7 +2784,8 @@ def _triton_spsv_csr_n_lo_smblk_vector_complex(
         REVERSE_ORDER=not lower,
         USE_FP64_ACC=use_fp64,
         DIAG_EPS=diag_eps,
-        WARP_SIZE=32,
+        WARP_SIZE=warp_size,
+        NUM_WORKERS=worker_count,
         num_warps=1,
     )
     return x
