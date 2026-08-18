@@ -1,0 +1,2463 @@
+"""SpSV tests: synthetic triangular systems and optional .mtx (CSR/COO)."""
+
+import argparse
+import csv
+import glob
+import hashlib
+import multiprocessing as mp
+import os
+import sys
+import time
+from pathlib import Path
+from queue import Empty
+
+import torch
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_SRC_ROOT = _PROJECT_ROOT / "src"
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+
+import flagsparse.sparse_operations.spsv as fs_spsv_impl
+
+try:
+    import cupy as cp
+    import cupyx.scipy.sparse as cpx_sparse
+    from cupyx.scipy.sparse.linalg import spsolve_triangular as cpx_spsolve_triangular
+except Exception:
+    cp = None
+    cpx_sparse = None
+    cpx_spsolve_triangular = None
+
+VALUE_DTYPES = [torch.float32, torch.float64, torch.complex64, torch.complex128]
+INDEX_DTYPES = [torch.int32, torch.int64]
+TEST_SIZES = [256, 512, 1024, 2048]
+WARMUP = 1
+ITERS = 1
+SPSV_CASE_TIMEOUT_SECONDS = 180
+SPSV_MAX_CASE_TIMEOUT_SECONDS = 180
+
+SPSV_TRIANGULAR_DIAG_DOMINANCE = 4.0
+# CSR 完整组合覆盖（在原 csv-csr 逻辑外新增，不影响原入口）
+CSR_FULL_VALUE_DTYPES = [
+    torch.float32,
+    torch.float64,
+    torch.complex64,
+    torch.complex128,
+]
+CSR_FULL_INDEX_DTYPES = [torch.int32, torch.int64]
+SPSV_OP_MODES = ["NON", "TRANS", "CONJ"]
+
+
+def _dtype_name(dtype):
+    return str(dtype).replace("torch.", "")
+
+
+VALUE_DTYPE_NAME_MAP = {
+    _dtype_name(dtype): dtype for dtype in CSR_FULL_VALUE_DTYPES
+}
+VALUE_DTYPE_NAME_MAP.update({
+    "float": torch.float32,
+    "double": torch.float64,
+})
+INDEX_DTYPE_NAME_MAP = {
+    _dtype_name(dtype): dtype for dtype in CSR_FULL_INDEX_DTYPES
+}
+SPSV_ALG_NUM_TO_SOLVE_KIND = {
+    1: "csr_cw",
+    2: "csr_cw_levelschd",
+    3: "csr_roc",
+    4: "csr_smblk",
+    8: "csr_nnz_balance",
+}
+
+
+def _parse_csv_tokens(raw):
+    return [tok.strip() for tok in str(raw).split(",") if tok.strip()]
+
+
+def _parse_value_dtypes_filter(raw):
+    tokens = [tok.lower() for tok in _parse_csv_tokens(raw)]
+    invalid = [tok for tok in tokens if tok not in VALUE_DTYPE_NAME_MAP]
+    if invalid:
+        raise ValueError(f"unsupported value dtypes: {invalid}")
+    return [VALUE_DTYPE_NAME_MAP[tok] for tok in tokens]
+
+
+def _parse_index_dtypes_filter(raw):
+    tokens = [tok.lower() for tok in _parse_csv_tokens(raw)]
+    invalid = [tok for tok in tokens if tok not in INDEX_DTYPE_NAME_MAP]
+    if invalid:
+        raise ValueError(f"unsupported index dtypes: {invalid}")
+    return [INDEX_DTYPE_NAME_MAP[tok] for tok in tokens]
+
+
+def _parse_op_modes_filter(raw):
+    tokens = [tok.upper() for tok in _parse_csv_tokens(raw)]
+    invalid = [tok for tok in tokens if tok not in SPSV_OP_MODES]
+    if invalid:
+        raise ValueError(f"unsupported ops: {invalid}")
+    return tokens
+
+
+def _parse_alg_num(raw):
+    value = int(raw)
+    if value not in SPSV_ALG_NUM_TO_SOLVE_KIND:
+        raise ValueError(
+            "unsupported alg_num: "
+            f"{value}. Supported values: {sorted(SPSV_ALG_NUM_TO_SOLVE_KIND)}"
+        )
+    return value
+
+
+def _solve_kind_from_alg_num(alg_num):
+    if alg_num is None:
+        return None
+    return SPSV_ALG_NUM_TO_SOLVE_KIND[int(alg_num)]
+
+
+def _alg_label(alg_num):
+    if alg_num is not None:
+        alg_num = int(alg_num)
+        if alg_num == 1:
+            return "ALG1/CW (ROCm: serial; CUDA: ready-flag)"
+        if alg_num == 2:
+            return "ALG2/CW-level"
+        if alg_num == 3:
+            if fs_spsv_impl._is_rocm_runtime():
+                return f"ALG3/ROC (ROCm WARP_SIZE={fs_spsv_impl.SPSV_ROCM_ALG3_WARP_SIZE})"
+            return "ALG3/ROC"
+        if alg_num == 4:
+            return "ALG4/SMBLK"
+        if alg_num == 8:
+            return "ALG8/NNZ-balance"
+        return f"ALG{alg_num}"
+    if (
+        fs_spsv_impl._is_rocm_runtime()
+        and not fs_spsv_impl.SPSV_ROCM_ENABLE_ADVANCED_AUTO
+    ):
+        return "AUTO->ALG1/CW(Triton-serial)"
+    return "AUTO"
+
+
+def _alg_num_supports_case(alg_num, fmt, op_mode, lower, value_dtype):
+    del lower, value_dtype
+    if alg_num is None:
+        return True
+    alg_num = int(alg_num)
+    if alg_num == 1:
+        return True
+    if alg_num in (2, 3, 4, 8):
+        return (
+            fmt in ("CSR", "COO")
+            and op_mode == "NON"
+        )
+    return False
+
+
+def _fmt_ms(v):
+    if isinstance(v, (tuple, list)):
+        v = v[0] if v else None
+    return "N/A" if v is None else f"{v:.4f}"
+
+
+def _fmt_ratio(v):
+    if isinstance(v, (tuple, list)):
+        v = v[0] if v else None
+    return "N/A" if v is None else f"{v:.2f}"
+
+
+def _fmt_err(v):
+    if isinstance(v, (tuple, list)):
+        v = v[0] if v else None
+    return "N/A" if v is None else f"{v:.2e}"
+
+
+def _safe_ratio(other_ms, base_ms):
+    if other_ms is None or base_ms is None or base_ms <= 0:
+        return None
+    return other_ms / base_ms
+
+
+def _allinone_filtered_avg_ms(times, fmt="CSR"):
+    if not times:
+        return None
+    times = [float(t) for t in times]
+    if len(times) == 1:
+        return times[0]
+    if fmt.upper() == "COO":
+        avg = sum(times) / len(times)
+        kept = [t for t in times if t < 2.0 * avg]
+        return sum(kept) / len(kept) if kept else avg
+    ordered = sorted(times)
+    n = len(ordered)
+    if n % 2 == 0:
+        median = (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0
+    else:
+        median = ordered[n // 2]
+    lo = median * 0.9
+    hi = median * 1.1
+    kept = [t for t in ordered if lo <= t <= hi]
+    return sum(kept) / len(kept) if kept else median
+
+
+def _amortized_total_ms(analysis_ms, solve_ms, iters):
+    del iters
+    if analysis_ms is None or solve_ms is None:
+        return None
+    return float(analysis_ms) + float(solve_ms)
+
+
+def _sum_ms(analysis_ms, solve_ms, iters=None):
+    if iters is None:
+        iters = ITERS
+    return _amortized_total_ms(analysis_ms, solve_ms, iters)
+
+
+def _spsv_benchmark_schedule(nnz, op_mode, value_dtype, fmt="CSR"):
+    del nnz, op_mode, value_dtype, fmt
+    return int(WARMUP), int(ITERS)
+
+
+def _status_str(ok_flag, has_value):
+    if ok_flag:
+        return "PASS"
+    return "FAIL" if has_value else "N/A"
+
+
+def _csv_export_row_spsv(row):
+    return {
+        "matrix": row.get("matrix"),
+        "value_dtype": row.get("value_dtype"),
+        "index_dtype": row.get("index_dtype"),
+        "opA": row.get("opA"),
+        "n_rows": row.get("n_rows"),
+        "n_cols": row.get("n_cols"),
+        "nnz": row.get("nnz"),
+        "flagsparse_ms": row.get("flagsparse_ms"),
+        "pytorch_ms": row.get("pytorch_ms"),
+        "hipsparse_ms": row.get("hipsparse_ms"),
+        "pytorch_speedup": row.get("pytorch_speedup"),
+        "hipsparse_speedup": row.get("hipsparse_speedup"),
+        "pt_status": row.get("pt_status"),
+        "hs_status": row.get("hs_status"),
+        "status": row.get("status"),
+        "err_ref": row.get("err_ref"),
+        "err_res": row.get("err_res"),
+        "err_pt": row.get("err_pt"),
+        "err_hs": row.get("err_hs"),
+        "pytorch_reason": row.get("pytorch_reason"),
+        "hipsparse_reason": row.get("hipsparse_reason"),
+        "error": row.get("error"),
+    }
+
+
+SPSV_CSV_FIELDNAMES = (
+    "matrix", "value_dtype", "index_dtype", "opA", "n_rows", "n_cols",
+    "nnz", "flagsparse_ms", "pytorch_ms", "hipsparse_ms",
+    "pytorch_speedup", "hipsparse_speedup", "pt_status",
+    "hs_status", "status", "err_ref", "err_res", "err_pt", "err_hs",
+    "pytorch_reason", "hipsparse_reason", "error",
+)
+
+
+def _open_spsv_csv_checkpoint(csv_path):
+    """Create a CSV and make each later case result durable immediately."""
+    csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+    writer = csv.DictWriter(csv_file, fieldnames=SPSV_CSV_FIELDNAMES)
+    writer.writeheader()
+    csv_file.flush()
+    os.fsync(csv_file.fileno())
+    return csv_file, writer
+
+
+def _checkpoint_spsv_csv_row(csv_file, writer, row):
+    writer.writerow(
+        {
+            key: "" if value is None else value
+            for key, value in _csv_export_row_spsv(row).items()
+        }
+    )
+    csv_file.flush()
+    os.fsync(csv_file.fileno())
+
+
+def _empty_csv_case_row_spsv(path, value_dtype, index_dtype, op_mode, status, error):
+    return {
+        "matrix": os.path.basename(path),
+        "value_dtype": _dtype_name(value_dtype),
+        "index_dtype": _dtype_name(index_dtype),
+        "opA": op_mode,
+        "n_rows": "ERR",
+        "n_cols": "ERR",
+        "nnz": "ERR",
+        "flagsparse_ms": None,
+        "pytorch_ms": None,
+        "hipsparse_ms": None,
+        "pytorch_speedup": None,
+        "hipsparse_speedup": None,
+        "pt_status": "N/A",
+        "hs_status": "N/A",
+        "status": status,
+        "err_ref": None,
+        "err_res": None,
+        "err_pt": None,
+        "err_hs": None,
+        "pytorch_reason": None,
+        "hipsparse_reason": None,
+        "error": error,
+    }
+
+
+def _tol_for_dtype(dtype):
+    if dtype in (torch.float32, torch.complex64):
+        return 1e-4, 1e-2
+    return 1e-12, 1e-10
+
+
+def _stable_case_seed(*parts):
+    raw = "|".join(str(part) for part in parts).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(raw).digest()[:8], "little") % (2**63)
+
+
+def _generator_for_seed(seed):
+    if seed is None:
+        return None
+    gen = torch.Generator()
+    gen.manual_seed(int(seed))
+    return gen
+
+
+def _randn_by_dtype(n, dtype, device, generator=None):
+    if dtype in (torch.float32, torch.float64):
+        return torch.randn(n, dtype=dtype, device=device, generator=generator)
+    base = torch.float32 if dtype == torch.complex64 else torch.float64
+    real = torch.randn(n, dtype=base, device=device, generator=generator)
+    imag = torch.randn(n, dtype=base, device=device, generator=generator)
+    return torch.complex(real, imag)
+
+
+def _tensor_from_scalar_values(values, dtype, device):
+    return torch.tensor(values, dtype=dtype, device=device)
+
+
+def _matrix_market_value(parts, mm_field):
+    if mm_field == "complex":
+        if len(parts) < 4:
+            raise ValueError("MatrixMarket complex entry requires real and imag parts")
+        return complex(float(parts[2]), float(parts[3]))
+    if len(parts) >= 3:
+        return float(parts[2])
+    if mm_field == "pattern":
+        return 1.0
+    raise ValueError("MatrixMarket entry is missing a numeric value")
+
+
+def _effective_csr_for_op(data, indices, indptr, shape, *, lower, op_mode):
+    data_tri, indices_tri, indptr_tri = _extract_triangular_csr(
+        data, indices, indptr, shape, lower=lower
+    )
+    if op_mode == "TRANS":
+        data_eff, indices_eff, indptr_eff = _csr_transpose(
+            data_tri,
+            indices_tri,
+            indptr_tri,
+            shape,
+            conjugate=False,
+        )
+    elif op_mode == "CONJ":
+        data_eff, indices_eff, indptr_eff = _csr_transpose(
+            data_tri,
+            indices_tri,
+            indptr_tri,
+            shape,
+            conjugate=True,
+        )
+    else:
+        data_eff = data_tri
+        indices_eff = indices_tri
+        indptr_eff = indptr_tri
+    return data_eff, indices_eff, indptr_eff
+
+
+def _extract_triangular_csr(data, indices, indptr, shape, *, lower):
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if data.numel() == 0:
+        return (
+            data,
+            torch.empty(0, dtype=torch.int64, device=data.device),
+            torch.zeros(n_rows + 1, dtype=torch.int64, device=data.device),
+        )
+    row = torch.repeat_interleave(
+        torch.arange(n_rows, device=data.device, dtype=torch.int64),
+        indptr.to(torch.int64)[1:] - indptr.to(torch.int64)[:-1],
+    )
+    col = indices.to(torch.int64)
+    keep = col <= row if lower else col >= row
+    row = row[keep]
+    col = col[keep]
+    data_eff = data[keep]
+    key = row * max(1, n_cols) + col
+    try:
+        order = torch.argsort(key, stable=True)
+    except TypeError:
+        order = torch.argsort(key)
+    row = row[order]
+    col = col[order]
+    data_eff = data_eff[order]
+    nnz_per_row = torch.bincount(row, minlength=n_rows)
+    indptr_eff = torch.zeros(n_rows + 1, dtype=torch.int64, device=data.device)
+    indptr_eff[1:] = torch.cumsum(nnz_per_row, dim=0)
+    return data_eff.contiguous(), col.contiguous(), indptr_eff
+
+
+def _build_csr_tensor_for_op(data, indices, indptr, shape, op_mode, *, lower):
+    data_eff, indices_eff, indptr_eff = _effective_csr_for_op(
+        data, indices, indptr, shape, lower=lower, op_mode=op_mode
+    )
+    return torch.sparse_csr_tensor(
+        indptr_eff,
+        indices_eff,
+        data_eff,
+        size=shape,
+        device=data.device,
+    )
+
+
+def _benchmark_pytorch_reference(data, indices, indptr, shape, b, *, lower, op_mode):
+    try:
+        sparse_spsolve = getattr(torch.sparse, "spsolve", None)
+        if sparse_spsolve is None:
+            raise NotImplementedError("torch.sparse.spsolve is unavailable")
+        A_csr = _build_csr_tensor_for_op(
+            data, indices, indptr, shape, op_mode, lower=lower
+        )
+        if not A_csr.is_cuda:
+            raise RuntimeError("torch.sparse.spsolve CUDA path is unavailable")
+        torch.cuda.synchronize()
+        e0 = torch.cuda.Event(True)
+        e1 = torch.cuda.Event(True)
+        e0.record()
+        x_ref = sparse_spsolve(A_csr, b)
+        e1.record()
+        torch.cuda.synchronize()
+        ms = e0.elapsed_time(e1)
+        return x_ref.to(b.dtype), ms, "gpu_sparse", None
+    except Exception as sparse_err:
+        if "out of memory" in str(sparse_err).lower() and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return None, None, "unavailable", f"PyTorch sparse solve unavailable ({sparse_err})"
+
+
+def _sparse_ref_inputs(data, b):
+    return data, b
+
+
+def _supported_csr_full_ops(value_dtype, index_dtype):
+    if value_dtype not in CSR_FULL_VALUE_DTYPES:
+        return []
+    if index_dtype == torch.int32:
+        return ["NON", "TRANS", "CONJ"]
+    if index_dtype == torch.int64:
+        return ["NON", "TRANS", "CONJ"]
+    return []
+
+
+def _build_random_triangular_csr(n, value_dtype, index_dtype, device, lower=True):
+    """Build a well-conditioned triangular CSR for real and complex dtypes."""
+    max_bandwidth = max(4, min(n, 16))
+    rows_host = []
+    cols_host = []
+    vals_host = []
+    row_off_abs = [0.0] * n
+    col_off_abs = [0.0] * n
+    if value_dtype == torch.float32:
+        base_real_dtype = torch.float32
+    elif value_dtype == torch.float64:
+        base_real_dtype = torch.float64
+    elif value_dtype == torch.complex64:
+        base_real_dtype = torch.float32
+    else:
+        base_real_dtype = torch.float64
+
+    for i in range(n):
+        if lower:
+            cand_cols = list(range(0, i + 1))
+        else:
+            cand_cols = list(range(i, n))
+        if not cand_cols:
+            cand_cols = [i]
+        diag_col = i
+        off_cand = [c for c in cand_cols if c != diag_col]
+        k_off = min(len(off_cand), max_bandwidth - 1)
+        if k_off > 0:
+            perm = torch.randperm(len(off_cand))[:k_off].tolist()
+            off_cols = [off_cand[j] for j in perm]
+        else:
+            off_cols = []
+        if value_dtype in (torch.complex64, torch.complex128):
+            off_vals = torch.complex(
+                torch.randn(len(off_cols), dtype=base_real_dtype, device=device).mul_(0.01),
+                torch.randn(len(off_cols), dtype=base_real_dtype, device=device).mul_(0.01),
+            )
+            off_vals_host = [complex(v) for v in off_vals.cpu().tolist()]
+        else:
+            off_vals = torch.randn(len(off_cols), dtype=base_real_dtype, device=device).mul_(0.01)
+            off_vals_host = off_vals.cpu().tolist()
+        for c, v in zip(off_cols, off_vals_host):
+            rows_host.append(i)
+            cols_host.append(int(c))
+            vals_host.append(v)
+            mag = abs(v)
+            row_off_abs[i] += mag
+            col_off_abs[int(c)] += mag
+
+    for i in range(n):
+        diag_mag = (
+            SPSV_TRIANGULAR_DIAG_DOMINANCE * max(row_off_abs[i], col_off_abs[i]) + 1.0
+        )
+        diag_val = (
+            complex(diag_mag, 0.0)
+            if value_dtype in (torch.complex64, torch.complex128)
+            else diag_mag
+        )
+        rows_host.append(i)
+        cols_host.append(i)
+        vals_host.append(diag_val)
+
+    rows_t = torch.tensor(rows_host, dtype=torch.int64, device=device)
+    cols_t = torch.tensor(cols_host, dtype=torch.int64, device=device)
+    vals_t = torch.tensor(vals_host, dtype=value_dtype, device=device)
+    order = torch.argsort(rows_t * max(1, n) + cols_t)
+    rows_t = rows_t[order]
+    cols_t = cols_t[order]
+    vals_t = vals_t[order]
+    nnz_per_row = torch.bincount(rows_t, minlength=n)
+    indptr = torch.zeros(n + 1, dtype=torch.int64, device=device)
+    indptr[1:] = torch.cumsum(nnz_per_row, dim=0)
+    indices = cols_t.to(index_dtype)
+    return vals_t, indices, indptr, (n, n)
+
+def _csr_to_coo(data, indices, indptr, shape, index_dtype=torch.int64):
+    n_rows = int(shape[0])
+    row = torch.repeat_interleave(
+        torch.arange(n_rows, device=data.device, dtype=index_dtype),
+        indptr[1:] - indptr[:-1],
+    )
+    col = indices.to(index_dtype)
+    return data, row, col
+
+
+def _csr_transpose(data, indices, indptr, shape, conjugate=False):
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if data.numel() == 0:
+        return (
+            data,
+            torch.empty(0, dtype=torch.int64, device=data.device),
+            torch.zeros(n_cols + 1, dtype=torch.int64, device=data.device),
+        )
+
+    row, col = _csr_to_coo(data, indices, indptr, shape)[1:]
+    row_t = col
+    col_t = row
+    key = row_t * max(1, n_rows) + col_t
+    try:
+        order = torch.argsort(key, stable=True)
+    except TypeError:
+        order = torch.argsort(key)
+
+    row_t = row_t[order]
+    col_t = col_t[order]
+    data_eff = data.conj() if conjugate and torch.is_complex(data) else data
+    data_t = data_eff[order]
+    nnz_per_row = torch.bincount(row_t, minlength=n_cols)
+    indptr_t = torch.zeros(n_cols + 1, dtype=torch.int64, device=data.device)
+    indptr_t[1:] = torch.cumsum(nnz_per_row, dim=0)
+    return data_t, col_t.to(torch.int64), indptr_t
+
+
+def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None, lower=True):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    header_info = None
+    mm_field = "real"
+    mm_symmetry = "general"
+    row_maps = None
+
+    def _accum_tri(row_maps_local, r, c, v):
+        keep = c < r if lower else c > r
+        if not keep:
+            return
+        row = row_maps_local[r]
+        row[c] = row.get(c, 0.0) + v
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if line.startswith("%%MatrixMarket"):
+                parts = line.split()
+                if len(parts) >= 5:
+                    mm_field = parts[3].lower()
+                    mm_symmetry = parts[4].lower()
+                continue
+            if line.startswith("%"):
+                continue
+            if not header_info and line:
+                parts = line.split()
+                n_rows = int(parts[0])
+                n_cols = int(parts[1])
+                nnz = int(parts[2]) if len(parts) > 2 else 0
+                header_info = (n_rows, n_cols, nnz)
+                if n_rows != n_cols:
+                    raise ValueError("SpSV requires square matrices")
+                row_maps = [dict() for _ in range(n_rows)]
+                continue
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            r = int(parts[0]) - 1
+            c = int(parts[1]) - 1
+            v = _matrix_market_value(parts, mm_field)
+            _accum_tri(row_maps, r, c, v)
+            if mm_symmetry == "symmetric" and r != c:
+                _accum_tri(row_maps, c, r, v)
+            elif mm_symmetry == "hermitian" and r != c:
+                _accum_tri(
+                    row_maps,
+                    c,
+                    r,
+                    v.conjugate() if isinstance(v, complex) else v,
+                )
+            elif mm_symmetry == "skew-symmetric" and r != c:
+                _accum_tri(row_maps, c, r, -v)
+
+    if header_info is None:
+        raise ValueError(f"Cannot parse .mtx header: {file_path}")
+    n_rows, n_cols, _nnz = header_info
+    row_off_abs = [0.0] * n_rows
+    col_off_abs = [0.0] * n_cols
+    for r, row in enumerate(row_maps):
+        for c, v in row.items():
+            mag = abs(v)
+            row_off_abs[r] += mag
+            col_off_abs[c] += mag
+
+    for r in range(n_rows):
+        # Make the generated triangular system stable for both A and op(A).
+        row_maps[r][r] = (
+            SPSV_TRIANGULAR_DIAG_DOMINANCE * max(row_off_abs[r], col_off_abs[r]) + 1.0
+        )
+
+    cols_s = []
+    vals_s = []
+    indptr_list = [0]
+    for r in range(n_rows):
+        row = row_maps[r]
+        for c in sorted(row.keys()):
+            cols_s.append(c)
+            vals_s.append(row[c])
+        indptr_list.append(len(cols_s))
+    data = _tensor_from_scalar_values(vals_s, dtype, device)
+    indices = torch.tensor(cols_s, dtype=torch.int64, device=device)
+    indptr = torch.tensor(indptr_list, dtype=torch.int64, device=device)
+    return data, indices, indptr, (n_rows, n_cols)
+
+
+def _coo_inputs_for_csv(data, indices, indptr, shape, index_dtype=torch.int64):
+    """Build normal COO inputs from canonical CSR while preserving matrix metadata."""
+    data_c, row_c, col_c = _csr_to_coo(
+        data, indices, indptr, shape, index_dtype=index_dtype
+    )
+    return data_c, row_c, col_c
+
+
+def _random_rhs_for_spsv(shape, value_dtype, device, op_mode="NON", seed=None):
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    rhs_size = n_rows if op_mode == "NON" else n_cols
+    if seed is None:
+        return _randn_by_dtype(rhs_size, value_dtype, device)
+    rhs = _randn_by_dtype(
+        rhs_size,
+        value_dtype,
+        torch.device("cpu"),
+        generator=_generator_for_seed(seed),
+    )
+    return rhs.to(device)
+
+
+def _apply_csr_op(data, indices, indptr, x, shape, op_mode, *, lower):
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    data_eff, indices_eff, indptr_eff = _effective_csr_for_op(
+        data, indices, indptr, shape, lower=lower, op_mode=op_mode
+    )
+    row = torch.repeat_interleave(
+        torch.arange(n_rows, device=data.device, dtype=torch.int64),
+        indptr_eff[1:] - indptr_eff[:-1],
+    )
+    col = indices_eff.to(torch.int64)
+    if op_mode == "NON":
+        b = torch.zeros(n_rows, dtype=data.dtype, device=data.device)
+        b.scatter_add_(0, row, data_eff * x[col])
+        return b
+    if op_mode == "TRANS":
+        b = torch.zeros(n_cols, dtype=data.dtype, device=data.device)
+        b.scatter_add_(0, row, data_eff * x[col])
+        return b
+    if op_mode == "CONJ":
+        b = torch.zeros(n_cols, dtype=data.dtype, device=data.device)
+        b.scatter_add_(0, row, data_eff * x[col])
+        return b
+    raise ValueError("op_mode must be 'NON', 'TRANS', or 'CONJ'")
+
+
+def _solution_residual_metrics(data, indices, indptr, shape, x, b, value_dtype, op_mode, *, lower):
+    atol, rtol = _tol_for_dtype(value_dtype)
+    b_recon = _apply_csr_op(data, indices, indptr, x, shape, op_mode, lower=lower)
+    err_res = (
+        float(torch.max(torch.abs(b_recon - b)).item())
+        if b.numel() > 0
+        else 0.0
+    )
+    ok_res = torch.allclose(b_recon, b, atol=atol, rtol=rtol)
+    return err_res, ok_res
+
+
+def _benchmark_flagsparse(call, *, warmup=WARMUP, iters=ITERS):
+    x = None
+    for _ in range(warmup):
+        x = call()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(iters):
+        e0 = torch.cuda.Event(True)
+        e1 = torch.cuda.Event(True)
+        e0.record()
+        x = call()
+        e1.record()
+        torch.cuda.synchronize()
+        times.append(e0.elapsed_time(e1))
+    return x, _allinone_filtered_avg_ms(times)
+
+
+def _analyze_flagsparse_spsv_csr_reuse(
+    data,
+    indices,
+    indptr,
+    shape,
+    *,
+    lower=True,
+    transpose=False,
+    solve_kind=None,
+):
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    descr = fs_spsv_impl.flagsparse_spsv_analysis_csr(
+        data,
+        indices,
+        indptr,
+        shape,
+        lower=lower,
+        transpose=transpose,
+        solve_kind=solve_kind,
+        clear_cache=True,
+    )
+    workspace = fs_spsv_impl.flagsparse_spsv_create_workspace(descr)
+    if descr.solve_kind == "transpose_cw":
+        fs_spsv_impl.flagsparse_spsv_preprocess_csr(descr, workspace=workspace)
+    torch.cuda.synchronize()
+    return descr, workspace, (time.perf_counter() - t0) * 1000.0
+
+
+def _benchmark_flagsparse_spsv_csr_reuse(
+    descr,
+    workspace,
+    b,
+    *,
+    warmup=WARMUP,
+    iters=ITERS,
+):
+    return _benchmark_flagsparse(
+        lambda: fs_spsv_impl.flagsparse_spsv_solve_csr(
+            descr,
+            b,
+            workspace=workspace,
+        ),
+        warmup=warmup,
+        iters=iters,
+    )
+
+
+def _prepare_flagsparse_spsv_workspace_for_b(descr, workspace, b):
+    del b
+    if descr.solve_kind == "transpose_cw":
+        fs_spsv_impl.flagsparse_spsv_preprocess_csr(descr, workspace=workspace)
+
+
+def _reanalyze_flagsparse_spsv_workspace(descr, workspace):
+    if descr.solve_kind == "transpose_cw":
+        fs_spsv_impl.flagsparse_spsv_preprocess_csr(descr, workspace=workspace)
+
+
+def _cleanup_flagsparse_spsv_workspace(workspace):
+    del workspace
+
+
+def _benchmark_flagsparse_spsv_full_round(
+    analyze_call,
+    make_workspace_call,
+    prepare_call,
+    analysis_extra_call,
+    solve_call,
+    cleanup_call,
+    warmup,
+    iters,
+):
+    warmup = max(0, int(warmup))
+    iters = max(1, int(iters))
+    x = None
+    setup_descr = analyze_call()
+    workspace = make_workspace_call(setup_descr)
+    prepare_call(setup_descr, workspace)
+    try:
+        for _ in range(warmup):
+            torch.cuda.synchronize()
+            descr = analyze_call()
+            analysis_extra_call(descr, workspace)
+            x = solve_call(descr, workspace)
+            torch.cuda.synchronize()
+
+        analysis_times = []
+        solve_times = []
+        for _ in range(iters):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            descr = analyze_call()
+            analysis_extra_call(descr, workspace)
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            x = solve_call(descr, workspace)
+            torch.cuda.synchronize()
+            t2 = time.perf_counter()
+            analysis_times.append((t1 - t0) * 1000.0)
+            solve_times.append((t2 - t1) * 1000.0)
+    finally:
+        cleanup_call(workspace)
+
+    analysis_ms = _allinone_filtered_avg_ms(analysis_times)
+    solve_ms = _allinone_filtered_avg_ms(solve_times)
+    return x, analysis_ms, solve_ms
+
+
+def _benchmark_flagsparse_spsv_csr(
+    data,
+    indices,
+    indptr,
+    b,
+    shape,
+    *,
+    lower=True,
+    transpose=False,
+    solve_kind=None,
+    warmup=WARMUP,
+    iters=ITERS,
+):
+    return _benchmark_flagsparse(
+        lambda: fs_spsv_impl.flagsparse_spsv_csr(
+            data,
+            indices,
+            indptr,
+            b,
+            shape,
+            lower=lower,
+            transpose=transpose,
+            solve_kind=solve_kind,
+        ),
+        warmup=warmup,
+        iters=iters,
+    )
+
+
+def _benchmark_flagsparse_spsv_csr_split(
+    data,
+    indices,
+    indptr,
+    b,
+    shape,
+    *,
+    lower=True,
+    transpose=False,
+    solve_kind=None,
+):
+    op_mode = fs_spsv_impl._normalize_spsv_transpose_mode(transpose)
+    data_tri, indices_tri, indptr_tri = _extract_triangular_csr(
+        data, indices, indptr, shape, lower=lower
+    )
+    warmup, iters = _spsv_benchmark_schedule(
+        int(data_tri.numel()),
+        "NON" if op_mode == "N" else ("TRANS" if op_mode == "T" else "CONJ"),
+        data.dtype,
+        fmt="CSR",
+    )
+    def analyze_call():
+        fs_spsv_impl._clear_spsv_csr_preprocess_cache()
+        return fs_spsv_impl.flagsparse_spsv_analysis_csr(
+            data_tri,
+            indices_tri,
+            indptr_tri,
+            shape,
+            lower=lower,
+            transpose=transpose,
+            solve_kind=solve_kind,
+            clear_cache=False,
+        )
+
+    def solve_call(descr, workspace):
+        return fs_spsv_impl.flagsparse_spsv_solve_csr(
+            descr,
+            b,
+            workspace=workspace,
+        )
+
+    return _benchmark_flagsparse_spsv_full_round(
+        analyze_call,
+        fs_spsv_impl.flagsparse_spsv_create_workspace,
+        lambda descr, workspace: _prepare_flagsparse_spsv_workspace_for_b(
+            descr, workspace, b
+        ),
+        _reanalyze_flagsparse_spsv_workspace,
+        solve_call,
+        _cleanup_flagsparse_spsv_workspace,
+        warmup,
+        iters,
+    )
+
+
+def _benchmark_flagsparse_spsv_coo_split(
+    data,
+    row,
+    col,
+    b,
+    shape,
+    *,
+    lower=True,
+    transpose=False,
+    solve_kind=None,
+):
+    data, input_index_dtype, row64, col64, b, n_rows, n_cols = fs_spsv_impl._prepare_spsv_coo_inputs(
+        data, row, col, b, shape
+    )
+    trans_mode = fs_spsv_impl._normalize_spsv_transpose_mode(transpose)
+    if trans_mode == "N":
+        fs_spsv_impl._validate_spsv_non_trans_combo(data.dtype, input_index_dtype, "COO")
+    else:
+        fs_spsv_impl._validate_spsv_trans_combo(data.dtype, input_index_dtype, "COO")
+    data_csr, indices_csr, indptr_csr = fs_spsv_impl._coo2csr_for_spsv(
+        data, row64, col64, n_rows, assume_ordered=False
+    )
+    data_tri, indices_tri, indptr_tri = _extract_triangular_csr(
+        data_csr, indices_csr, indptr_csr, (n_rows, n_cols), lower=lower
+    )
+    warmup, iters = _spsv_benchmark_schedule(
+        int(data_tri.numel()),
+        "NON" if trans_mode == "N" else ("TRANS" if trans_mode == "T" else "CONJ"),
+        data.dtype,
+        fmt="COO",
+    )
+    def analyze_call():
+        fs_spsv_impl._clear_spsv_csr_preprocess_cache()
+        return fs_spsv_impl.flagsparse_spsv_analysis_csr(
+            data_tri,
+            indices_tri,
+            indptr_tri,
+            (n_rows, n_cols),
+            lower=lower,
+            transpose=transpose,
+            solve_kind=solve_kind,
+            clear_cache=False,
+        )
+
+    def solve_call(descr, workspace):
+        return fs_spsv_impl.flagsparse_spsv_solve_csr(
+            descr,
+            b,
+            workspace=workspace,
+        )
+
+    return _benchmark_flagsparse_spsv_full_round(
+        analyze_call,
+        fs_spsv_impl.flagsparse_spsv_create_workspace,
+        lambda descr, workspace: _prepare_flagsparse_spsv_workspace_for_b(
+            descr, workspace, b
+        ),
+        _reanalyze_flagsparse_spsv_workspace,
+        solve_call,
+        _cleanup_flagsparse_spsv_workspace,
+        warmup,
+        iters,
+    )
+
+
+def _benchmark_sparse_ref_lower_csr_or_coo(
+    fmt,
+    data,
+    indices,
+    indptr,
+    shape,
+    b,
+    warmup,
+    iters,
+    lower,
+):
+    """Triangular solve via hipSPARSE-on-ROCm or CuPy-on-CUDA."""
+    if fs_spsv_impl._is_rocm_runtime():
+        sparse_ref = fs_spsv_impl._benchmark_spsv_csr_sparse_ref(
+            data,
+            indices,
+            indptr,
+            b,
+            shape,
+            lower=lower,
+            unit_diagonal=False,
+            op="non",
+            warmup=warmup,
+            iters=iters,
+            fresh_each_iter=True,
+        )
+        return sparse_ref["ms"], sparse_ref["values"]
+    if (
+        cp is None
+        or cpx_sparse is None
+        or cpx_spsolve_triangular is None
+    ):
+        return None, None
+    try:
+        b_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(b.contiguous()))
+        if fmt == "COO":
+            dc, rr, cc = _csr_to_coo(data, indices, indptr, shape)
+            data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(dc.contiguous()))
+            row_cp = cp.from_dlpack(
+                torch.utils.dlpack.to_dlpack(rr.to(torch.int64).contiguous())
+            )
+            col_cp = cp.from_dlpack(
+                torch.utils.dlpack.to_dlpack(cc.to(torch.int64).contiguous())
+            )
+            A_cp = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
+        else:
+            data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data.contiguous()))
+            idx_cp = cp.from_dlpack(
+                torch.utils.dlpack.to_dlpack(indices.to(torch.int64).contiguous())
+            )
+            ptr_cp = cp.from_dlpack(
+                torch.utils.dlpack.to_dlpack(indptr.contiguous())
+            )
+            A_cp = cpx_sparse.csr_matrix((data_cp, idx_cp, ptr_cp), shape=shape)
+        for _ in range(warmup):
+            _ = cpx_spsolve_triangular(
+                A_cp, b_cp, lower=lower, unit_diagonal=False
+            )
+        cp.cuda.runtime.deviceSynchronize()
+        t0 = cp.cuda.Event()
+        t1 = cp.cuda.Event()
+        t0.record()
+        for _ in range(iters):
+            x_cu = cpx_spsolve_triangular(
+                A_cp, b_cp, lower=lower, unit_diagonal=False
+            )
+        t1.record()
+        t1.synchronize()
+        sparse_ref_ms = cp.cuda.get_elapsed_time(t0, t1) / iters
+        x_ref_t = torch.utils.dlpack.from_dlpack(x_cu.toDlpack())
+        x_ref_t = x_ref_t.to(b.dtype)
+        return sparse_ref_ms, x_ref_t
+    except Exception:
+        return None, None
+
+
+def _benchmark_sparse_ref_csr_with_op(
+    data,
+    indices,
+    indptr,
+    shape,
+    b,
+    op_mode,
+    lower,
+    *,
+    return_reason=False,
+):
+    if fs_spsv_impl._is_rocm_runtime():
+        sparse_ref = fs_spsv_impl._benchmark_spsv_csr_sparse_ref(
+            data,
+            indices,
+            indptr,
+            b,
+            shape,
+            lower=lower,
+            unit_diagonal=False,
+            op=op_mode,
+            warmup=WARMUP,
+            iters=ITERS,
+            fresh_each_iter=True,
+        )
+        if return_reason:
+            return sparse_ref["ms"], sparse_ref["values"], sparse_ref.get("reason")
+        return sparse_ref["ms"], sparse_ref["values"]
+    if (
+        cp is None
+        or cpx_sparse is None
+        or cpx_spsolve_triangular is None
+    ):
+        if return_reason:
+            return None, None, "CuPy sparse triangular solve reference is unavailable"
+        return None, None
+    try:
+        warmup, iters = _spsv_benchmark_schedule(int(data.numel()), op_mode, data.dtype, fmt="CSR")
+        data_ref, b_ref = _sparse_ref_inputs(data, b)
+        data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data_ref.contiguous()))
+        idx_cp = cp.from_dlpack(
+            torch.utils.dlpack.to_dlpack(indices.to(torch.int64).contiguous())
+        )
+        ptr_cp = cp.from_dlpack(
+            torch.utils.dlpack.to_dlpack(indptr.to(torch.int64).contiguous())
+        )
+        b_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(b_ref.contiguous()))
+        A_cp = cpx_sparse.csr_matrix((data_cp, idx_cp, ptr_cp), shape=shape)
+        if op_mode == "TRANS":
+            A_eff = A_cp.transpose().tocsr()
+            lower_eff = not lower
+        elif op_mode == "CONJ":
+            A_eff = A_cp.transpose().conj().tocsr()
+            lower_eff = not lower
+        else:
+            A_eff = A_cp
+            lower_eff = lower
+
+        for _ in range(warmup):
+            _ = cpx_spsolve_triangular(
+                A_eff, b_cp, lower=lower_eff, unit_diagonal=False
+            )
+        cp.cuda.runtime.deviceSynchronize()
+        c0 = cp.cuda.Event()
+        c1 = cp.cuda.Event()
+        c0.record()
+        for _ in range(iters):
+            x_cp = cpx_spsolve_triangular(
+                A_eff, b_cp, lower=lower_eff, unit_diagonal=False
+            )
+        c1.record()
+        c1.synchronize()
+        ms = cp.cuda.get_elapsed_time(c0, c1) / iters
+        x_t = torch.utils.dlpack.from_dlpack(x_cp.toDlpack()).to(b.dtype)
+        if return_reason:
+            return ms, x_t, None
+        return ms, x_t
+    except Exception as exc:
+        if return_reason:
+            return None, None, str(exc)
+        return None, None
+
+
+def run_spsv_synthetic_all(lower=True, alg_num=None):
+    if not torch.cuda.is_available():
+        print("CUDA/ROCm device is not available.")
+        return
+    device = torch.device("cuda")
+    sep = "=" * 110
+    print(sep)
+    print("FLAGSPARSE SpSV BENCHMARK (synthetic triangular systems, CSR + COO)")
+    print(sep)
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(
+        f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
+        "(override with --warmup/--iters)"
+    )
+    print(f"Triangle: {'LOWER' if lower else 'UPPER'}")
+    print(f"Algorithm: {_alg_label(alg_num)}")
+    print()
+
+    hdr = (
+        f"{'Fmt':>5} {'opA':>5} {'N':>6} {'FS.ms':>10} {'PT.ms':>10} {'HS.ms':>10} "
+        f"{'PT.spd':>10} {'HS.spd':>10} "
+        f"{'Status':>8} {'Err(PT)':>12} {'Err(HS)':>12}"
+    )
+
+    total = 0
+    failed = 0
+    for value_dtype in VALUE_DTYPES:
+        for index_dtype in INDEX_DTYPES:
+            print("-" * 110)
+            print(
+                f"Value dtype: {_dtype_name(value_dtype):<12} | "
+                f"Index dtype: {_dtype_name(index_dtype):<6}"
+            )
+            print("-" * 110)
+            print(hdr)
+            print("-" * 110)
+            for n in TEST_SIZES:
+                for fmt in ("CSR", "COO"):
+                    op_modes = (
+                        _supported_csr_full_ops(value_dtype, index_dtype)
+                        if fmt == "CSR"
+                        else ["NON"]
+                    )
+                    for op_mode in op_modes:
+                        if not _alg_num_supports_case(
+                            alg_num, fmt, op_mode, lower, value_dtype
+                        ):
+                            continue
+                        data, indices, indptr, shape = _build_random_triangular_csr(
+                            n, value_dtype, index_dtype, device, lower=lower
+                        )
+                        rhs_op = op_mode if fmt == "CSR" else "NON"
+                        b = _random_rhs_for_spsv(
+                            shape,
+                            value_dtype,
+                            device,
+                            op_mode=rhs_op,
+                            seed=_stable_case_seed(
+                                "synthetic",
+                                "LOWER" if lower else "UPPER",
+                                fmt,
+                                op_mode,
+                                n,
+                                _dtype_name(value_dtype),
+                                _dtype_name(index_dtype),
+                            ),
+                        )
+
+                        torch.cuda.synchronize()
+                        if fmt == "CSR":
+                            x, analysis_ms, t_ms = _benchmark_flagsparse_spsv_csr_split(
+                                data,
+                                indices,
+                                indptr,
+                                b,
+                                shape,
+                                lower=lower,
+                                transpose=op_mode,
+                                solve_kind=_solve_kind_from_alg_num(alg_num),
+                            )
+                        else:
+                            dc, rr, cc = _csr_to_coo(
+                                data, indices, indptr, shape, index_dtype=index_dtype
+                            )
+                            x, analysis_ms, t_ms = _benchmark_flagsparse_spsv_coo_split(
+                                dc,
+                                rr,
+                                cc,
+                                b,
+                                shape,
+                                lower=lower,
+                                transpose=op_mode,
+                                solve_kind=_solve_kind_from_alg_num(alg_num),
+                            )
+                        torch.cuda.synchronize()
+
+                        x_pt, pytorch_ms, _pt_backend, _pt_skip_reason = _benchmark_pytorch_reference(
+                            data,
+                            indices,
+                            indptr,
+                            shape,
+                            b,
+                            lower=lower,
+                            op_mode=op_mode,
+                        )
+                        err_pt = (
+                            float(torch.max(torch.abs(x - x_pt)).item())
+                            if (x_pt is not None and n > 0)
+                            else None
+                        )
+
+                        hipsparse_ms = None
+                        err_hs = None
+                        x_hs_t = None
+                        if fmt == "CSR":
+                            hipsparse_ms, x_hs_t = _benchmark_sparse_ref_csr_with_op(
+                                data, indices, indptr, shape, b, op_mode, lower
+                            )
+                        elif value_dtype in (
+                            torch.float32,
+                            torch.float64,
+                            torch.complex64,
+                            torch.complex128,
+                        ):
+                            hipsparse_ms, x_hs_t = _benchmark_sparse_ref_lower_csr_or_coo(
+                                fmt,
+                                data,
+                                indices,
+                                indptr,
+                                shape,
+                                b,
+                                WARMUP,
+                                ITERS,
+                                lower,
+                            )
+                        if x_hs_t is not None and n > 0:
+                            err_hs = float(
+                                torch.max(torch.abs(x - x_hs_t)).item()
+                            )
+
+                        atol, rtol = _tol_for_dtype(value_dtype)
+                        ok_pt = (
+                            torch.allclose(x, x_pt, atol=atol, rtol=rtol)
+                            if x_pt is not None
+                            else False
+                        )
+                        ok_hs = (
+                            True
+                            if x_hs_t is None
+                            else torch.allclose(x, x_hs_t, atol=atol, rtol=rtol)
+                        )
+                        ok = ok_pt or ok_hs
+                        status = "PASS" if ok else "FAIL"
+                        if not ok:
+                            failed += 1
+                        total += 1
+
+                        flagsparse_ms = _sum_ms(analysis_ms, t_ms)
+                        pytorch_speedup = _safe_ratio(pytorch_ms, flagsparse_ms)
+                        hipsparse_speedup = _safe_ratio(hipsparse_ms, flagsparse_ms)
+                        print(
+                            f"{fmt:>5} {op_mode:>5} {n:>6} {_fmt_ms(flagsparse_ms):>10} {_fmt_ms(pytorch_ms):>10} "
+                            f"{_fmt_ms(hipsparse_ms):>10} {_fmt_ratio(pytorch_speedup):>10} {_fmt_ratio(hipsparse_speedup):>10} "
+                            f"{status:>8} {_fmt_err(err_pt):>12} {_fmt_err(err_hs):>12}"
+                        )
+                        # Synthetic benchmark keeps the main row compact; PyTorch fallback notes
+                        # are only emitted in matrix CSV runs where failed reference checks matter.
+            print("-" * 110)
+            print()
+
+    print(sep)
+    print(f"Total cases: {total}  Failed: {failed}")
+    print(sep)
+
+
+def _run_one_csv_row_coo(path, value_dtype, index_dtype, op_mode, device, lower=True, alg_num=None):
+    data, indices, indptr, shape = _load_mtx_to_csr_torch(
+        path, dtype=value_dtype, device=device, lower=lower
+    )
+    indices = indices.to(index_dtype)
+    indptr = indptr.to(index_dtype)
+    n_rows, n_cols = shape
+    b = _random_rhs_for_spsv(
+        shape,
+        value_dtype,
+        device,
+        op_mode=op_mode,
+        seed=_stable_case_seed(
+            "csv-coo",
+            os.path.basename(path),
+            "LOWER" if lower else "UPPER",
+            op_mode,
+            _dtype_name(value_dtype),
+            _dtype_name(index_dtype),
+        ),
+    )
+    d_in, r_in, c_in = _coo_inputs_for_csv(
+        data, indices, indptr, shape, index_dtype=index_dtype
+    )
+    x, analysis_ms, t_ms = _benchmark_flagsparse_spsv_coo_split(
+        d_in,
+        r_in,
+        c_in,
+        b,
+        shape,
+        lower=lower,
+        transpose=op_mode,
+        solve_kind=_solve_kind_from_alg_num(alg_num),
+    )
+    return _finalize_csv_row(
+        path,
+        value_dtype,
+        index_dtype,
+        op_mode,
+        data,
+        indices,
+        indptr,
+        shape,
+        x,
+        analysis_ms,
+        t_ms,
+        b,
+        n_rows,
+        n_cols,
+        lower=lower,
+    )
+
+
+def _finalize_csv_row(
+    path,
+    value_dtype,
+    index_dtype,
+    op_mode,
+    data,
+    indices,
+    indptr,
+    shape,
+    x,
+    analysis_ms,
+    t_ms,
+    b,
+    n_rows,
+    n_cols,
+    *,
+    lower=True,
+):
+    atol, rtol = _tol_for_dtype(value_dtype)
+    err_res, _ok_res = _solution_residual_metrics(
+        data, indices, indptr, shape, x, b, value_dtype, op_mode, lower=lower
+    )
+    pytorch_ms = None
+    err_pt = None
+    ok_pt = False
+    pt_skip_reason = None
+    x_ref, pytorch_ms, _pt_backend, pt_skip_reason = _benchmark_pytorch_reference(
+        data,
+        indices,
+        indptr,
+        shape,
+        b,
+        lower=lower,
+        op_mode=op_mode,
+    )
+    if x_ref is not None:
+        x_cmp = x
+        x_ref_cmp = x_ref
+        err_pt = (
+            float(torch.max(torch.abs(x_cmp - x_ref_cmp)).item())
+            if n_rows > 0
+            else 0.0
+        )
+        ok_pt = torch.allclose(x_cmp, x_ref_cmp, atol=atol, rtol=rtol)
+
+    hipsparse_ms = None
+    err_hs = None
+    ok_hs = False
+    x_hs_t = None
+    hs_skip_reason = None
+    hipsparse_ms, x_hs_t, hs_skip_reason = _benchmark_sparse_ref_csr_with_op(
+        data, indices, indptr, shape, b, op_mode, lower, return_reason=True
+    )
+    if x_hs_t is not None:
+        x_cmp = x
+        x_hs_cmp = x_hs_t
+        err_hs = (
+            float(torch.max(torch.abs(x_cmp - x_hs_cmp)).item())
+            if n_rows > 0
+            else 0.0
+        )
+        ok_hs = torch.allclose(x_cmp, x_hs_cmp, atol=atol, rtol=rtol)
+
+    status = "PASS" if (ok_pt or ok_hs) else "FAIL"
+    if (not ok_pt) and (not ok_hs) and (err_pt is None and err_hs is None):
+        status = "REF_FAIL"
+    ref_errors = [err for err in (err_pt, err_hs) if err is not None]
+    err_ref = min(ref_errors) if ref_errors else None
+    flagsparse_ms = _sum_ms(analysis_ms, t_ms)
+
+    row = {
+        "matrix": os.path.basename(path),
+        "value_dtype": _dtype_name(value_dtype),
+        "index_dtype": _dtype_name(index_dtype),
+        "opA": op_mode,
+        "n_rows": n_rows,
+        "n_cols": n_cols,
+        "nnz": int(data.numel()),
+        "flagsparse_ms": flagsparse_ms,
+        "pytorch_ms": pytorch_ms,
+        "hipsparse_ms": hipsparse_ms,
+        "pytorch_speedup": _safe_ratio(pytorch_ms, flagsparse_ms),
+        "hipsparse_speedup": _safe_ratio(hipsparse_ms, flagsparse_ms),
+        "pt_status": _status_str(ok_pt, err_pt is not None),
+        "hs_status": _status_str(ok_hs, err_hs is not None),
+        "status": status,
+        "err_ref": err_ref,
+        "err_res": err_res,
+        "err_pt": err_pt,
+        "err_hs": err_hs,
+        "pytorch_reason": pt_skip_reason,
+        "hipsparse_reason": hs_skip_reason,
+        "error": None,
+    }
+    return row, pt_skip_reason
+
+
+def _run_one_csv_row_csr_full(
+    path,
+    value_dtype,
+    index_dtype,
+    op_mode,
+    device,
+    lower=True,
+    alg_num=None,
+    fs_only=False,
+):
+    data, indices, indptr, shape = _load_mtx_to_csr_torch(
+        path, dtype=value_dtype, device=device, lower=lower
+    )
+    indices = indices.to(index_dtype)
+    indptr = indptr.to(index_dtype)
+    n_rows, n_cols = shape
+    b = _random_rhs_for_spsv(
+        shape,
+        value_dtype,
+        device,
+        op_mode=op_mode,
+        seed=_stable_case_seed(
+            "csv-csr",
+            os.path.basename(path),
+            "LOWER" if lower else "UPPER",
+            op_mode,
+            _dtype_name(value_dtype),
+            _dtype_name(index_dtype),
+        ),
+    )
+    x, analysis_ms, t_ms = _benchmark_flagsparse_spsv_csr_split(
+        data,
+        indices,
+        indptr,
+        b,
+        shape,
+        lower=lower,
+        transpose=op_mode,
+        solve_kind=_solve_kind_from_alg_num(alg_num),
+    )
+    return _finalize_csv_row_csr_full(
+        path,
+        value_dtype,
+        index_dtype,
+        op_mode,
+        data,
+        indices,
+        indptr,
+        shape,
+        x,
+        analysis_ms,
+        t_ms,
+        b,
+        n_rows,
+        n_cols,
+        lower=lower,
+        fs_only=fs_only,
+    )
+
+
+def _finalize_csv_row_csr_full(
+    path,
+    value_dtype,
+    index_dtype,
+    op_mode,
+    data,
+    indices,
+    indptr,
+    shape,
+    x,
+    analysis_ms,
+    t_ms,
+    b,
+    n_rows,
+    n_cols,
+    lower=True,
+    fs_only=False,
+):
+    atol, rtol = _tol_for_dtype(value_dtype)
+    err_res, _ok_res = _solution_residual_metrics(
+        data, indices, indptr, shape, x, b, value_dtype, op_mode, lower=lower
+    )
+
+    pytorch_ms = None
+    err_pt = None
+    ok_pt = False
+    pt_skip_reason = None
+    x_ref = None
+    if fs_only:
+        pt_skip_reason = "disabled by --fs-only"
+    else:
+        x_ref, pytorch_ms, _pt_backend, pt_skip_reason = _benchmark_pytorch_reference(
+            data,
+            indices,
+            indptr,
+            shape,
+            b,
+            lower=lower,
+            op_mode=op_mode,
+        )
+    if x_ref is not None:
+        x_cmp = x
+        x_ref_cmp = x_ref
+        err_pt = (
+            float(torch.max(torch.abs(x_cmp - x_ref_cmp)).item())
+            if n_rows > 0
+            else 0.0
+        )
+        ok_pt = torch.allclose(x_cmp, x_ref_cmp, atol=atol, rtol=rtol)
+
+    hipsparse_ms = None
+    err_hs = None
+    ok_hs = False
+    x_hs_t = None
+    hs_skip_reason = None
+    if fs_only:
+        hs_skip_reason = "disabled by --fs-only"
+    else:
+        hipsparse_ms, x_hs_t, hs_skip_reason = _benchmark_sparse_ref_csr_with_op(
+            data, indices, indptr, shape, b, op_mode, lower, return_reason=True
+        )
+    if x_hs_t is not None:
+        x_cmp = x
+        x_hs_cmp = x_hs_t
+        err_hs = (
+            float(torch.max(torch.abs(x_cmp - x_hs_cmp)).item())
+            if n_rows > 0
+            else 0.0
+        )
+        ok_hs = torch.allclose(x_cmp, x_hs_cmp, atol=atol, rtol=rtol)
+
+    status = "FS_ONLY" if fs_only else ("PASS" if (ok_pt or ok_hs) else "FAIL")
+    if (not fs_only) and (not ok_pt) and (not ok_hs) and (err_pt is None and err_hs is None):
+        status = "REF_FAIL"
+    ref_errors = [err for err in (err_pt, err_hs) if err is not None]
+    err_ref = min(ref_errors) if ref_errors else None
+    flagsparse_ms = _sum_ms(analysis_ms, t_ms)
+
+    row = {
+        "matrix": os.path.basename(path),
+        "value_dtype": _dtype_name(value_dtype),
+        "index_dtype": _dtype_name(index_dtype),
+        "opA": op_mode,
+        "n_rows": n_rows,
+        "n_cols": n_cols,
+        "nnz": int(data.numel()),
+        "flagsparse_ms": flagsparse_ms,
+        "pytorch_ms": pytorch_ms,
+        "hipsparse_ms": hipsparse_ms,
+        "pytorch_speedup": _safe_ratio(pytorch_ms, flagsparse_ms),
+        "hipsparse_speedup": _safe_ratio(hipsparse_ms, flagsparse_ms),
+        "pt_status": _status_str(ok_pt, err_pt is not None),
+        "hs_status": _status_str(ok_hs, err_hs is not None),
+        "status": status,
+        "err_ref": err_ref,
+        "err_res": err_res,
+        "err_pt": err_pt,
+        "err_hs": err_hs,
+        "pytorch_reason": pt_skip_reason,
+        "hipsparse_reason": hs_skip_reason,
+        "error": None,
+    }
+    return row, pt_skip_reason
+
+
+def _run_spsv_csv_case_worker(
+    result_queue,
+    fmt,
+    path,
+    value_dtype,
+    index_dtype,
+    op_mode,
+    lower,
+    alg_num,
+    warmup,
+    iters,
+    fs_only,
+):
+    global WARMUP, ITERS
+    WARMUP = max(0, int(warmup))
+    ITERS = max(1, int(iters))
+    try:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA/ROCm device is not available.")
+        device = torch.device("cuda")
+        if fmt == "csr":
+            row, pt_skip = _run_one_csv_row_csr_full(
+                path,
+                value_dtype,
+                index_dtype,
+                op_mode,
+                device,
+                lower=lower,
+                alg_num=alg_num,
+                fs_only=fs_only,
+            )
+        elif fmt == "coo":
+            row, pt_skip = _run_one_csv_row_coo(
+                path,
+                value_dtype,
+                index_dtype,
+                op_mode,
+                device,
+                lower=lower,
+                alg_num=alg_num,
+            )
+        else:
+            raise ValueError(f"unsupported SpSV CSV format: {fmt}")
+        result_queue.put(("ok", (row, pt_skip)))
+    except BaseException as exc:
+        result_queue.put(("error", f"{exc.__class__.__name__}: {exc}"))
+
+
+def _run_spsv_csv_case_with_timeout(
+    fmt,
+    path,
+    value_dtype,
+    index_dtype,
+    op_mode,
+    lower,
+    alg_num,
+    timeout_seconds,
+    fs_only=False,
+):
+    timeout_seconds = max(
+        1, min(int(timeout_seconds), int(SPSV_MAX_CASE_TIMEOUT_SECONDS))
+    )
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue(maxsize=1)
+    proc = ctx.Process(
+        target=_run_spsv_csv_case_worker,
+        args=(
+            result_queue,
+            fmt,
+            path,
+            value_dtype,
+            index_dtype,
+            op_mode,
+            lower,
+            alg_num,
+            WARMUP,
+            ITERS,
+            fs_only,
+        ),
+    )
+    proc.start()
+    proc.join(timeout_seconds)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(10)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        row = _empty_csv_case_row_spsv(
+            path,
+            value_dtype,
+            index_dtype,
+            op_mode,
+            "SKIP",
+            f"timed out after {timeout_seconds} seconds",
+        )
+        return row, None
+
+    try:
+        status, payload = result_queue.get_nowait()
+    except Empty:
+        row = _empty_csv_case_row_spsv(
+            path,
+            value_dtype,
+            index_dtype,
+            op_mode,
+            "ERROR",
+            f"worker exited with code {proc.exitcode} without returning a result",
+        )
+        return row, None
+
+    if status == "ok":
+        return payload
+
+    err_msg = str(payload)
+    status_out = "SKIP" if "SpSV requires square matrices" in err_msg else "ERROR"
+    row = _empty_csv_case_row_spsv(
+        path, value_dtype, index_dtype, op_mode, status_out, err_msg
+    )
+    return row, None
+
+
+def _effective_spsv_case_timeout(case_timeout_seconds):
+    return min(int(case_timeout_seconds), int(SPSV_MAX_CASE_TIMEOUT_SECONDS))
+
+
+def _print_spsv_timeout(path, case_timeout_seconds):
+    print(
+        f"TIMEOUT: {os.path.basename(path)} exceeded "
+        f"{_effective_spsv_case_timeout(case_timeout_seconds)} seconds",
+        flush=True,
+    )
+
+
+def run_all_supported_spsv_csr_csv(
+    mtx_paths,
+    csv_path,
+    lower=True,
+    value_dtypes=None,
+    index_dtypes=None,
+    op_modes=None,
+    alg_num=None,
+    case_timeout_seconds=SPSV_CASE_TIMEOUT_SECONDS,
+    fs_only=False,
+):
+    if not torch.cuda.is_available():
+        print("CUDA/ROCm device is not available.")
+        return
+    device = torch.device("cuda")
+    rows_out = []
+    selected_value_dtypes = value_dtypes or CSR_FULL_VALUE_DTYPES
+    selected_index_dtypes = index_dtypes or CSR_FULL_INDEX_DTYPES
+    selected_op_modes = op_modes or SPSV_OP_MODES
+    checkpoint_file, checkpoint_writer = _open_spsv_csv_checkpoint(csv_path)
+    for value_dtype in selected_value_dtypes:
+        for index_dtype in selected_index_dtypes:
+            supported_op_modes = [
+                op for op in _supported_csr_full_ops(value_dtype, index_dtype)
+                if op in selected_op_modes
+            ]
+            for op_mode in supported_op_modes:
+                if not _alg_num_supports_case(
+                    alg_num, "CSR", op_mode, lower, value_dtype
+                ):
+                    continue
+                print("=" * 150)
+                print(
+                    f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}  |  CSR  |  triA={'LOWER' if lower else 'UPPER'}  |  opA={op_mode}"
+                )
+                print(f"Algorithm: {_alg_label(alg_num)}")
+                if fs_only:
+                    print("Formats: FlagSparse=CSR only (hipSPARSE and PyTorch references disabled)")
+                else:
+                    print(
+                        "Formats: FlagSparse=CSR, hipSPARSE=CSR ref, "
+                        "PyTorch(ms)=official sparse solve reference"
+                    )
+                print(
+                    f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
+                    "(override with --warmup/--iters)"
+                )
+                effective_timeout = _effective_spsv_case_timeout(case_timeout_seconds)
+                print(f"Per-matrix timeout: {effective_timeout} seconds")
+                if fs_only:
+                    print(
+                        "RHS is generated directly. FS_ONLY means no external reference was run; "
+                        "Err(Res)=|op(A)*x-b| is diagnostic only."
+                    )
+                else:
+                    print(
+                        "RHS is generated directly. "
+                        "FS.ms / HS.ms both include fresh analysis/preparation + solve per timed round. "
+                        "PT.spd=PT.ms/FS.ms and HS.spd=HS.ms/FS.ms. "
+                        "Err(Ref)=best |FlagSparse-reference|, Err(Res)=|op(A)*x-b|, "
+                        "Err(PT)=|FlagSparse-PyTorch|, Err(HS)=|FlagSparse-hipSPARSE|. "
+                        "PASS if PyTorch / hipSPARSE reference passes. Residual is diagnostic only."
+                    )
+                print("-" * 150)
+                print(
+                    f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
+                    f"{'FS.ms':>10} {'PT.ms':>10} {'HS.ms':>10} {'PT.spd':>10} {'HS.spd':>10} "
+                    f"{'Status':>6} {'Err(Ref)':>10} {'Err(Res)':>10} {'Err(PT)':>10} {'Err(HS)':>10}"
+                )
+                print("-" * 150)
+                for path in mtx_paths:
+                    try:
+                        print(
+                            f"RUNNING: {os.path.basename(path)} | "
+                            f"dtype={_dtype_name(value_dtype)} | "
+                            f"index={_dtype_name(index_dtype)} | fmt=csr | opA={op_mode}",
+                            flush=True,
+                        )
+                        row, pt_skip = _run_spsv_csv_case_with_timeout(
+                            "csr",
+                            path,
+                            value_dtype,
+                            index_dtype,
+                            op_mode,
+                            lower,
+                            alg_num,
+                            case_timeout_seconds,
+                            fs_only=fs_only,
+                        )
+                        if row["status"] == "SKIP" and row.get("error", "").startswith("timed out"):
+                            _print_spsv_timeout(path, case_timeout_seconds)
+                        rows_out.append(row)
+                        _checkpoint_spsv_csv_row(checkpoint_file, checkpoint_writer, row)
+                        name = os.path.basename(path)[:27]
+                        if len(os.path.basename(path)) > 27:
+                            name = name + "…"
+                        n_rows, n_cols = row["n_rows"], row["n_cols"]
+                        nnz = row["nnz"]
+                        flagsparse_ms = row["flagsparse_ms"]
+                        pytorch_ms = row["pytorch_ms"]
+                        hipsparse_ms = row["hipsparse_ms"]
+                        err_ref, err_res = row["err_ref"], row["err_res"]
+                        err_pt, err_hs = row["err_pt"], row["err_hs"]
+                        status = row["status"]
+                        print(
+                            f"{name:<28} {n_rows:>7} {n_cols:>7} {nnz:>10} "
+                            f"{_fmt_ms(flagsparse_ms):>10} {_fmt_ms(pytorch_ms):>10} {_fmt_ms(hipsparse_ms):>10} "
+                            f"{_fmt_ratio(row['pytorch_speedup']):>10} {_fmt_ratio(row['hipsparse_speedup']):>10} "
+                            f"{status:>6} {_fmt_err(err_ref):>10} {_fmt_err(err_res):>10} {_fmt_err(err_pt):>10} {_fmt_err(err_hs):>10}"
+                        )
+                        if status in ("FAIL", "REF_FAIL"):
+                            if pt_skip:
+                                print(f"  NOTE: {pt_skip}")
+                            if row.get("hipsparse_reason"):
+                                print(f"  NOTE: hipSPARSE reference unavailable ({row['hipsparse_reason']})")
+                        if status in ("SKIP", "ERROR") and row.get("error"):
+                            print(f"  {status}: {row['error']}")
+                    except Exception as e:
+                        err_msg = str(e)
+                        status = "SKIP" if "SpSV requires square matrices" in err_msg else "ERROR"
+                        row = _empty_csv_case_row_spsv(
+                            path, value_dtype, index_dtype, op_mode, status, err_msg
+                        )
+                        rows_out.append(row)
+                        _checkpoint_spsv_csv_row(checkpoint_file, checkpoint_writer, row)
+                        name = os.path.basename(path)[:27]
+                        if len(os.path.basename(path)) > 27:
+                            name = name + "…"
+                        print(
+                            f"{name:<28} {'ERR':>7} {'ERR':>7} {'ERR':>10} "
+                            f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} "
+                            f"{'N/A':>10} {'N/A':>10} "
+                            f"{status:>6} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10}"
+                        )
+                        print(f"  {status}: {e}")
+                print("-" * 150)
+    checkpoint_file.close()
+    print(f"Wrote {len(rows_out)} rows to {csv_path}")
+
+
+def run_all_dtypes_spsv_coo_csv(
+    mtx_paths,
+    csv_path,
+    lower=True,
+    value_dtypes=None,
+    index_dtypes=None,
+    op_modes=None,
+    alg_num=None,
+    case_timeout_seconds=SPSV_CASE_TIMEOUT_SECONDS,
+):
+    if not torch.cuda.is_available():
+        print("CUDA/ROCm device is not available.")
+        return
+    device = torch.device("cuda")
+    rows_out = []
+    selected_value_dtypes = value_dtypes or VALUE_DTYPES
+    selected_index_dtypes = index_dtypes or INDEX_DTYPES
+    for value_dtype in selected_value_dtypes:
+        for index_dtype in selected_index_dtypes:
+            supported_op_modes = [
+                op for op in _supported_csr_full_ops(value_dtype, index_dtype)
+                if op in (op_modes or SPSV_OP_MODES)
+            ]
+            for op_mode in supported_op_modes:
+                if not _alg_num_supports_case(
+                    alg_num, "COO", op_mode, lower, value_dtype
+                ):
+                    continue
+                print("=" * 150)
+                print(
+                    f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}  |  COO"
+                    f"  triA={'LOWER' if lower else 'UPPER'}  |  opA={op_mode}"
+                )
+                print(f"Algorithm: {_alg_label(alg_num)}")
+                print(
+                    "Formats: FlagSparse=COO input routed through CSR SpSV, hipSPARSE=CSR ref, "
+                    "PyTorch(ms)=official sparse solve reference. "
+                    "RHS is generated directly."
+                )
+                print(
+                    f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
+                    "(override with --warmup/--iters)"
+                )
+                effective_timeout = _effective_spsv_case_timeout(case_timeout_seconds)
+                print(f"Per-matrix timeout: {effective_timeout} seconds")
+                print(
+                    "FS.ms / HS.ms both include fresh analysis/preparation + solve per timed round. "
+                    "PT.spd=PT.ms/FS.ms and HS.spd=HS.ms/FS.ms."
+                )
+                print(
+                    "Matrix metadata fields reuse the canonical triangular matrix, matching CSR CSV output."
+                )
+                print(
+                    "Err(Ref)=best |FlagSparse-reference|, Err(Res)=|op(A)*x-b|, "
+                    "Err(PT)=|FlagSparse-PyTorch|, Err(HS)=|FlagSparse-hipSPARSE|. "
+                    "PASS if PyTorch / hipSPARSE reference passes. Residual is diagnostic only."
+                )
+                print("-" * 150)
+                print(
+                    f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
+                    f"{'FS.ms':>10} {'PT.ms':>10} {'HS.ms':>10} {'PT.spd':>10} {'HS.spd':>10} "
+                    f"{'Status':>6} {'Err(Ref)':>10} {'Err(Res)':>10} {'Err(PT)':>10} {'Err(HS)':>10}"
+                )
+                print("-" * 150)
+                for path in mtx_paths:
+                    try:
+                        print(
+                            f"RUNNING: {os.path.basename(path)} | "
+                            f"dtype={_dtype_name(value_dtype)} | "
+                            f"index={_dtype_name(index_dtype)} | fmt=coo | opA={op_mode}",
+                            flush=True,
+                        )
+                        row, pt_skip = _run_spsv_csv_case_with_timeout(
+                            "coo",
+                            path,
+                            value_dtype,
+                            index_dtype,
+                            op_mode,
+                            lower,
+                            alg_num,
+                            case_timeout_seconds,
+                        )
+                        if row["status"] == "SKIP" and row.get("error", "").startswith("timed out"):
+                            _print_spsv_timeout(path, case_timeout_seconds)
+                        rows_out.append(row)
+                        name = os.path.basename(path)[:27]
+                        if len(os.path.basename(path)) > 27:
+                            name = name + "…"
+                        n_rows, n_cols = row["n_rows"], row["n_cols"]
+                        nnz = row["nnz"]
+                        flagsparse_ms = row["flagsparse_ms"]
+                        pytorch_ms = row["pytorch_ms"]
+                        hipsparse_ms = row["hipsparse_ms"]
+                        err_ref, err_res = row["err_ref"], row["err_res"]
+                        err_pt, err_hs = row["err_pt"], row["err_hs"]
+                        status = row["status"]
+                        print(
+                            f"{name:<28} {n_rows:>7} {n_cols:>7} {nnz:>10} "
+                            f"{_fmt_ms(flagsparse_ms):>10} {_fmt_ms(pytorch_ms):>10} {_fmt_ms(hipsparse_ms):>10} "
+                            f"{_fmt_ratio(row['pytorch_speedup']):>10} {_fmt_ratio(row['hipsparse_speedup']):>10} "
+                            f"{status:>6} {_fmt_err(err_ref):>10} {_fmt_err(err_res):>10} {_fmt_err(err_pt):>10} {_fmt_err(err_hs):>10}"
+                        )
+                        if status in ("FAIL", "REF_FAIL"):
+                            if pt_skip:
+                                print(f"  NOTE: {pt_skip}")
+                            if row.get("hipsparse_reason"):
+                                print(f"  NOTE: hipSPARSE reference unavailable ({row['hipsparse_reason']})")
+                        if status in ("SKIP", "ERROR") and row.get("error"):
+                            print(f"  {status}: {row['error']}")
+                    except Exception as e:
+                        err_msg = str(e)
+                        status = "SKIP" if "SpSV requires square matrices" in err_msg else "ERROR"
+                        rows_out.append(
+                            _empty_csv_case_row_spsv(
+                                path, value_dtype, index_dtype, op_mode, status, err_msg
+                            )
+                        )
+                        name = os.path.basename(path)[:27]
+                        if len(os.path.basename(path)) > 27:
+                            name = name + "…"
+                        print(
+                            f"{name:<28} {'ERR':>7} {'ERR':>7} {'ERR':>10} "
+                            f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} "
+                            f"{'N/A':>10} {'N/A':>10} {status:>6} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10}"
+                        )
+                        print(f"  {status}: {e}")
+                print("-" * 150)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=SPSV_CSV_FIELDNAMES)
+        w.writeheader()
+        for r in rows_out:
+            w.writerow({k: ("" if v is None else v) for k, v in _csv_export_row_spsv(r).items()})
+    print(f"Wrote {len(rows_out)} rows to {csv_path}")
+
+
+def _check_one_csr_transpose_case(path, value_dtype, index_dtype, op_mode, device, lower=True):
+    data, indices, indptr, shape = _load_mtx_to_csr_torch(
+        path, dtype=value_dtype, device=device, lower=lower
+    )
+    indices = indices.to(index_dtype)
+    indptr = indptr.to(index_dtype)
+    n_rows, n_cols = shape
+    trans_data, trans_indices64, trans_indptr64 = fs_spsv_impl._csr_transpose(
+        data,
+        indices.to(torch.int64),
+        indptr.to(torch.int64),
+        n_rows,
+        n_cols,
+        conjugate=(op_mode == "CONJ"),
+    )
+    trans_shape = (n_cols, n_rows)
+    trans_indices = trans_indices64.to(index_dtype)
+    trans_indptr = trans_indptr64.to(index_dtype)
+
+    probe = _random_rhs_for_spsv(
+        trans_shape,
+        value_dtype,
+        device,
+        op_mode="NON",
+        seed=_stable_case_seed(
+            "check-transpose-action",
+            os.path.basename(path),
+            "LOWER" if lower else "UPPER",
+            op_mode,
+            _dtype_name(value_dtype),
+            _dtype_name(index_dtype),
+        ),
+    )
+    action_ref = _apply_csr_op(
+        data, indices, indptr, probe, shape, op_mode, lower=lower
+    )
+    action_trans = _apply_csr_op(
+        trans_data, trans_indices, trans_indptr, probe, trans_shape, "NON", lower=not lower
+    )
+    action_err = (
+        float(torch.max(torch.abs(action_trans - action_ref)).item())
+        if action_ref.numel() > 0
+        else 0.0
+    )
+    atol, rtol = _tol_for_dtype(value_dtype)
+    action_ok = torch.allclose(action_trans, action_ref, atol=atol, rtol=rtol)
+
+    b = _random_rhs_for_spsv(
+        shape,
+        value_dtype,
+        device,
+        op_mode=op_mode,
+        seed=_stable_case_seed(
+            "check-transpose-solve",
+            os.path.basename(path),
+            "LOWER" if lower else "UPPER",
+            op_mode,
+            _dtype_name(value_dtype),
+            _dtype_name(index_dtype),
+        ),
+    )
+    x_op = fs_spsv_impl.flagsparse_spsv_csr(
+        data,
+        indices,
+        indptr,
+        b,
+        shape,
+        lower=lower,
+        transpose=op_mode,
+    )
+    x_mat = fs_spsv_impl.flagsparse_spsv_csr(
+        trans_data,
+        trans_indices,
+        trans_indptr,
+        b,
+        trans_shape,
+        lower=not lower,
+        transpose="NON",
+    )
+    solve_err = (
+        float(torch.max(torch.abs(x_op - x_mat)).item()) if x_op.numel() > 0 else 0.0
+    )
+    solve_ok = torch.allclose(x_op, x_mat, atol=atol, rtol=rtol)
+
+    ref_err = None
+    ref_ok = None
+    x_ref, _, _, _ = _benchmark_pytorch_reference(
+        data,
+        indices,
+        indptr,
+        shape,
+        b,
+        lower=lower,
+        op_mode=op_mode,
+    )
+    if x_ref is not None:
+        ref_err = (
+            float(torch.max(torch.abs(x_op - x_ref)).item()) if x_op.numel() > 0 else 0.0
+        )
+        ref_ok = torch.allclose(x_op, x_ref, atol=atol, rtol=rtol)
+
+    status = "PASS" if action_ok and solve_ok and (ref_ok is not False) else "FAIL"
+    return {
+        "matrix": os.path.basename(path),
+        "value_dtype": _dtype_name(value_dtype),
+        "index_dtype": _dtype_name(index_dtype),
+        "opA": op_mode,
+        "n_rows": n_rows,
+        "nnz": int(data.numel()),
+        "action_err": action_err,
+        "solve_err": solve_err,
+        "ref_err": ref_err,
+        "status": status,
+    }
+
+
+def run_csr_transpose_check(
+    mtx_paths,
+    lower=True,
+    value_dtypes=None,
+    index_dtypes=None,
+    op_modes=None,
+):
+    if not torch.cuda.is_available():
+        print("CUDA/ROCm device is not available.")
+        return
+    device = torch.device("cuda")
+    selected_value_dtypes = value_dtypes or CSR_FULL_VALUE_DTYPES
+    selected_index_dtypes = index_dtypes or CSR_FULL_INDEX_DTYPES
+    selected_op_modes = [op for op in (op_modes or ("TRANS", "CONJ")) if op in ("TRANS", "CONJ")]
+    if not selected_op_modes:
+        print("--check-transpose only checks TRANS/CONJ; no matching op selected.")
+        return
+
+    print("=" * 150)
+    print(
+        "CSR TRANS/CONJ preprocessing check: "
+        "ActionErr compares materialized op(A) against direct CSR scatter; "
+        "SolveErr compares transpose path against materialized NON path."
+    )
+    print("-" * 150)
+    print(
+        f"{'Matrix':<28} {'dtype':>10} {'index':>7} {'opA':>5} "
+        f"{'N':>7} {'NNZ':>10} {'Status':>6} {'ActionErr':>10} {'SolveErr':>10} {'RefErr':>10}"
+    )
+    print("-" * 150)
+    total = 0
+    failed = 0
+    for value_dtype in selected_value_dtypes:
+        for index_dtype in selected_index_dtypes:
+            for op_mode in selected_op_modes:
+                for path in mtx_paths:
+                    try:
+                        row = _check_one_csr_transpose_case(
+                            path,
+                            value_dtype,
+                            index_dtype,
+                            op_mode,
+                            device,
+                            lower=lower,
+                        )
+                        total += 1
+                        failed += int(row["status"] != "PASS")
+                        name = row["matrix"][:27]
+                        if len(row["matrix"]) > 27:
+                            name += "..."
+                        print(
+                            f"{name:<28} {row['value_dtype']:>10} {row['index_dtype']:>7} {row['opA']:>5} "
+                            f"{row['n_rows']:>7} {row['nnz']:>10} {row['status']:>6} "
+                            f"{_fmt_err(row['action_err']):>10} {_fmt_err(row['solve_err']):>10} {_fmt_err(row['ref_err']):>10}"
+                        )
+                    except Exception as e:
+                        total += 1
+                        failed += 1
+                        name = os.path.basename(path)[:27]
+                        if len(os.path.basename(path)) > 27:
+                            name += "..."
+                        print(
+                            f"{name:<28} {_dtype_name(value_dtype):>10} {_dtype_name(index_dtype):>7} {op_mode:>5} "
+                            f"{'ERR':>7} {'ERR':>10} {'ERROR':>6} "
+                            f"{_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10}"
+                        )
+                        print(f"  ERROR: {e}")
+    print("-" * 150)
+    print(f"Total cases: {total}  Failed: {failed}")
+
+
+def main():
+    global WARMUP, ITERS
+    parser = argparse.ArgumentParser(
+        description="SpSV test: synthetic triangular systems and optional .mtx (CSR/COO), same baselines as CSR."
+    )
+    parser.add_argument(
+        "mtx",
+        nargs="*",
+        help=".mtx file path(s), or directory(ies) to glob for *.mtx",
+    )
+    parser.add_argument(
+        "--synthetic", action="store_true", help="Run synthetic triangular tests"
+    )
+    parser.add_argument(
+        "--csv-csr",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Run full supported CSR SpSV combinations (dtype/index/opA) on .mtx and export CSV",
+    )
+    parser.add_argument(
+        "--csv-coo",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Run all dtypes on .mtx (COO SpSV), same CSV columns as --csv-csr",
+    )
+    parser.add_argument(
+        "--check-transpose",
+        action="store_true",
+        help="Check CSR TRANS/CONJ preprocessing against direct CSR scatter and materialized NON solve",
+    )
+    parser.add_argument(
+        "--upper",
+        action="store_true",
+        help="Use upper-triangular inputs instead of the default lower-triangular inputs",
+    )
+    parser.add_argument(
+        "--ops",
+        type=str,
+        default=None,
+        help="Comma-separated opA filter for CSR/COO CSV, e.g. NON,TRANS,CONJ",
+    )
+    parser.add_argument(
+        "--alg-num",
+        "--alg_num",
+        dest="alg_num",
+        type=_parse_alg_num,
+        default=None,
+        help=(
+            "Algorithm selection compatible with allinone style. "
+            "Supported: 1=ALG1(csr_cw), 2=ALG2(csr_cw_levelschd), "
+            "3=ALG3(csr_roc), 4=ALG4(csr_smblk), 8=ALG8(csr_nnz_balance). "
+            "Omit to use AUTO routing."
+        ),
+    )
+    parser.add_argument(
+        "--value-dtypes",
+        type=str,
+        default=None,
+        help="Comma-separated value dtype filter for CSR CSV, e.g. float,double,complex64,complex128",
+    )
+    parser.add_argument(
+        "--index-dtypes",
+        type=str,
+        default=None,
+        help="Comma-separated index dtype filter for CSR CSV, e.g. int32,int64",
+    )
+    parser.add_argument(
+        "--fs-only",
+        action="store_true",
+        help="For --csv-csr, benchmark FlagSparse only; do not run hipSPARSE or PyTorch references",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=WARMUP,
+        help="Benchmark warmup iterations (Library-main style default: 1)",
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=ITERS,
+        help="Benchmark timed iterations (Library-main style default: 1)",
+    )
+    parser.add_argument(
+        "--case-timeout-seconds",
+        type=int,
+        default=SPSV_CASE_TIMEOUT_SECONDS,
+        help="Skip one .mtx case if it does not finish within this many seconds (default: 180; capped at 180)",
+    )
+    args = parser.parse_args()
+    WARMUP = max(0, int(args.warmup))
+    ITERS = max(1, int(args.iters))
+    lower = not args.upper
+    if args.alg_num in (2, 3, 4, 8):
+        if args.check_transpose:
+            raise ValueError(
+                f"ALG{args.alg_num} matches allinone's NON-only path; --check-transpose is not supported"
+            )
+        if args.ops:
+            op_modes_cli = _parse_op_modes_filter(args.ops)
+            if any(op != "NON" for op in op_modes_cli):
+                raise ValueError(
+                    f"ALG{args.alg_num} matches allinone's NON-only path; use --ops NON"
+                )
+
+    if args.synthetic:
+        run_spsv_synthetic_all(lower=lower, alg_num=args.alg_num)
+        return
+
+    paths = []
+    for p in args.mtx:
+        if os.path.isfile(p) and p.endswith(".mtx"):
+            paths.append(p)
+        elif os.path.isdir(p):
+            paths.extend(sorted(glob.glob(os.path.join(p, "*.mtx"))))
+    if args.check_transpose:
+        if not paths:
+            paths = sorted(glob.glob("*.mtx"))
+        if not paths:
+            print("No .mtx files found for --check-transpose")
+            return
+        value_dtypes = (
+            _parse_value_dtypes_filter(args.value_dtypes)
+            if args.value_dtypes
+            else None
+        )
+        index_dtypes = (
+            _parse_index_dtypes_filter(args.index_dtypes)
+            if args.index_dtypes
+            else None
+        )
+        op_modes = (
+            _parse_op_modes_filter(args.ops)
+            if args.ops
+            else None
+        )
+        run_csr_transpose_check(
+            paths,
+            lower=lower,
+            value_dtypes=value_dtypes,
+            index_dtypes=index_dtypes,
+            op_modes=op_modes,
+        )
+        return
+    if args.csv_csr:
+        if not paths:
+            paths = sorted(glob.glob("*.mtx"))
+        if not paths:
+            print("No .mtx files found for --csv-csr")
+            return
+        value_dtypes = (
+            _parse_value_dtypes_filter(args.value_dtypes)
+            if args.value_dtypes
+            else None
+        )
+        index_dtypes = (
+            _parse_index_dtypes_filter(args.index_dtypes)
+            if args.index_dtypes
+            else None
+        )
+        op_modes = (
+            _parse_op_modes_filter(args.ops)
+            if args.ops
+            else None
+        )
+        run_all_supported_spsv_csr_csv(
+            paths,
+            args.csv_csr,
+            lower=lower,
+            value_dtypes=value_dtypes,
+            index_dtypes=index_dtypes,
+            op_modes=op_modes,
+            alg_num=args.alg_num,
+            case_timeout_seconds=args.case_timeout_seconds,
+            fs_only=args.fs_only,
+        )
+        return
+    if args.csv_coo:
+        if not paths:
+            paths = sorted(glob.glob("*.mtx"))
+        if not paths:
+            print("No .mtx files found for --csv-coo")
+            return
+        value_dtypes = (
+            _parse_value_dtypes_filter(args.value_dtypes)
+            if args.value_dtypes
+            else None
+        )
+        index_dtypes = (
+            _parse_index_dtypes_filter(args.index_dtypes)
+            if args.index_dtypes
+            else None
+        )
+        op_modes = (
+            _parse_op_modes_filter(args.ops)
+            if args.ops
+            else None
+        )
+        run_all_dtypes_spsv_coo_csv(
+            paths,
+            args.csv_coo,
+            lower=lower,
+            value_dtypes=value_dtypes,
+            index_dtypes=index_dtypes,
+            op_modes=op_modes,
+            alg_num=args.alg_num,
+            case_timeout_seconds=args.case_timeout_seconds,
+        )
+        return
+
+    print("Use --synthetic, --csv-csr, or --csv-coo to run SpSV tests.")
+
+
+if __name__ == "__main__":
+    main()

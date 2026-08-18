@@ -62,6 +62,8 @@ from .spmv_coo import (
     flagsparse_spmv_coo,
     prepare_spmv_coo,
 )
+from .spmv_bsr import PreparedBsrSpmv, flagsparse_spmv_bsr, prepare_spmv_bsr
+from .spmv_csc import PreparedCscSpmv, flagsparse_spmv_csc, prepare_spmv_csc
 from .spmm_csr import (
     PreparedCsrSpmmOpt,
     PreparedCsrSpmmRoute,
@@ -89,7 +91,17 @@ from .spmm_csr_opt_alg2 import (
     prepare_spmm_csr_opt_alg2,
     prepare_spmm_csr_opt_alg2_preprocess,
 )
-from .spmm_coo import flagsparse_spmm_coo
+from .spmm_coo import (
+    PreparedCooSpmmRoute,
+    SPMM_COO_ALGORITHMS,
+    SpmmCooAlgorithm,
+    SpmmCooAlgorithmUnavailable,
+    flagsparse_spmm_coo,
+    flagsparse_spmm_coo_run,
+    list_spmm_coo_algorithms,
+    prepare_spmm_coo_route,
+    resolve_spmm_coo_algorithm,
+)
 from .spgemm_csr import SpGEMMPrepared, flagsparse_spgemm_csr, prepare_spgemm_csr
 from .sddmm_csr import SDDMMPrepared, flagsparse_sddmm_csr, prepare_sddmm_csr
 from .spsv import (
@@ -122,9 +134,12 @@ __all__ = [
     "PreparedCoo",
     "PreparedAlphaSpmmAlg1",
     "PreparedCsrSpmv",
+    "PreparedBsrSpmv",
+    "PreparedCscSpmv",
     "PreparedCsrSpmmOpt",
     "PreparedCsrSpmmRoute",
     "PreparedCsrSpmmOptAlg2",
+    "PreparedCooSpmmRoute",
     "SDDMMPrepared",
     "SpGEMMPrepared",
     "FlagSparseDnVecDescr",
@@ -167,6 +182,7 @@ __all__ = [
     "flagsparse_sddmm_csr",
     "flagsparse_spgemm_csr",
     "flagsparse_spmm_coo",
+    "flagsparse_spmm_coo_run",
     "flagsparse_spmm_csr",
     "flagsparse_spmm_csr_opt",
     "flagsparse_spmm_csr_opt_alg1",
@@ -177,6 +193,8 @@ __all__ = [
     "flagsparse_spmv_coo",
     "flagsparse_spmv_coo_tocsr",
     "flagsparse_spmv_csr",
+    "flagsparse_spmv_bsr",
+    "flagsparse_spmv_csc",
     "flagsparse_spsm_coo",
     "flagsparse_spsm_csr",
     "flagsparse_create_dnvec",
@@ -210,16 +228,24 @@ __all__ = [
     "prepare_spmm_csr_opt_alg2",
     "prepare_spmm_csr_opt_alg2_preprocess",
     "prepare_spmm_csr_route",
+    "prepare_spmm_coo_route",
     "prepare_spmv_coo",
     "prepare_spmv_coo_tocsr",
     "prepare_spmv_csr",
+    "prepare_spmv_bsr",
+    "prepare_spmv_csc",
     "pytorch_index_gather",
     "pytorch_index_scatter",
     "normalize_spmm_dcu_strategy",
     "resolve_spmm_dcu_launch_strategy",
     "resolve_spmm_csr_algorithm",
+    "resolve_spmm_coo_algorithm",
     "SPMM_CSR_ALGORITHMS",
+    "SPMM_COO_ALGORITHMS",
     "SpmmCsrAlgorithm",
     "SpmmCsrAlgorithmUnavailable",
+    "SpmmCooAlgorithm",
+    "SpmmCooAlgorithmUnavailable",
     "list_spmm_csr_algorithms",
+    "list_spmm_coo_algorithms",
 ]

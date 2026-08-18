@@ -162,6 +162,28 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "--iters",
         "{iters}",
     ),
+    "spmv_csc": (
+        "tests/test_spmv_csc.py",
+        "{input}",
+        "--csv-csc",
+        "{csv}",
+        "--no-hipsparse",
+        "--warmup",
+        "{warmup}",
+        "--iters",
+        "{iters}",
+    ),
+    "spmv_bsr": (
+        "tests/test_spmv_bsr.py",
+        "{input}",
+        "--csv-bsr",
+        "{csv}",
+        "--no-hipsparse",
+        "--warmup",
+        "{warmup}",
+        "--iters",
+        "{iters}",
+    ),
     "spmv_coo_tocsr": (
         "tests/test_spmv_coo.py",
         "{input}",
@@ -304,6 +326,8 @@ OP_TEST_CONFIGS: dict[str, OperatorTestConfig] = {
     "scatter": OperatorTestConfig("scatter", PERFORMANCE_COMMANDS["scatter"]),
     "spmv_csr": OperatorTestConfig("spmv_csr", PERFORMANCE_COMMANDS["spmv_csr"]),
     "spmv_coo": OperatorTestConfig("spmv_coo", PERFORMANCE_COMMANDS["spmv_coo"]),
+    "spmv_csc": OperatorTestConfig("spmv_csc", PERFORMANCE_COMMANDS["spmv_csc"]),
+    "spmv_bsr": OperatorTestConfig("spmv_bsr", PERFORMANCE_COMMANDS["spmv_bsr"]),
     "spmv_coo_tocsr": OperatorTestConfig(
         "spmv_coo_tocsr", PERFORMANCE_COMMANDS["spmv_coo_tocsr"]
     ),

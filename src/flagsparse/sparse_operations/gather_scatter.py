@@ -3,6 +3,7 @@
 from . import _common as _common_mod
 from ._common import *
 
+import ctypes
 import triton
 import triton.language as tl
 
@@ -15,6 +16,7 @@ _hipsparse_unavailable_reason = _common_mod._hipsparse_unavailable_reason
 _hipsparse_value_type = _common_mod._hipsparse_value_type
 _hipsparse_index_type = _common_mod._hipsparse_index_type
 _benchmark_prepared_cuda_op = _common_mod._benchmark_prepared_cuda_op
+_benchmark_prepared_hip_event_op = _common_mod._benchmark_prepared_hip_event_op
 
 SUPPORTED_SCATTER_VALUE_DTYPES = (
     torch.float16,
@@ -25,8 +27,49 @@ SUPPORTED_SCATTER_VALUE_DTYPES = (
     torch.complex128,
 )
 DEFAULT_GATHER_BLOCK_SIZE = 256
-DEFAULT_GATHER_MAX_PROGRAMS = 2
-DEFAULT_GATHER_NUM_WARPS = 8
+DEFAULT_GATHER_NUM_WARPS = 4
+
+
+def _torch_current_stream_ptr():
+    return _common_mod._torch_current_stream_ptr()
+
+
+def _set_hipsparse_stream(handle, stream="current"):
+    set_stream = getattr(hipsparse, "hipsparseSetStream", None)
+    if set_stream is None:
+        return "hipSPARSE binding does not expose hipsparseSetStream"
+
+    if stream == "current":
+        stream_ptr = _torch_current_stream_ptr()
+        if stream_ptr is None:
+            return "could not resolve torch current CUDA/HIP stream pointer"
+    else:
+        stream_ptr = int(stream)
+
+    if stream_ptr == 0:
+        stream_args = [0, ctypes.c_void_p(0)]
+    else:
+        stream_args = [ctypes.c_void_p(stream_ptr), stream_ptr]
+    if stream_ptr != 0 and HipPointer is not None:
+        try:
+            stream_args.append(HipPointer.fromObj(stream_ptr))
+        except Exception:
+            pass
+
+    last_error = None
+    for stream_arg in stream_args:
+        try:
+            _hip_check_result(set_stream(handle, stream_arg), "hipsparseSetStream")
+            return None
+        except TypeError as exc:
+            last_error = exc
+        except Exception as exc:
+            last_error = exc
+    return f"hipsparseSetStream failed for stream {stream_ptr}: {last_error}"
+
+
+def _set_hipsparse_current_stream(handle):
+    return _set_hipsparse_stream(handle, "current")
 
 
 def _scatter_dtype_error_message():
@@ -49,13 +92,11 @@ def _gather_real_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    num_programs = tl.num_programs(axis=0)
-    for block_start in tl.range(pid * BLOCK_SIZE, nnz, num_programs * BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < nnz
-        indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
-        gathered_values = tl.load(dense_values_ptr + indices, mask=mask, other=0.0)
-        tl.store(sparse_values_ptr + offsets, gathered_values, mask=mask)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < nnz
+    indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
+    gathered_values = tl.load(dense_values_ptr + indices, mask=mask, other=0.0)
+    tl.store(sparse_values_ptr + offsets, gathered_values, mask=mask)
 
 
 @triton.jit
@@ -67,24 +108,22 @@ def _gather_complex_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    num_programs = tl.num_programs(axis=0)
-    for block_start in tl.range(pid * BLOCK_SIZE, nnz, num_programs * BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < nnz
-        indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < nnz
+    indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
 
-        dense_offsets = indices * 2
-        sparse_offsets = offsets * 2
+    dense_offsets = indices * 2
+    sparse_offsets = offsets * 2
 
-        gathered_real = tl.load(
-            dense_values_ri_ptr + dense_offsets, mask=mask, other=0.0
-        )
-        gathered_imag = tl.load(
-            dense_values_ri_ptr + dense_offsets + 1, mask=mask, other=0.0
-        )
+    gathered_real = tl.load(
+        dense_values_ri_ptr + dense_offsets, mask=mask, other=0.0
+    )
+    gathered_imag = tl.load(
+        dense_values_ri_ptr + dense_offsets + 1, mask=mask, other=0.0
+    )
 
-        tl.store(sparse_values_ri_ptr + sparse_offsets, gathered_real, mask=mask)
-        tl.store(sparse_values_ri_ptr + sparse_offsets + 1, gathered_imag, mask=mask)
+    tl.store(sparse_values_ri_ptr + sparse_offsets, gathered_real, mask=mask)
+    tl.store(sparse_values_ri_ptr + sparse_offsets + 1, gathered_imag, mask=mask)
 
 
 @triton.jit
@@ -145,9 +184,7 @@ def _triton_gather_impl(
             raise TypeError("out dtype must match gather output dtype")
         return out
 
-    grid = lambda meta: (
-        min(DEFAULT_GATHER_MAX_PROGRAMS, triton.cdiv(nnz, meta["BLOCK_SIZE"])),
-    )
+    grid = lambda meta: (triton.cdiv(nnz, meta["BLOCK_SIZE"]),)
 
     if not _is_complex_dtype(dense_vector.dtype):
         sparse_values = out
@@ -388,7 +425,9 @@ def _hipsparse_create_dnvec_descriptor(dnvec_ref, size, values, value_type):
     )
 
 
-def _prepare_hipsparse_gather(dense_vector, indices, out=None):
+def _prepare_hipsparse_gather(
+    dense_vector, indices, out=None, require_stream=False, stream="current"
+):
     dense_vector, indices = _prepare_hipsparse_gather_inputs(dense_vector, indices)
     skip_reason = _hipsparse_gather_scatter_skip_reason(
         dense_vector.dtype, indices.dtype, "gather"
@@ -424,6 +463,9 @@ def _prepare_hipsparse_gather(dense_vector, indices, out=None):
     success = False
     try:
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        stream_warning = _set_hipsparse_stream(handle, stream)
+        if require_stream and stream_warning is not None:
+            raise RuntimeError(stream_warning)
         ptr_type = type(handle)
         spvec = ptr_type()
         dnvec = ptr_type()
@@ -450,6 +492,7 @@ def _prepare_hipsparse_gather(dense_vector, indices, out=None):
             "spvec": spvec,
             "dnvec": dnvec,
             "values": sparse_values,
+            "stream_binding_warning": stream_warning,
         }
     finally:
         if not success:
@@ -511,12 +554,15 @@ def hipsparse_gather(dense_vector, indices, out=None, return_metadata=False):
 
 
 def benchmark_hipsparse_gather(dense_vector, indices, warmup, iters, out=None):
-    return _benchmark_prepared_cuda_op(
-        lambda: _prepare_hipsparse_gather(dense_vector, indices, out=out),
+    return _benchmark_prepared_hip_event_op(
+        lambda: _prepare_hipsparse_gather(
+            dense_vector, indices, out=out, require_stream=True, stream=0
+        ),
         _run_hipsparse_gather_prepared,
         _destroy_hipsparse_gather_prepared,
         warmup=warmup,
         iters=iters,
+        event_stream=0,
     )
 
 
@@ -527,6 +573,7 @@ def _prepare_hipsparse_scatter(
     out=None,
     reset_output=True,
     dtype_policy="strict",
+    require_stream=False,
 ):
     sparse_values, indices, _, dense_size, _ = _prepare_scatter_inputs(
         sparse_values,
@@ -569,6 +616,9 @@ def _prepare_hipsparse_scatter(
     success = False
     try:
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        stream_warning = _set_hipsparse_current_stream(handle)
+        if require_stream and stream_warning is not None:
+            raise RuntimeError(stream_warning)
         ptr_type = type(handle)
         spvec = ptr_type()
         dnvec = ptr_type()
@@ -595,6 +645,7 @@ def _prepare_hipsparse_scatter(
             "spvec": spvec,
             "dnvec": dnvec,
             "values": dense_values,
+            "stream_binding_warning": stream_warning,
         }
     finally:
         if not success:
@@ -688,6 +739,7 @@ def benchmark_hipsparse_scatter(
             out=out,
             reset_output=reset_output,
             dtype_policy=dtype_policy,
+            require_stream=True,
         ),
         _run_hipsparse_scatter_prepared,
         _destroy_hipsparse_scatter_prepared,

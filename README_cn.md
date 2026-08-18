@@ -65,6 +65,20 @@ python tests/test_spmv_coo.py --synthetic
 python tests/test_spmv_coo.py <目录/> --csv-coo out.csv
 ```
 
+**test_spmv_csc.py** - 原生 CSC SpMV：
+
+```bash
+python tests/test_spmv_csc.py --synthetic
+python tests/test_spmv_csc.py <目录/> --csv-csc out.csv --ops non,trans,conj --no-hipsparse
+```
+
+**test_spmv_bsr.py** - 原生 BSR SpMV（输出为 padded block-grid 语义）：
+
+```bash
+python tests/test_spmv_bsr.py --synthetic --ops non,trans,conj
+python tests/test_spmv_bsr.py <目录/> --csv-bsr out.csv --block-dims 2,4 --ops non,trans,conj --no-hipsparse
+```
+
 **test_spmv_opt.py** - SpMV 基线 vs 优化对比（仅 `float32` / `float64`）：
 
 ```bash

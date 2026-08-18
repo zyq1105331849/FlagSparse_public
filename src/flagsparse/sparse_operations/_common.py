@@ -101,6 +101,8 @@ __all__ = (
     "_prepare_inputs",
     "_prepare_scatter_inputs",
     "_benchmark_cuda_op",
+    "_benchmark_prepared_cuda_op",
+    "_benchmark_prepared_hip_event_op",
     "cp",
     "cpx_sparse",
     "time",
@@ -397,6 +399,46 @@ def _destroy_hip_event(evt):
         _hip_check_result(hip.hipEventDestroy(evt), "hipEventDestroy")
     except Exception:
         pass
+
+
+def _torch_current_stream_ptr():
+    stream = torch.cuda.current_stream()
+    for attr_name in ("cuda_stream", "hip_stream"):
+        stream_ptr = getattr(stream, attr_name, None)
+        if callable(stream_ptr):
+            stream_ptr = stream_ptr()
+        if stream_ptr is not None:
+            return int(stream_ptr)
+    return None
+
+
+def _hip_event_record_stream(evt, stream, call_name):
+    if stream == "current":
+        stream_ptr = _torch_current_stream_ptr()
+        if stream_ptr is None:
+            raise RuntimeError("could not resolve torch current CUDA/HIP stream pointer")
+    else:
+        stream_ptr = int(stream)
+    if stream_ptr == 0:
+        stream_args = (0, ctypes.c_void_p(0))
+    else:
+        stream_args = (ctypes.c_void_p(stream_ptr), stream_ptr)
+    last_error = None
+    for stream_arg in stream_args:
+        try:
+            _hip_check_result(hip.hipEventRecord(evt, stream_arg), call_name)
+            return
+        except TypeError as exc:
+            last_error = exc
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(
+        f"{call_name} failed for stream {stream_ptr}: {last_error}"
+    ) from last_error
+
+
+def _hip_event_record_current_stream(evt, call_name):
+    _hip_event_record_stream(evt, "current", call_name)
 
 
 def _hipsparse_lookup(container_name, attr_names):
@@ -1855,5 +1897,40 @@ def _benchmark_prepared_cuda_op(prepare_fn, run_fn, destroy_fn, warmup, iters):
     finally:
         _destroy_hip_event(stop_ev)
         _destroy_hip_event(start_ev)
+        if state is not None:
+            destroy_fn(state)
+
+
+def _benchmark_prepared_hip_event_op(
+    prepare_fn, run_fn, destroy_fn, warmup, iters, event_stream="current"
+):
+    if not _is_rocm_runtime() or not _hip_runtime_event_available():
+        return _benchmark_prepared_cuda_op(
+            prepare_fn, run_fn, destroy_fn, warmup=warmup, iters=iters
+        )
+
+    warmup = max(0, int(warmup))
+    iters = max(1, int(iters))
+    state = None
+    start_evt = None
+    stop_evt = None
+    try:
+        state = prepare_fn()
+        output = None
+        for _ in range(warmup):
+            output = run_fn(state)
+
+        torch.cuda.synchronize()
+        start_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(start)")
+        stop_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(stop)")
+        _hip_event_record_stream(start_evt, event_stream, "hipEventRecord(start)")
+        for _ in range(iters):
+            output = run_fn(state)
+        _hip_event_record_stream(stop_evt, event_stream, "hipEventRecord(stop)")
+        _hip_check_result(hip.hipEventSynchronize(stop_evt), "hipEventSynchronize(stop)")
+        return output, _hip_event_elapsed_ms(start_evt, stop_evt) / iters
+    finally:
+        _destroy_hip_event(stop_evt)
+        _destroy_hip_event(start_evt)
         if state is not None:
             destroy_fn(state)

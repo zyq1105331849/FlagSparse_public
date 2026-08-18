@@ -67,6 +67,20 @@ python tests/test_spmv_coo.py --synthetic
 python tests/test_spmv_coo.py <dir/> --csv-coo out.csv
 ```
 
+**test_spmv_csc.py** - native CSC SpMV:
+
+```bash
+python tests/test_spmv_csc.py --synthetic
+python tests/test_spmv_csc.py <dir/> --csv-csc out.csv --ops non,trans,conj --no-hipsparse
+```
+
+**test_spmv_bsr.py** - native BSR SpMV with padded block-grid output:
+
+```bash
+python tests/test_spmv_bsr.py --synthetic --ops non,trans,conj
+python tests/test_spmv_bsr.py <dir/> --csv-bsr out.csv --block-dims 2,4 --ops non,trans,conj --no-hipsparse
+```
+
 **test_spmv_opt.py** - SpMV baseline vs optimised A/B (`float32` / `float64` only):
 
 ```bash

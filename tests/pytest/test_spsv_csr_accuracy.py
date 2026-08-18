@@ -751,7 +751,7 @@ def test_spsv_csr_explicit_levelschd_analysis_builds_only_level_metadata():
 
 
 @pytest.mark.spsv
-def test_spsv_csr_explicit_nnz_balance_route_matches_dense():
+def test_spsv_csr_explicit_nnz_balance_route_matches_dense(monkeypatch):
     device = torch.device("cuda")
     dtype = torch.float64
     n = 96
@@ -759,6 +759,16 @@ def test_spsv_csr_explicit_nnz_balance_route_matches_dense():
     A = A + torch.eye(n, dtype=dtype, device=device) * 3.0
     b = _rand_like(dtype, (n,), device)
     Asp = A.to_sparse_csr()
+
+    def fail_level_schedule_fallback(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("csr_nnz_balance must not use the level-schedule row_map")
+
+    monkeypatch.setattr(
+        fs_spsv_impl,
+        "_triton_spsv_csr_n_lo_cw_levelschd_vector",
+        fail_level_schedule_fallback,
+    )
 
     x = flagsparse_spsv_csr(
         Asp.values(),

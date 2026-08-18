@@ -1404,6 +1404,122 @@ def _run_spmm_coo_route(
         return C, meta
     return C
 
+
+class SpmmCooAlgorithm:
+    """Registered COO SpMM route for the route-based run API."""
+
+    __slots__ = ("name", "display_name", "supported_ops", "supported_dtypes", "route")
+
+    def __init__(self, name, display_name, supported_ops, supported_dtypes, route):
+        self.name = str(name)
+        self.display_name = str(display_name)
+        self.supported_ops = tuple(supported_ops)
+        self.supported_dtypes = tuple(supported_dtypes)
+        self.route = str(route)
+
+
+class SpmmCooAlgorithmUnavailable(RuntimeError):
+    """Raised when a registered COO SpMM algorithm is unavailable."""
+
+
+class PreparedCooSpmmRoute:
+    """Matrix-level COO SpMM route preparation shared by registered algorithms."""
+
+    __slots__ = ("data", "row", "col", "shape", "op", "alg", "route")
+
+    def __init__(self, data, row, col, shape, op, alg, route):
+        self.data = data
+        self.row = row
+        self.col = col
+        self.shape = (int(shape[0]), int(shape[1]))
+        self.op = str(op)
+        self.alg = str(alg)
+        self.route = str(route)
+
+
+SPMM_COO_ALGORITHMS = {
+    "rowrun": SpmmCooAlgorithm(
+        "rowrun",
+        "COO row-run",
+        ("non", "trans", "conj"),
+        SUPPORTED_SPMM_VALUE_DTYPES,
+        "rowrun",
+    ),
+    "atomic": SpmmCooAlgorithm(
+        "atomic",
+        "COO atomic",
+        ("non", "trans", "conj"),
+        SUPPORTED_SPMM_VALUE_DTYPES,
+        "atomic",
+    ),
+}
+
+
+def resolve_spmm_coo_algorithm(alg, op, dtype):
+    alg_name = "rowrun" if alg in (None, "auto") else str(alg).lower()
+    op_name = _spmm_coo_op_to_name(_normalize_spmm_coo_op(op))
+    if alg_name not in SPMM_COO_ALGORITHMS:
+        supported = ", ".join(sorted(SPMM_COO_ALGORITHMS))
+        raise ValueError(f"unsupported COO SpMM algorithm {alg!r}; supported: auto, {supported}")
+    spec = SPMM_COO_ALGORITHMS[alg_name]
+    if op_name not in spec.supported_ops:
+        raise SpmmCooAlgorithmUnavailable(f"COO SpMM algorithm {alg_name!r} does not support op={op_name}")
+    if dtype not in spec.supported_dtypes:
+        raise SpmmCooAlgorithmUnavailable(f"COO SpMM algorithm {alg_name!r} does not support dtype={dtype}")
+    return spec
+
+
+def list_spmm_coo_algorithms(op=None, dtype=None):
+    result = []
+    op_name = None if op is None else _spmm_coo_op_to_name(_normalize_spmm_coo_op(op))
+    for spec in SPMM_COO_ALGORITHMS.values():
+        if op_name is not None and op_name not in spec.supported_ops:
+            continue
+        if dtype is not None and dtype not in spec.supported_dtypes:
+            continue
+        result.append(spec.name)
+    return result
+
+
+def prepare_spmm_coo_route(data, row, col, shape, *, op="non", alg="auto"):
+    op_name = _spmm_coo_op_to_name(_normalize_spmm_coo_op(op))
+    spec = resolve_spmm_coo_algorithm(alg, op_name, data.dtype)
+    return PreparedCooSpmmRoute(data, row, col, shape, op_name, spec.name, spec.route)
+
+
+def flagsparse_spmm_coo_run(
+    prepared,
+    B,
+    *,
+    out=None,
+    return_time=False,
+    return_meta=False,
+    block_n=None,
+    block_nnz=256,
+    launch_strategy=None,
+    dense_layout="auto",
+):
+    if not isinstance(prepared, PreparedCooSpmmRoute):
+        raise TypeError("prepared must be a PreparedCooSpmmRoute")
+    return _run_spmm_coo_route(
+        prepared.data,
+        prepared.row,
+        prepared.col,
+        B,
+        prepared.shape,
+        block_n=block_n,
+        block_nnz=block_nnz,
+        out=out,
+        return_time=return_time,
+        return_meta=return_meta,
+        route=prepared.route,
+        op=prepared.op,
+        transpose=None,
+        launch_strategy=launch_strategy,
+        dense_layout=dense_layout,
+    )
+
+
 def flagsparse_spmm_coo(
     data,
     row,
