@@ -117,7 +117,8 @@ python tests/test_spgemm.py <目录/> --csv results.csv    # 可选：--dtype fl
 
 **test_spsv.py** - CSR/COO SpSV（三角求解；**仅方阵**）。
 
-**test_spsv_sell.py** - 下三角、UNIT/NON_UNIT、实数/复数、原生列主序 SELL SpSV。CSV 和终端字段
+**test_spsv_sell.py** - 下三角、UNIT/NON_UNIT、实数/复数、原生列主序 SELL SpSV；公共
+SELL descriptor 同时支持通过独立 slice-cooperative 反向依赖 kernel 实现的 TRANS/CONJ。CSV 和终端字段
 与 CSR SpSV 保持一致；`FlagSparse_ms` 与 `cuSPARSE_ms` 都统计每轮完整的
 分析加求解；workspace 分配与 CSR 转 SELL 不计时。
 
@@ -128,6 +129,9 @@ python tests/test_spsv.py <目录/> --csv-coo out.csv     # 列与 CSR 相同
 pytest -q -s tests/test_spsv_sell.py
 python tests/test_spsv_sell.py <目录或文件.mtx> --csv sell_alg1.csv --slice-size 32 --alg_num 1
 python tests/test_spsv_sell.py <目录或文件.mtx> --csv sell_alg2.csv --slice-size 32 --alg_num 2
+python tests/test_spsv_sell.py --csv sell_non.csv --ops NON <目录或文件.mtx>
+python tests/test_spsv_sell.py --csv sell_trans.csv --dtype float32 --slice-size 32 --ops TRANS <目录或文件.mtx>
+python tests/test_spsv_sell.py --csv sell_conj.csv --dtype complex64 --slice-size 32 --ops CONJ <目录或文件.mtx>
 python tests/test_spsv_sell.py <目录或文件.mtx> --csv sell_unit.csv --unit-diagonal
 python tests/test_spsv_sell.py <目录或文件.mtx> --csv sell_complex.csv --dtype complex
 # 可选 ALG2 调优：追加 --alg2-workers 32|64|128|256|512
