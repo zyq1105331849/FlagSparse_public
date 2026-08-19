@@ -62,10 +62,10 @@ def _spsv_env_warp_size(name, default):
     return value
 
 
-def _spsv_env_positive_int(name, default):
+def _spsv_env_nonnegative_int(name, default):
     value = int(os.environ.get(name, default))
-    if value <= 0:
-        raise ValueError(f"{name} must be positive, got {value}")
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative, got {value}")
     return value
 
 
@@ -85,8 +85,8 @@ SPSV_ROCM_ALG3_WARP_SIZE = _spsv_env_warp_size(
 SPSV_ROCM_ALG4_WARP_SIZE = _spsv_env_warp_size(
     "FLAGSPARSE_SPSV_ROCM_ALG4_WARP_SIZE", "64"
 )
-SPSV_ROCM_ALG4_WORKER_COUNT = _spsv_env_positive_int(
-    "FLAGSPARSE_SPSV_ROCM_ALG4_WORKER_COUNT", "4"
+SPSV_ROCM_ALG4_WORKER_COUNT = _spsv_env_nonnegative_int(
+    "FLAGSPARSE_SPSV_ROCM_ALG4_WORKER_COUNT", "0"
 )
 _SPSV_CSR_PREPROCESS_CACHE = OrderedDict()
 _SPSV_CSR_PREPROCESS_CACHE_SIZE = 8
@@ -101,6 +101,20 @@ def _torch_current_stream_ptr():
         if stream_ptr is not None:
             return int(stream_ptr)
     return None
+
+
+def _spsv_alg4_worker_count(n_rows, device, is_rocm):
+    n_rows = int(n_rows)
+    if n_rows <= 0:
+        return 0
+    if not is_rocm:
+        return n_rows
+    if SPSV_ROCM_ALG4_WORKER_COUNT > 0:
+        return min(n_rows, SPSV_ROCM_ALG4_WORKER_COUNT)
+    # One persistent program per CU keeps the complete worker grid resident on
+    # gfx936 while exposing enough independent rows to hide ready-flag latency.
+    cu_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    return min(n_rows, max(1, cu_count))
 
 
 def _try_set_hipsparse_current_stream(handle):
@@ -2721,9 +2735,7 @@ def _triton_spsv_csr_n_lo_smblk_vector(
     use_fp64_acc = data.dtype == torch.float64
     is_rocm = _is_rocm_runtime()
     warp_size = SPSV_ROCM_ALG4_WARP_SIZE if is_rocm else 32
-    worker_count = min(
-        n_rows, SPSV_ROCM_ALG4_WORKER_COUNT if is_rocm else n_rows
-    )
+    worker_count = _spsv_alg4_worker_count(n_rows, b_vec.device, is_rocm)
     _spsv_csr_smblk_kernel[(worker_count,)](
         data,
         indices,
@@ -2769,9 +2781,7 @@ def _triton_spsv_csr_n_lo_smblk_vector_complex(
     use_fp64 = component_dtype == torch.float64
     is_rocm = _is_rocm_runtime()
     warp_size = SPSV_ROCM_ALG4_WARP_SIZE if is_rocm else 32
-    worker_count = min(
-        n_rows, SPSV_ROCM_ALG4_WORKER_COUNT if is_rocm else n_rows
-    )
+    worker_count = _spsv_alg4_worker_count(n_rows, b_vec.device, is_rocm)
     _spsv_csr_smblk_kernel_complex[(worker_count,)](
         data_ri,
         indices,
