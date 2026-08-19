@@ -1,3 +1,19 @@
+<!--
+ Copyright 2026 FlagOS Contributors
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+ -->
+
 # FlagSparse
 
 GPU 稀疏运算库（SpMV、SpMM、SpGEMM、SDDMM、gather、scatter、多种稀疏格式）。
@@ -72,6 +88,15 @@ python tests/test_spmv_opt.py <目录或文件.mtx> [...]
 python tests/test_spmv_opt.py <目录/> --csv out.csv
 ```
 
+**test_spmv_bsr.py** - 原生 BSR SpMV，输出按 block-grid padding：
+
+```bash
+python tests/test_spmv_bsr.py --synthetic --ops non,trans,conj
+python tests/test_spmv_bsr.py <目录/> --csv-bsr out.csv --block-dims 2,4 --ops non,trans,conj --alg compare
+# correctness 使用 BSR 展开的 COO 作为精确 reference；PyTorch BSR 只作为 baseline。
+# --alg blockrow_reduce 运行仅支持 non 的 block-row tile reduction 路径；compare 对 trans/conj 保持 base。
+```
+
 **test_spmm.py** - CSR SpMM（`.mtx` 批量、合成或 `--csv`）：
 
 ```bash
@@ -117,10 +142,7 @@ python tests/test_spgemm.py <目录/> --csv results.csv    # 可选：--dtype fl
 
 **test_spsv.py** - CSR/COO SpSV（三角求解；**仅方阵**）。
 
-**test_spsv_sell.py** - 下三角、UNIT/NON_UNIT、实数/复数、原生列主序 SELL SpSV；公共
-SELL descriptor 同时支持通过独立 slice-cooperative 反向依赖 kernel 实现的 TRANS/CONJ。CSV 和终端字段
-与 CSR SpSV 保持一致；`FlagSparse_ms` 与 `cuSPARSE_ms` 都统计每轮完整的
-分析加求解；workspace 分配与 CSR 转 SELL 不计时。
+**test_spsv_sell.py** - 下三角、UNIT/NON_UNIT、实数/复数、原生列主序 SELL SpSV
 
 ```bash
 python tests/test_spsv.py --synthetic

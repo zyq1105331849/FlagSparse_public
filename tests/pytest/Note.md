@@ -1,3 +1,19 @@
+<!--
+ Copyright 2026 FlagOS Contributors
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+ -->
+
 # tests/pytest 参数化用例说明 / Parametrized Test Notes
 
 ## 中文
@@ -78,7 +94,8 @@ All parametrized accuracy tests build synthetic tensors on `torch.device("cuda")
 
 - Gather/Scatter use `GATHER_SCATTER_SHAPES` and `GATHER_SCATTER_FLOAT_DTYPES`; references are PyTorch indexing and `index_copy_`.
 - CSR/COO SpMV use synthetic sparse matrices; references use `torch.sparse.mm`.
-- BSR SpMV covers `non` / `trans` / `conj`; native output uses padded block-grid length and tests compare the logical slice against a BSR-expanded COO reference. PyTorch BSR is recorded only as a same-format baseline, never as the golden reference.
+- BSR SpMV covers `non` / `trans` / `conj`; native output uses padded block-grid length and tests compare the logical slice against a BSR-expanded COO reference. PyTorch BSR is recorded only as a same-format baseline, never as the golden reference. The `blockrow_reduce` algorithm is a `non`-only optimized path with GPU bucket preprocessing counted as `process_gpu_ms`.
+- BSR SpMM v1 covers `op="non"` with padded block-grid output; tests compare the logical slice against `Ref=torch_spmm_coo`, built by expanding the same BSR arrays to COO for correctness only.
 - CSR/COO SpMM, SpSM, SpGEMM, and SDDMM use small synthetic matrices and PyTorch dense/sparse or sampled dense references.
 - SpSV uses diagonally strengthened triangular matrices; references use `torch.linalg.solve_triangular`; optional CuPy/cuSPARSE references run only when available.
 

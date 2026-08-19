@@ -78,8 +78,9 @@ python tests/test_spmv_opt.py <dir/> --csv out.csv
 
 ```bash
 python tests/test_spmv_bsr.py --synthetic --ops non,trans,conj
-python tests/test_spmv_bsr.py <dir/> --csv-bsr out.csv --block-dims 2,4 --ops non,trans,conj
+python tests/test_spmv_bsr.py <dir/> --csv-bsr out.csv --block-dims 2,4 --ops non,trans,conj --alg compare
 # correctness uses BSR-expanded COO as the exact reference; PyTorch BSR is a baseline only.
+# --alg blockrow_reduce runs the non-only block-row tile reduction path; compare keeps trans/conj on base.
 ```
 
 **test_spmm.py** - CSR SpMM (`.mtx` batch, synthetic, or `--csv`):
@@ -109,6 +110,14 @@ python tests/test_spmm_coo.py <dir/> --csv out.csv      # only --route rowrun or
 # same tuning flags as CSR SpMM where applicable: --op, --dense-cols, --block-n, --block-nnz, --warmup, --iters, --no-cusparse
 ```
 
+**test_spmm_bsr.py** - native BSR SpMM with padded block-grid output:
+
+```bash
+python tests/test_spmm_bsr.py --synthetic --block-dims 2 --ops non
+python tests/test_spmm_bsr.py <dir/> --csv-bsr out.csv --block-dims 2 --ops non --dense-cols 32
+# correctness uses the same BSR arrays expanded to COO as Ref=torch_spmm_coo; PyTorch/CuPy BSR are same-format baselines only when available.
+```
+
 **test_sddmm.py** - CSR SDDMM (`.mtx` batch or `--csv`):
 
 ```bash
@@ -128,11 +137,7 @@ python tests/test_spgemm.py <dir/> --csv results.csv     # optional: --dtype flo
 **test_spsv.py** - CSR/COO SpSV (triangular solve; **square** matrices only).
 
 **test_spsv_sell.py** - lower, UNIT/NON_UNIT, real/complex, native column-major
-SELL SpSV. The public SELL descriptor also supports TRANS/CONJ through its
-dedicated slice-cooperative reverse-dependency kernel. Its CSV and terminal fields follow the CSR SpSV output.
-`FlagSparse_ms` and `cuSPARSE_ms` both cover every per-call analysis plus solve.
-Workspace allocation and CSR to SELL conversion are outside the timed interval.
-
+SELL SpSV. 
 ```bash
 python tests/test_spsv.py --synthetic
 python tests/test_spsv.py <dir/> --csv-csr spsv.csv

@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Export the FlagSparse sparse-operator support matrix to CSV.
 
 The script is intentionally static: it does not import torch/triton/cupy or
@@ -16,7 +31,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-
 CSV_FIELDS = (
     "operator",
     "format",
@@ -27,7 +41,14 @@ CSV_FIELDS = (
     "status",
 )
 
-DEFAULT_VALUE_DTYPES = ("float16", "bfloat16", "float32", "float64", "complex64", "complex128")
+DEFAULT_VALUE_DTYPES = (
+    "float16",
+    "bfloat16",
+    "float32",
+    "float64",
+    "complex64",
+    "complex128",
+)
 DEFAULT_INDEX_DTYPES = ("int32", "int64")
 NA = "N/A"
 VALUE_DTYPE_ORDER = {
@@ -72,7 +93,9 @@ class SourceModule:
     def _collect(self) -> None:
         for node in self.tree.body:
             if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
                 for target in targets:
                     if isinstance(target, ast.Name):
                         self.assignments[target.id] = node.value
@@ -92,10 +115,18 @@ class SourceModule:
         if isinstance(node, ast.Set):
             return tuple(self._flatten(el) for el in node.elts)
         if isinstance(node, ast.Dict):
-            return {self._eval(k): self._eval(v) for k, v in zip(node.keys, node.values) if k is not None}
+            return {
+                self._eval(k): self._eval(v)
+                for k, v in zip(node.keys, node.values)
+                if k is not None
+            }
         if isinstance(node, ast.Starred):
             return self._eval(node.value)
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "torch":
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "torch"
+        ):
             return node.attr
         if isinstance(node, ast.Name):
             if node.id in self.assignments:
@@ -174,7 +205,9 @@ def discover_modules(src_root: Path) -> dict[str, SourceModule]:
         common_values = DEFAULT_VALUE_DTYPES
     shared = {
         "SUPPORTED_VALUE_DTYPES": common_values,
-        "SUPPORTED_INDEX_DTYPES": normalize_dtype_values(common.get("SUPPORTED_INDEX_DTYPES")),
+        "SUPPORTED_INDEX_DTYPES": normalize_dtype_values(
+            common.get("SUPPORTED_INDEX_DTYPES")
+        ),
     }
     modules = {"_common": common}
     for path in sorted(src_root.glob("*.py")):
@@ -196,6 +229,10 @@ def collect_public_apis(*init_paths: Path) -> set[str]:
 
 def op_names(module: SourceModule, const_name: str) -> tuple[str, ...]:
     names = module.get(const_name)
+    if isinstance(names, (tuple, list, set)):
+        values = tuple(str(value) for value in flatten(names))
+        if values:
+            return values
     if isinstance(names, dict):
         values = [str(v) for _, v in sorted(names.items(), key=lambda item: item[0])]
         if values:
@@ -253,6 +290,11 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
         if "spmm_coo" in modules
         else ("non", "trans", "conj")
     )
+    spmm_bsr_ops = (
+        op_names(modules["spmm_bsr"], "SPMM_BSR_SUPPORTED_OP_NAMES")
+        if "spmm_bsr" in modules
+        else ("non",)
+    )
     return (
         ApiSpec(
             "gather",
@@ -291,7 +333,12 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
     )
 
 
-def rows_for_spec(spec: ApiSpec, modules: dict[str, SourceModule], public_apis: set[str], src_root: Path) -> list[dict[str, str]]:
+def rows_for_spec(
+    spec: ApiSpec,
+    modules: dict[str, SourceModule],
+    public_apis: set[str],
+    src_root: Path,
+) -> list[dict[str, str]]:
     module = modules.get(spec.module)
     notes = [spec.notes] if spec.notes else []
     status = "SUPPORTED"
@@ -332,7 +379,9 @@ def rows_for_spec(spec: ApiSpec, modules: dict[str, SourceModule], public_apis: 
     ]
 
 
-def row(spec: ApiSpec, value_dtype: str, index_dtype: str, op: str, status: str) -> dict[str, str]:
+def row(
+    spec: ApiSpec, value_dtype: str, index_dtype: str, op: str, status: str
+) -> dict[str, str]:
     return {
         "operator": spec.operator,
         "format": spec.fmt,
@@ -344,7 +393,9 @@ def row(spec: ApiSpec, value_dtype: str, index_dtype: str, op: str, status: str)
     }
 
 
-def discovered_unmapped_rows(modules: dict[str, SourceModule], specs: Iterable[ApiSpec], src_root: Path) -> list[dict[str, str]]:
+def discovered_unmapped_rows(
+    modules: dict[str, SourceModule], specs: Iterable[ApiSpec], src_root: Path
+) -> list[dict[str, str]]:
     mapped = {(spec.module, spec.value_const) for spec in specs if spec.value_const}
     mapped |= {(spec.module, spec.index_const) for spec in specs if spec.index_const}
     out: list[dict[str, str]] = []
@@ -352,7 +403,9 @@ def discovered_unmapped_rows(modules: dict[str, SourceModule], specs: Iterable[A
         if module_name in {"_common", "__init__", "benchmarks"}:
             continue
         for const_name in sorted(module.assignments):
-            if not (const_name.startswith("SUPPORTED_") and const_name.endswith("_DTYPES")):
+            if not (
+                const_name.startswith("SUPPORTED_") and const_name.endswith("_DTYPES")
+            ):
                 continue
             if (module_name, const_name) in mapped:
                 continue
@@ -393,7 +446,9 @@ def _sort_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
 
 def build_rows(src_root: Path) -> list[dict[str, str]]:
     modules = discover_modules(src_root)
-    public_apis = collect_public_apis(src_root / "__init__.py", src_root.parent / "__init__.py")
+    public_apis = collect_public_apis(
+        src_root / "__init__.py", src_root.parent / "__init__.py"
+    )
     specs = registry(modules)
     rows: list[dict[str, str]] = []
     for spec in specs:

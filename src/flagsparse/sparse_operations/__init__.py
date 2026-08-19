@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """FlagSparse sparse operations (gather, scatter, SpMV, SpMM, SpGEMM, SDDMM, SpSM)."""
 
 from ._common import SUPPORTED_INDEX_DTYPES, SUPPORTED_VALUE_DTYPES, cp, cpx_sparse
@@ -31,8 +45,18 @@ from .gather_scatter import (
     triton_cusparse_gather,
     triton_cusparse_scatter,
 )
-from .sddmm_csr import SDDMMPrepared, benchmark_sddmm_case, flagsparse_sddmm_csr, prepare_sddmm_csr
-from .spgemm_csr import SpGEMMPrepared, benchmark_spgemm_case, flagsparse_spgemm_csr, prepare_spgemm_csr
+from .sddmm_csr import (
+    SDDMMPrepared,
+    benchmark_sddmm_case,
+    flagsparse_sddmm_csr,
+    prepare_sddmm_csr,
+)
+from .spgemm_csr import (
+    SpGEMMPrepared,
+    benchmark_spgemm_case,
+    flagsparse_spgemm_csr,
+    prepare_spgemm_csr,
+)
 from .spmm_coo import (
     PreparedCooSpmmRoute,
     SPMM_COO_ALGORITHMS,
@@ -43,6 +67,17 @@ from .spmm_coo import (
     list_spmm_coo_algorithms,
     prepare_spmm_coo_route,
     resolve_spmm_coo_algorithm,
+)
+from .spmm_bsr import (
+    PreparedBsrSpmm,
+    SPMM_BSR_ALGORITHMS,
+    SpmmBsrAlgorithm,
+    SpmmBsrAlgorithmUnavailable,
+    flagsparse_spmm_bsr,
+    flagsparse_spmm_bsr_run,
+    list_spmm_bsr_algorithms,
+    prepare_spmm_bsr_route,
+    resolve_spmm_bsr_algorithm,
 )
 from .spmm_csr import (
     PreparedCsrSpmmOpt,
@@ -126,6 +161,7 @@ __all__ = [
     "PreparedCooSpmmRoute",
     "PreparedAlphaSpmmAlg1",
     "PreparedBsrSpmv",
+    "PreparedBsrSpmm",
     "PreparedCsrSpmv",
     "PreparedCscSpmv",
     "PreparedCsrSpmmOpt",
@@ -140,6 +176,8 @@ __all__ = [
     "SpmmCsrAlgorithmUnavailable",
     "SpmmCooAlgorithm",
     "SpmmCooAlgorithmUnavailable",
+    "SpmmBsrAlgorithm",
+    "SpmmBsrAlgorithmUnavailable",
     "FlagSparseSpMatDescr",
     "FlagSparseSpSVDescr",
     "FlagSparseSpSVHandle",
@@ -169,6 +207,8 @@ __all__ = [
     "flagsparse_sddmm_csr",
     "flagsparse_spgemm_csr",
     "flagsparse_spmm_coo",
+    "flagsparse_spmm_bsr",
+    "flagsparse_spmm_bsr_run",
     "flagsparse_spmm_coo_run",
     "flagsparse_spmm_csr",
     "flagsparse_spmm_csr_run",
@@ -205,6 +245,7 @@ __all__ = [
     "flagsparse_spsv_solve_sell",
     "list_spmm_csr_algorithms",
     "list_spmm_coo_algorithms",
+    "list_spmm_bsr_algorithms",
     "prepare_sddmm_csr",
     "build_alpha_spmm_alg1_tle_opt_meta",
     "build_alpha_spmm_alg1_tle_opt2_meta",
@@ -224,6 +265,7 @@ __all__ = [
     "prepare_spmm_csr_opt_alg1_preprocess",
     "prepare_spmm_csr_route",
     "prepare_spmm_coo_route",
+    "prepare_spmm_bsr_route",
     "prepare_spmm_csr_opt_alg2",
     "prepare_spmm_csr_opt_alg2_preprocess",
     "prepare_spmv_coo",
@@ -233,8 +275,10 @@ __all__ = [
     "prepare_spmv_csr",
     "resolve_spmm_csr_algorithm",
     "resolve_spmm_coo_algorithm",
+    "resolve_spmm_bsr_algorithm",
     "SPMM_COO_ALGORITHMS",
     "SPMM_CSR_ALGORITHMS",
+    "SPMM_BSR_ALGORITHMS",
     "pytorch_index_gather",
     "pytorch_index_scatter",
     "triton_cusparse_gather",

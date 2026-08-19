@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """FlagSparse package."""
 
 __version__ = "1.0.0"
@@ -18,6 +32,7 @@ __all__ = [
     "PreparedCoo",
     "PreparedCooSpmmRoute",
     "PreparedBsrSpmv",
+    "PreparedBsrSpmm",
     "PreparedCscSpmv",
     "PreparedAlphaSpmmAlg1",
     "PreparedCsrSpmv",
@@ -35,6 +50,7 @@ __all__ = [
     "prepare_alpha_spmm_alg1_tle_opt2",
     "prepare_spmm_csr_opt",
     "prepare_spmm_coo_route",
+    "prepare_spmm_bsr_route",
     "prepare_spmm_csr_route",
     "prepare_spmm_csr_opt_alg1",
     "prepare_spmm_csr_opt_alg1_preprocess",
@@ -99,6 +115,8 @@ __all__ = [
     "flagsparse_spmm_csr",
     "flagsparse_spmm_coo",
     "flagsparse_spmm_coo_run",
+    "flagsparse_spmm_bsr",
+    "flagsparse_spmm_bsr_run",
     "benchmark_spmm_case",
     "benchmark_spmm_opt_case",
     "benchmark_spmm_opt_alg2_case",
@@ -108,13 +126,18 @@ __all__ = [
     "comprehensive_spsm_test",
     "benchmark_spmv_case",
     "list_spmm_coo_algorithms",
+    "list_spmm_bsr_algorithms",
     "list_spmm_csr_algorithms",
     "resolve_spmm_coo_algorithm",
+    "resolve_spmm_bsr_algorithm",
     "resolve_spmm_csr_algorithm",
     "SPMM_COO_ALGORITHMS",
     "SPMM_CSR_ALGORITHMS",
+    "SPMM_BSR_ALGORITHMS",
     "SpmmCooAlgorithm",
     "SpmmCooAlgorithmUnavailable",
+    "SpmmBsrAlgorithm",
+    "SpmmBsrAlgorithmUnavailable",
     "SpmmCsrAlgorithm",
     "SpmmCsrAlgorithmUnavailable",
     "create_csr_matrix",
@@ -154,6 +177,7 @@ _OPS_EXPORTS = {
     "PreparedCoo",
     "PreparedCooSpmmRoute",
     "PreparedBsrSpmv",
+    "PreparedBsrSpmm",
     "PreparedCscSpmv",
     "PreparedAlphaSpmmAlg1",
     "PreparedCsrSpmv",
@@ -171,6 +195,7 @@ _OPS_EXPORTS = {
     "prepare_alpha_spmm_alg1_tle_opt2",
     "prepare_spmm_csr_opt",
     "prepare_spmm_coo_route",
+    "prepare_spmm_bsr_route",
     "prepare_spmm_csr_route",
     "prepare_spmm_csr_opt_alg1",
     "prepare_spmm_csr_opt_alg1_preprocess",
@@ -235,6 +260,8 @@ _OPS_EXPORTS = {
     "flagsparse_spmm_csr",
     "flagsparse_spmm_coo",
     "flagsparse_spmm_coo_run",
+    "flagsparse_spmm_bsr",
+    "flagsparse_spmm_bsr_run",
     "benchmark_spmm_case",
     "benchmark_spmm_opt_case",
     "benchmark_spmm_opt_alg2_case",
@@ -244,13 +271,18 @@ _OPS_EXPORTS = {
     "benchmark_spmv_case",
     "comprehensive_spsm_test",
     "list_spmm_coo_algorithms",
+    "list_spmm_bsr_algorithms",
     "list_spmm_csr_algorithms",
     "resolve_spmm_coo_algorithm",
+    "resolve_spmm_bsr_algorithm",
     "resolve_spmm_csr_algorithm",
     "SPMM_COO_ALGORITHMS",
     "SPMM_CSR_ALGORITHMS",
+    "SPMM_BSR_ALGORITHMS",
     "SpmmCooAlgorithm",
     "SpmmCooAlgorithmUnavailable",
+    "SpmmBsrAlgorithm",
+    "SpmmBsrAlgorithmUnavailable",
     "SpmmCsrAlgorithm",
     "SpmmCsrAlgorithmUnavailable",
 }
@@ -281,9 +313,11 @@ _FORMAT_EXPORTS = {
 def __getattr__(name):
     if name in _OPS_EXPORTS:
         from . import sparse_operations as _ops
+
         return getattr(_ops, name)
     if name in _FORMAT_EXPORTS:
         from . import sparse_formats as _formats
+
         return getattr(_formats, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 

@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import pytest
 import torch
 
@@ -306,7 +320,7 @@ def test_spsv_csr_unit_transpose_family_supported_combos(
 
 
 @pytest.mark.spsv
-def test_spsv_csr_complex_non_trans_defaults_to_cw_route():
+def test_spsv_csr_complex_non_trans_defaults_to_smblk_route():
     device = torch.device("cuda")
     n = SPSV_N[0]
     dtype = torch.complex64
@@ -321,7 +335,7 @@ def test_spsv_csr_complex_non_trans_defaults_to_cw_route():
         data, indices, indptr, b, (n, n), True, False, False
     )
     selected = fs_spsv_impl._select_spsv_runtime_plan(solve_plan, trans_mode)
-    assert selected["solve_kind"] == "csr_cw"
+    assert selected["solve_kind"] == "csr_smblk"
 
 
 @pytest.mark.spsv
@@ -393,7 +407,7 @@ def test_spsv_auto_route_promotes_dense_real_lower_to_nnz_balance():
         unit_diagonal=False,
         value_dtype=torch.float64,
     )
-    assert route == "csr_nnz_balance"
+    assert route == "csr_smblk"
 
 
 @pytest.mark.spsv
@@ -526,7 +540,7 @@ def test_spsv_auto_route_promotes_wide_frontier_real_lower_to_levelschd():
         unit_diagonal=False,
         value_dtype=torch.float32,
     )
-    assert route == "csr_cw_levelschd"
+    assert route == "csr_smblk"
 
 
 @pytest.mark.spsv

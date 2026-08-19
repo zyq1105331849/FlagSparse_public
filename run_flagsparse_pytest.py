@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Run FlagSparse accuracy and performance suites per operator.
 
 The operator inventory comes from ``conf/operators.yaml`` by default.  Each
@@ -55,6 +70,12 @@ DEFAULT_EXCLUDED_OPS = {
     "spmv_coo_tocsr",
     "spsv_descriptor_api",
     "sparse_format_constructors",
+    # spmm_csr now routes to the optimized (alg1) kernel by default, so the
+    # standalone opt operators are dropped from the default CI run. They remain
+    # configured and can still be run explicitly via --ops.
+    "spmm_csr_opt",
+    "spmm_csr_opt_alg1",
+    "spmm_csr_opt_alg2",
 }
 STATUS_TO_FLAGGEMS = {
     "PASS": "Passed",
@@ -185,6 +206,8 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{csv}",
         "--ops",
         "non,trans,conj",
+        "--alg",
+        "compare",
         "--warmup",
         "{warmup}",
         "--iters",
@@ -219,6 +242,20 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{input}",
         "--csv",
         "{csv}",
+        "--warmup",
+        "{warmup}",
+        "--iters",
+        "{iters}",
+    ),
+    "spmm_bsr": (
+        "tests/test_spmm_bsr.py",
+        "{input}",
+        "--csv-bsr",
+        "{csv}",
+        "--ops",
+        "non",
+        "--block-dims",
+        "2",
         "--warmup",
         "{warmup}",
         "--iters",
@@ -349,6 +386,7 @@ OP_TEST_CONFIGS: dict[str, OperatorTestConfig] = {
     ),
     "spmm_csr": OperatorTestConfig("spmm_csr", PERFORMANCE_COMMANDS["spmm_csr"]),
     "spmm_coo": OperatorTestConfig("spmm_coo", PERFORMANCE_COMMANDS["spmm_coo"]),
+    "spmm_bsr": OperatorTestConfig("spmm_bsr", PERFORMANCE_COMMANDS["spmm_bsr"]),
     "spmm_csr_opt": OperatorTestConfig(
         "spmm_csr_opt", PERFORMANCE_COMMANDS["spmm_csr_opt"]
     ),
@@ -436,6 +474,9 @@ def collect_env_info(project_root: Path) -> dict[str, object]:
             "torch": _module_version("torch"),
             "triton": _module_version("triton"),
             "flagsparse": _module_version("flagsparse"),
+            # FlagTree ships the ``triton`` module, so its own version only lives
+            # in the ``flagtree`` distribution metadata (no importable module).
+            "flagtree": _module_version("flagtree"),
         },
         "git": {
             "commit": _capture_text(["git", "rev-parse", "HEAD"], cwd=project_root),
@@ -497,11 +538,13 @@ def _flag_gems_env_info(env_info: dict[str, object]) -> dict[str, object]:
     torch_package = packages.get("torch")
     triton_package = packages.get("triton")
     flagsparse_package = packages.get("flagsparse")
+    flagtree_package = packages.get("flagtree")
     torch_package = torch_package if isinstance(torch_package, dict) else {}
     triton_package = triton_package if isinstance(triton_package, dict) else {}
     flagsparse_package = (
         flagsparse_package if isinstance(flagsparse_package, dict) else {}
     )
+    flagtree_package = flagtree_package if isinstance(flagtree_package, dict) else {}
 
     devices = cuda.get("devices")
     devices = devices if isinstance(devices, list) else []
@@ -529,8 +572,13 @@ def _flag_gems_env_info(env_info: dict[str, object]) -> dict[str, object]:
             "device_name": str(first_device.get("name") or ""),
             "device_count": int(cuda.get("device_count") or 0),
         },
-        # The reference FlagGems summary reserves this field but emits null.
-        "flagtree": None,
+        # FlagTree distribution version (reserved as null by the reference
+        # FlagGems summary); emit the real version when the package is present.
+        "flagtree": (
+            str(flagtree_package.get("version"))
+            if flagtree_package.get("version")
+            else None
+        ),
         "triton": {
             "version": str(triton_package.get("version") or ""),
             "has_config": triton_has_config,
@@ -1778,9 +1826,11 @@ def _phase_rows(results: list[dict[str, object]]) -> list[dict[str, object]]:
                     "stderr_log_path": phase_result.get("stderr_log_path", ""),
                     "data_path": phase_result.get("data_path", ""),
                     "reason": phase_result.get("reason", ""),
-                    "command": shlex.join(phase_result.get("command", []))
-                    if phase_result.get("command")
-                    else "",
+                    "command": (
+                        shlex.join(phase_result.get("command", []))
+                        if phase_result.get("command")
+                        else ""
+                    ),
                 }
             )
     return rows

@@ -1,4 +1,19 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """SpMV COO tests: dtype/index/op grids, synthetic + optional .mtx, CSV export."""
+
 import argparse
 import glob
 import csv
@@ -9,6 +24,7 @@ import time
 import torch
 import flagsparse as fs
 import flagsparse.sparse_operations.spmv_coo as spmv_coo_mod
+
 try:
     import cupy as cp
     import cupyx.scipy.sparse as cpx_sparse
@@ -47,7 +63,9 @@ def _parse_csv_tokens(value, mapping, name):
     unknown = [token for token in tokens if token not in mapping]
     if unknown:
         allowed = ", ".join(mapping)
-        raise ValueError(f"unsupported {name}: {', '.join(unknown)}; allowed: {allowed}")
+        raise ValueError(
+            f"unsupported {name}: {', '.join(unknown)}; allowed: {allowed}"
+        )
     return [mapping[token] for token in tokens]
 
 
@@ -57,7 +75,9 @@ def _parse_ops(value):
         raise ValueError("--ops must not be empty")
     unknown = [token for token in tokens if token not in OP_NAMES]
     if unknown:
-        raise ValueError(f"unsupported op: {', '.join(unknown)}; allowed: {', '.join(OP_NAMES)}")
+        raise ValueError(
+            f"unsupported op: {', '.join(unknown)}; allowed: {', '.join(OP_NAMES)}"
+        )
     return tokens
 
 
@@ -245,8 +265,7 @@ def _coo_header(timing=False):
         f"{'Opt(ms)':>9} {'OptGPU':>9} {'OptCPU':>9}{split}"
     )
     return (
-        base
-        + f" {'PT(ms)':>9} {'CU(ms)':>9}  "
+        base + f" {'PT(ms)':>9} {'CU(ms)':>9}  "
         f"{'Opt/Base':>8} {'Opt/PT':>8} {'Opt/CU':>8}  "
         f"{'Err(Base)':>10} {'Err(Opt)':>10} {'Status':>6}"
     )
@@ -462,7 +481,9 @@ def run_synthetic(
         return
     device = torch.device("cuda")
     print("=" * 172)
-    print("FLAGSPARSE SpMV COO BENCHMARK (synthetic dense -> COO). All backends stay COO.")
+    print(
+        "FLAGSPARSE SpMV COO BENCHMARK (synthetic dense -> COO). All backends stay COO."
+    )
     print("=" * 172)
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Warmup: {warmup} | Iters: {iters}")
@@ -482,10 +503,18 @@ def run_synthetic(
                 )
                 print(COO_SEP)
                 print("FlagSparse: native COO Triton only (no CSR).")
-                print("Base(ms)=BaseCPU+BaseGPU; BaseGPU wraps row-run sort + seg_starts + segmented kernel.")
-                print("Opt(ms)=OptCPU+OptGPU; atomic has no segment/bucket preprocessing.")
-                print("--timing splits row-run GPU work into BasePGPU + BaseComp; atomic OptPGPU is zero.")
-                print("Speedups use Opt(ms) as the Triton comparison path; Base(ms) is reported separately.")
+                print(
+                    "Base(ms)=BaseCPU+BaseGPU; BaseGPU wraps row-run sort + seg_starts + segmented kernel."
+                )
+                print(
+                    "Opt(ms)=OptCPU+OptGPU; atomic has no segment/bucket preprocessing."
+                )
+                print(
+                    "--timing splits row-run GPU work into BasePGPU + BaseComp; atomic OptPGPU is zero."
+                )
+                print(
+                    "Speedups use Opt(ms) as the Triton comparison path; Base(ms) is reported separately."
+                )
                 print(COO_SEP)
                 print(_coo_header(timing=timing))
                 print(COO_SEP)
@@ -850,83 +879,13 @@ def _mtx_value_for_dtype(raw_value, dtype):
 
 
 def _load_mtx_to_coo_torch(file_path, dtype=torch.float32, device=None):
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    with open(file_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
+    """Load a .mtx into COO torch tensors via the C-accelerated scipy reader
+    (see tests/mtx_fast.py); the former pure-Python parser took minutes on
+    large SuiteSparse matrices. Returns (vals, rows, cols, shape)."""
+    from mtx_fast import load_coo
 
-    mm_field = "real"
-    mm_symmetry = "general"
-    data_lines = []
-    header_info = None
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("%%MatrixMarket"):
-            tokens = stripped.split()
-            if len(tokens) >= 5:
-                mm_field = tokens[3].lower()
-                mm_symmetry = tokens[4].lower()
-            continue
-        if stripped.startswith("%"):
-            continue
-        if not header_info and stripped:
-            parts = stripped.split()
-            n_rows = int(parts[0])
-            n_cols = int(parts[1])
-            nnz = int(parts[2]) if len(parts) > 2 else 0
-            header_info = (n_rows, n_cols, nnz)
-            continue
-        if stripped:
-            data_lines.append(stripped)
-    if header_info is None:
-        raise ValueError(f"Cannot parse .mtx header: {file_path}")
-    n_rows, n_cols, nnz = header_info
-
-    is_pattern = (mm_field == "pattern")
-    is_complex_field = mm_field == "complex"
-    is_symmetric = (mm_symmetry == "symmetric")
-    is_hermitian = (mm_symmetry == "hermitian")
-    is_skew = (mm_symmetry == "skew-symmetric")
-
-    rows_host = []
-    cols_host = []
-    vals_host = []
-    for line in data_lines[:nnz]:
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        r = int(parts[0]) - 1
-        c = int(parts[1]) - 1
-        if is_pattern:
-            raw = 1.0
-        elif is_complex_field:
-            real = float(parts[2]) if len(parts) >= 3 else 0.0
-            imag = float(parts[3]) if len(parts) >= 4 else 0.0
-            raw = complex(real, imag)
-        else:
-            raw = float(parts[2]) if len(parts) >= 3 else 0.0
-        v = _mtx_value_for_dtype(raw, dtype)
-        if 0 <= r < n_rows and 0 <= c < n_cols:
-            rows_host.append(r)
-            cols_host.append(c)
-            vals_host.append(v)
-            if r != c:
-                if is_symmetric and 0 <= c < n_rows and 0 <= r < n_cols:
-                    rows_host.append(c)
-                    cols_host.append(r)
-                    vals_host.append(v)
-                elif is_hermitian and 0 <= c < n_rows and 0 <= r < n_cols:
-                    rows_host.append(c)
-                    cols_host.append(r)
-                    vals_host.append(v.conjugate() if isinstance(v, complex) else v)
-                elif is_skew and 0 <= c < n_rows and 0 <= r < n_cols:
-                    rows_host.append(c)
-                    cols_host.append(r)
-                    vals_host.append(-v)
-    rows = torch.tensor(rows_host, dtype=torch.int64, device=device)
-    cols = torch.tensor(cols_host, dtype=torch.int64, device=device)
-    vals = torch.tensor(vals_host, dtype=dtype, device=device)
-    return vals, rows, cols, (n_rows, n_cols)
+    data, rows, cols, shape = load_coo(file_path, dtype=dtype, device=device)
+    return data, rows, cols, shape
 
 
 # Dense PyTorch reference for SpSV can OOM on large matrices.
@@ -1020,7 +979,9 @@ def run_all_dtypes_coo_csv(
     index_dtypes = INDEX_DTYPES if index_dtypes is None else index_dtypes
     ops = OPS if ops is None else ops
     print("=" * 200)
-    print("Input: MatrixMarket -> COO. FlagSparse: native COO Triton only (seg + atomic), no CSR.")
+    print(
+        "Input: MatrixMarket -> COO. FlagSparse: native COO Triton only (seg + atomic), no CSR."
+    )
     print("PyTorch = COO sparse.mm; CuPy = COO matvec (coo_matrix @ x, no tocsr).")
     print(
         "Timing policy: Base/Opt ms = process_cpu_ms + GPU event time. "
@@ -1132,11 +1093,15 @@ def run_all_dtypes_tocsr_csv(
         return
     device = torch.device("cuda")
     rows_out = []
-    value_dtypes = (torch.float32, torch.float64) if value_dtypes is None else value_dtypes
+    value_dtypes = (
+        (torch.float32, torch.float64) if value_dtypes is None else value_dtypes
+    )
     index_dtypes = INDEX_DTYPES if index_dtypes is None else index_dtypes
     print("=" * 200)
     print("Input: MatrixMarket -> COO. FlagSparse: COO-to-CSR preparation path.")
-    print("Runtime(ms) includes COO->CSR conversion; Prepared(ms) measures repeated CSR steady-state calls.")
+    print(
+        "Runtime(ms) includes COO->CSR conversion; Prepared(ms) measures repeated CSR steady-state calls."
+    )
     print(
         f"prepare_spmv_coo_tocsr once per variant + {warmup} warmup + "
         f"{iters} CUDA-event-averaged SpMV per backend."
