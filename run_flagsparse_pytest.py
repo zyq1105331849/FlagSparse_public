@@ -218,6 +218,28 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "--iters",
         "{iters}",
     ),
+    "spmm_bsr": (
+        "tests/test_spmm_bsr.py",
+        "{input}",
+        "--csv-bsr",
+        "{csv}",
+        "--no-hipsparse",
+        "--warmup",
+        "{warmup}",
+        "--iters",
+        "{iters}",
+    ),
+    "spmm_csc": (
+        "tests/test_spmm_csc.py",
+        "{input}",
+        "--csv-csc",
+        "{csv}",
+        "--no-hipsparse",
+        "--warmup",
+        "{warmup}",
+        "--iters",
+        "{iters}",
+    ),
     "spmm_csr_opt": (
         "tests/test_spmm_opt.py",
         "{input}",
@@ -333,6 +355,8 @@ OP_TEST_CONFIGS: dict[str, OperatorTestConfig] = {
     ),
     "spmm_csr": OperatorTestConfig("spmm_csr", PERFORMANCE_COMMANDS["spmm_csr"]),
     "spmm_coo": OperatorTestConfig("spmm_coo", PERFORMANCE_COMMANDS["spmm_coo"]),
+    "spmm_bsr": OperatorTestConfig("spmm_bsr", PERFORMANCE_COMMANDS["spmm_bsr"]),
+    "spmm_csc": OperatorTestConfig("spmm_csc", PERFORMANCE_COMMANDS["spmm_csc"]),
     "spmm_csr_opt": OperatorTestConfig(
         "spmm_csr_opt", PERFORMANCE_COMMANDS["spmm_csr_opt"]
     ),
@@ -2433,8 +2457,8 @@ def main(
         "--gpus",
         default="0",
         help=(
-            "Comma-separated ROCm/DCU GPU ids. PyTorch ROCm uses "
-            "CUDA_VISIBLE_DEVICES for device selection."
+            "Comma-separated ROCm/DCU GPU ids for the PyTorch backend-visible "
+            "device mask."
         ),
     )
     if include_accuracy_args:

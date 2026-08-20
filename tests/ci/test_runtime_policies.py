@@ -17,6 +17,8 @@ from flagsparse.sparse_operations import _common  # noqa: E402
 from flagsparse.sparse_operations import (  # noqa: E402
     gather_scatter as gather_scatter_ops,
 )
+from flagsparse.sparse_operations import spmm_bsr as spmm_bsr_ops  # noqa: E402
+from flagsparse.sparse_operations import spmm_csc as spmm_csc_ops  # noqa: E402
 from flagsparse.sparse_operations import spmv_bsr as spmv_bsr_ops  # noqa: E402
 from flagsparse.sparse_operations import spmv_csc as spmv_csc_ops  # noqa: E402
 from flagsparse.sparse_operations import spmv_coo as spmv_coo_ops  # noqa: E402
@@ -61,6 +63,16 @@ def test_spmv_csc_index_fallback_policy_normalization(policy):
 @pytest.mark.parametrize("policy", ["auto", "strict"])
 def test_spmv_bsr_index_fallback_policy_normalization(policy):
     assert spmv_bsr_ops._normalize_spmv_bsr_index_fallback_policy(policy) == policy
+
+
+@pytest.mark.parametrize("policy", ["auto", "strict"])
+def test_spmm_bsr_index_fallback_policy_normalization(policy):
+    assert spmm_bsr_ops._normalize_spmm_bsr_index_fallback_policy(policy) == policy
+
+
+@pytest.mark.parametrize("policy", ["auto", "strict"])
+def test_spmm_csc_index_fallback_policy_normalization(policy):
+    assert spmm_csc_ops._normalize_spmm_csc_index_fallback_policy(policy) == policy
 
 
 @pytest.mark.parametrize(
@@ -160,6 +172,40 @@ def test_spmv_bsr_supported_ops_accepted_by_policy(op):
         )
         is None
     )
+
+
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+def test_spmm_bsr_supported_ops_accepted_by_policy(op):
+    assert (
+        spmm_bsr_ops._ensure_spmm_bsr_supported_op(
+            spmm_bsr_ops._normalize_spmm_bsr_op(op)
+        )
+        is None
+    )
+
+
+def test_spmm_csc_supported_non_op_accepted_by_policy():
+    assert spmm_csc_ops._ensure_spmm_csc_supported_op(0) is None
+
+
+@pytest.mark.parametrize("op", ["trans", "conj"])
+def test_spmm_csc_transpose_family_rejected_by_policy(op):
+    with pytest.raises(ValueError, match="reserved"):
+        spmm_csc_ops._ensure_spmm_csc_supported_op(
+            spmm_csc_ops._normalize_spmm_csc_op(op)
+        )
+
+
+@pytest.mark.parametrize("alg", ["auto", "base", "spmm_bsr_base"])
+def test_spmm_bsr_algorithm_normalization(alg):
+    normalized = spmm_bsr_ops._normalize_spmm_bsr_alg(alg)
+    assert normalized in ("auto", "spmm_bsr_base")
+
+
+@pytest.mark.parametrize("alg", ["auto", "base", "spmm_csc_base"])
+def test_spmm_csc_algorithm_normalization(alg):
+    normalized = spmm_csc_ops._normalize_spmm_csc_alg(alg)
+    assert normalized in ("auto", "spmm_csc_base")
 
 
 def test_scatter_policy_validator_rejects_unknown_policy():

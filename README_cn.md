@@ -113,6 +113,20 @@ python tests/test_spmm_coo.py <目录/> --csv out.csv     # 仅支持 --route ro
 # 与 CSR SpMM 类似的调参：--dense-cols、--block-n、--block-nnz、--warmup、--iters、--no-hipsparse
 ```
 
+**test_spmm_bsr.py** - 原生 BSR SpMM（输出为 padded block-grid 语义）：
+
+```bash
+python tests/test_spmm_bsr.py --synthetic --block-dims 2 --ops non
+python tests/test_spmm_bsr.py <目录/> --csv-bsr out.csv --block-dims 2 --ops non --dense-cols 32 --no-hipsparse
+```
+
+**test_spmm_csc.py** - 原生 CSC SpMM：
+
+```bash
+python tests/test_spmm_csc.py --synthetic --ops non
+python tests/test_spmm_csc.py <目录/> --csv-csc out.csv --ops non --dense-cols 32 --no-hipsparse
+```
+
 **test_sddmm.py** - CSR SDDMM（`.mtx` 批量或 `--csv`）：
 
 ```bash

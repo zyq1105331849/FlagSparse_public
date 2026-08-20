@@ -115,6 +115,20 @@ python tests/test_spmm_coo.py <dir/> --csv out.csv      # only --route rowrun or
 # same tuning flags as CSR SpMM where applicable: --dense-cols, --block-n, --block-nnz, --warmup, --iters, --no-hipsparse
 ```
 
+**test_spmm_bsr.py** - native BSR SpMM with padded block-grid output:
+
+```bash
+python tests/test_spmm_bsr.py --synthetic --block-dims 2 --ops non
+python tests/test_spmm_bsr.py <dir/> --csv-bsr out.csv --block-dims 2 --ops non --dense-cols 32 --no-hipsparse
+```
+
+**test_spmm_csc.py** - native CSC SpMM:
+
+```bash
+python tests/test_spmm_csc.py --synthetic --ops non
+python tests/test_spmm_csc.py <dir/> --csv-csc out.csv --ops non --dense-cols 32 --no-hipsparse
+```
+
 **test_sddmm.py** - CSR SDDMM (`.mtx` batch or `--csv`):
 
 ```bash

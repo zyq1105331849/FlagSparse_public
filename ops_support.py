@@ -253,6 +253,16 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
         if "spmm_coo" in modules
         else ("non", "trans", "conj")
     )
+    spmm_bsr_ops = (
+        op_names(modules["spmm_bsr"], "SPMM_BSR_SUPPORTED_OP_NAMES")
+        if "spmm_bsr" in modules
+        else ("non", "trans", "conj")
+    )
+    spmm_csc_ops = (
+        op_names(modules["spmm_csc"], "SPMM_CSC_SUPPORTED_OP_NAMES")
+        if "spmm_csc" in modules
+        else ("non",)
+    )
     return (
         ApiSpec(
             "gather",
@@ -281,6 +291,8 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
         ApiSpec("spmm", "flagsparse_spmm_csr_opt", "spmm_csr", "CSR", "triton_opt", values=("float32", "float64"), index_const="SUPPORTED_INDEX_DTYPES", ops=("non",), notes="bucketed opt path only supports float32/float64"),
         ApiSpec("spmm", "flagsparse_spmm_csr_opt_alg2", "spmm_csr_opt_alg2", "CSR", "triton_opt_alg2", value_const="SUPPORTED_SPMM_OPT_ALG2_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=("non",), notes="hardware-aware alg2 opt path only supports float32/float64"),
         ApiSpec("spmm", "flagsparse_spmm_coo", "spmm_coo", "COO", "triton", values=spmm_values, index_const="SUPPORTED_INDEX_DTYPES", ops=spmm_coo_ops, notes="COO SpMM supports non/trans/conj via native route materialization"),
+        ApiSpec("spmm", "flagsparse_spmm_bsr", "spmm_bsr", "BSR", "triton", value_const="SUPPORTED_SPMM_BSR_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=spmm_bsr_ops, notes="native BSR SpMM supports non/trans/conj with padded block-grid output"),
+        ApiSpec("spmm", "flagsparse_spmm_csc", "spmm_csc", "CSC", "triton", value_const="SUPPORTED_SPMM_CSC_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=spmm_csc_ops, notes="native CSC SpMM currently supports non; trans/conj are rejected with reason"),
         ApiSpec("spgemm", "flagsparse_spgemm_csr", "spgemm_csr", "CSR", "triton", value_const="SUPPORTED_SPGEMM_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=("non",)),
         ApiSpec("sddmm", "flagsparse_sddmm_csr", "sddmm_csr", "CSR", "triton", value_const="SUPPORTED_SDDMM_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=("non",)),
         ApiSpec("spsv", "flagsparse_spsv_csr", "spsv", "CSR", "triton", value_const="SUPPORTED_SPSV_VALUE_DTYPES", index_const="SUPPORTED_SPSV_INDEX_DTYPES", ops=("NON_TRANS", "TRANS"), notes="TRANS support is narrower than NON_TRANS; see combo constants"),
