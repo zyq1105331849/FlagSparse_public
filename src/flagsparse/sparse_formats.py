@@ -550,12 +550,10 @@ def _coo_to_sell_impl(rows, cols, data, shape, slice_size):
 def _coo_to_blocked_ell_impl(rows, cols, data, shape, block_shape):
     br, bc = block_shape
     n_rows, n_cols = shape
-    if n_rows % br != 0 or n_cols % bc != 0:
-        raise ValueError(
-            f"shape {shape} must be divisible by block_shape {block_shape}"
-        )
-    n_block_rows = n_rows // br
-    n_block_cols = n_cols // bc
+    if br <= 0 or bc <= 0:
+        raise ValueError(f"block_shape {block_shape} must contain positive dimensions")
+    n_block_rows = (n_rows + br - 1) // br
+    n_block_cols = (n_cols + bc - 1) // bc
     block_rows = rows // br
     block_cols = cols // bc
     in_block_r = rows % br
@@ -571,14 +569,14 @@ def _coo_to_blocked_ell_impl(rows, cols, data, shape, block_shape):
         if key not in blocks:
             blocks[key] = cp.zeros((br, bc), dtype=data.dtype)
         blocks[key][ir, ic] += data[k]
-    max_blocks_per_row = 0
+    ell_width_blocks = 0
     for i in range(n_block_rows):
         count = sum(1 for (bi, _) in blocks if bi == i)
-        max_blocks_per_row = max(max_blocks_per_row, count)
-    if max_blocks_per_row == 0:
-        max_blocks_per_row = 1
-    data_out = cp.zeros((n_block_rows, max_blocks_per_row, br, bc), dtype=data.dtype)
-    indices_out = cp.full((n_block_rows, max_blocks_per_row), -1, dtype=cp.int64)
+        ell_width_blocks = max(ell_width_blocks, count)
+    if ell_width_blocks == 0:
+        ell_width_blocks = 1
+    data_out = cp.zeros((n_block_rows, ell_width_blocks, br, bc), dtype=data.dtype)
+    indices_out = cp.full((n_block_rows, ell_width_blocks), -1, dtype=cp.int64)
     for i in range(n_block_rows):
         cols_in_row = sorted([j for (bi, j) in blocks if bi == i])
         for t, j in enumerate(cols_in_row):
