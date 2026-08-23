@@ -39,6 +39,7 @@ ALGS = ("auto", "spmm_bell_base", "base", "all")
 TEST_SIZES = ((63, 95, 16), (128, 256, 32), (160, 1024, 48))
 WARMUP = 10
 ITERS = 50
+DEFAULT_MAX_BELL_STORAGE_MB = 2048.0
 
 PERF_FIELDS = [
     "matrix",
@@ -53,6 +54,9 @@ PERF_FIELDS = [
     "n_cols",
     "nnzb",
     "ell_width_blocks",
+    "stored_values",
+    "padding_ratio",
+    "estimated_storage_mb",
     "block_dim",
     "dense_cols",
     "b_stride",
@@ -91,6 +95,10 @@ def _fmt(value, digits=4):
     if isinstance(value, float):
         return f"{value:.{digits}f}"
     return str(value)
+
+
+def _dtype_size(dtype):
+    return torch.empty((), dtype=dtype).element_size()
 
 
 def _reference_dtype(dtype):
@@ -214,7 +222,7 @@ def _mtx_value_for_dtype(value, dtype):
     return float(value.real if isinstance(value, complex) else value)
 
 
-def _entries_to_bell(entries, shape, dtype, index_dtype, block_dim, device):
+def _build_bell_plan(entries, shape, block_dim):
     M, K = shape
     mb = (M + block_dim - 1) // block_dim
     blocks = {}
@@ -225,26 +233,62 @@ def _entries_to_bell(entries, shape, dtype, index_dtype, block_dim, device):
         inner_col = int(col) % block_dim
         block = blocks.setdefault(
             (brow, bcol),
-            [_zero_value(dtype) for _ in range(block_dim * block_dim)],
+            None,
         )
-        block[inner_row * block_dim + inner_col] += _mtx_value_for_dtype(value, dtype)
+        if block is None:
+            block = {}
+            blocks[(brow, bcol)] = block
+        block[(inner_row, inner_col)] = block.get((inner_row, inner_col), 0) + value
     row_blocks = [[] for _ in range(mb)]
     for key in sorted(blocks):
         row_blocks[key[0]].append(key)
     ell_width_blocks = max([len(row) for row in row_blocks] or [0])
     ell_width_blocks = max(1, ell_width_blocks)
-    data_values = [_zero_value(dtype)] * (mb * ell_width_blocks * block_dim * block_dim)
-    index_values = [-1] * (mb * ell_width_blocks)
+    return blocks, row_blocks, mb, ell_width_blocks
+
+
+def _estimate_bell_storage(entries, shape, dtype, index_dtype, block_dim):
+    blocks, row_blocks, mb, ell_width_blocks = _build_bell_plan(entries, shape, block_dim)
+    nnzb = len(blocks)
+    stored_values = mb * ell_width_blocks * block_dim * block_dim
+    index_values = mb * ell_width_blocks
+    estimated_bytes = stored_values * _dtype_size(dtype) + index_values * _dtype_size(index_dtype)
+    padding_ratio = float(stored_values) / max(1, len(entries))
+    return {
+        "blocks": blocks,
+        "row_blocks": row_blocks,
+        "mb": mb,
+        "ell_width_blocks": ell_width_blocks,
+        "nnzb": nnzb,
+        "stored_values": stored_values,
+        "estimated_storage_mb": estimated_bytes / (1024.0 * 1024.0),
+        "padding_ratio": padding_ratio,
+    }
+
+
+def _entries_to_bell(entries, shape, dtype, index_dtype, block_dim, device, plan=None):
+    if plan is None:
+        plan = _estimate_bell_storage(entries, shape, dtype, index_dtype, block_dim)
+    blocks = plan["blocks"]
+    row_blocks = plan["row_blocks"]
+    mb = int(plan["mb"])
+    ell_width_blocks = int(plan["ell_width_blocks"])
+    data = torch.zeros(
+        (mb, ell_width_blocks, block_dim, block_dim),
+        dtype=dtype,
+        device=device,
+    )
+    indices = torch.full(
+        (mb, ell_width_blocks),
+        -1,
+        dtype=index_dtype,
+        device=device,
+    )
     for brow, keys in enumerate(row_blocks):
         for slot, key in enumerate(keys):
-            index_values[brow * ell_width_blocks + slot] = key[1]
-            block = blocks[key]
-            base = (brow * ell_width_blocks + slot) * block_dim * block_dim
-            data_values[base : base + block_dim * block_dim] = block
-    data = torch.tensor(data_values, dtype=dtype, device=device)
-    data = data.reshape(mb, ell_width_blocks, block_dim, block_dim).contiguous()
-    indices = torch.tensor(index_values, dtype=index_dtype, device=device)
-    indices = indices.reshape(mb, ell_width_blocks).contiguous()
+            indices[brow, slot] = key[1]
+            for (inner_row, inner_col), value in blocks[key].items():
+                data[brow, slot, inner_row, inner_col] = _mtx_value_for_dtype(value, dtype)
     return data, indices
 
 
@@ -320,7 +364,7 @@ def _entries_to_torch_coo(entries, shape, dtype, device):
 
 def _torch_spmm_coo_reference_from_original_coo(entries, B, shape, dtype):
     ref_dtype = _reference_dtype(dtype)
-    A = _entries_to_torch_coo(entries, shape, ref_dtype, B.device)
+    A = _entries_to_torch_coo(entries, shape, dtype, B.device).to(ref_dtype)
     return torch.sparse.mm(A, B.to(ref_dtype)).to(dtype)
 
 
@@ -381,12 +425,10 @@ def _time_flagsparse_bell(data, indices, B, shape, block_dim, alg, op, warmup, i
     }
 
 
-def _run_case(matrix_name, entries, shape, dtype, index_dtype, block_dim, dense_cols, layout, alg, op, warmup, iters, timing):
+def _run_case(matrix_name, entries, shape, dtype, index_dtype, block_dim, dense_cols, layout, alg, op, warmup, iters, timing, max_bell_storage_mb):
     M, K = shape
     device = torch.device("cuda")
-    data, indices = _entries_to_bell(entries, shape, dtype, index_dtype, block_dim, device)
-    B = _build_dense_B(K, dense_cols, dtype, device, layout)
-    ref = _torch_spmm_coo_reference_from_original_coo(entries, B, shape, dtype)
+    plan = _estimate_bell_storage(entries, shape, dtype, index_dtype, block_dim)
     row = {
         "matrix": matrix_name,
         "dtype": _dtype_name(dtype),
@@ -398,11 +440,14 @@ def _run_case(matrix_name, entries, shape, dtype, index_dtype, block_dim, dense_
         "out_rows": M,
         "n_rows": M,
         "n_cols": K,
-        "nnzb": int(torch.count_nonzero(indices >= 0).item()),
-        "ell_width_blocks": int(data.shape[1]),
+        "nnzb": int(plan["nnzb"]),
+        "ell_width_blocks": int(plan["ell_width_blocks"]),
+        "stored_values": int(plan["stored_values"]),
+        "padding_ratio": float(plan["padding_ratio"]),
+        "estimated_storage_mb": float(plan["estimated_storage_mb"]),
         "block_dim": block_dim,
         "dense_cols": dense_cols,
-        "b_stride": B.stride(0),
+        "b_stride": None,
         "c_stride": None,
         "ms": None,
         "gpu_ms": None,
@@ -427,7 +472,25 @@ def _run_case(matrix_name, entries, shape, dtype, index_dtype, block_dim, dense_
             }
         )
         return row
+    if plan["estimated_storage_mb"] > float(max_bell_storage_mb):
+        row.update(
+            {
+                "status": "SKIP",
+                "reason": (
+                    "BELL padded storage estimate "
+                    f"{plan['estimated_storage_mb']:.1f} MiB exceeds guard "
+                    f"{float(max_bell_storage_mb):.1f} MiB"
+                ),
+            }
+        )
+        return row
     try:
+        data, indices = _entries_to_bell(
+            entries, shape, dtype, index_dtype, block_dim, device, plan=plan
+        )
+        B = _build_dense_B(K, dense_cols, dtype, device, layout)
+        ref = _torch_spmm_coo_reference_from_original_coo(entries, B, shape, dtype)
+        row["b_stride"] = B.stride(0)
         bell = _time_flagsparse_bell(
             data, indices, B, shape, block_dim, alg, op, warmup, iters, timing=timing
         )
@@ -448,6 +511,9 @@ def _run_case(matrix_name, entries, shape, dtype, index_dtype, block_dim, dense_
         )
     except Exception as exc:
         row["reason"] = str(exc)
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     return row
 
 
@@ -456,6 +522,7 @@ def _print_notes():
     print("Accuracy reference: Ref=torch_spmm_coo_from_original_coo builds torch sparse COO from the original matrix entries; this is correctness-only.")
     print("PyTorch/CuPy BELL baselines: unavailable unless a real same-format Blocked-ELL API is present; no casting or format fallback is used.")
     print("Timing policy: ms = process_cpu_ms + gpu_ms; BELL SpMM v1 has no process phase.")
+    print("Memory guard: oversized BELL padded storage is reported as SKIP before tensor allocation.")
 
 
 def _print_row(row, timing=False):
@@ -467,7 +534,7 @@ def _print_row(row, timing=False):
     print(
         f"{os.path.basename(str(row['matrix']))[:28]:<28} {row['op']:<5} {row['alg']:<15} "
         f"{row['block_dim']:>4} {row['out_rows']:>8} {row['n_rows']:>8} {row['n_cols']:>8} "
-        f"{row['nnzb']:>8} {row['ell_width_blocks']:>6} {row['dense_cols']:>6} "
+        f"{row['nnzb']:>8} {row['ell_width_blocks']:>6} {row['estimated_storage_mb']:>8.1f} {row['dense_cols']:>6} "
         f"{_fmt(row['ms']):>9} {_fmt(row['gpu_ms']):>9} {_fmt(row['process_cpu_ms']):>9}"
         f"{extra} {_fmt(row['err_vs_ref'], 2):>10} {row['status']:>6}"
     )
@@ -490,6 +557,12 @@ def main():
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument("--timing", action="store_true")
+    parser.add_argument(
+        "--max-bell-storage-mb",
+        type=float,
+        default=DEFAULT_MAX_BELL_STORAGE_MB,
+        help="Skip cases whose estimated BELL data+index storage exceeds this MiB guard",
+    )
     parser.add_argument("--no-cusparse", action="store_true", help="Accepted for CLI consistency; no BELL cuSPARSE baseline is used")
     parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
@@ -531,7 +604,7 @@ def main():
                     print("-" * 132)
                     header = (
                         f"{'Matrix':<28} {'Op':<5} {'Alg':<15} {'BDim':>4} {'Out':>8} {'Rows':>8} "
-                        f"{'Cols':>8} {'NNZB':>8} {'ELLW':>6} {'DCols':>6} {'ms':>9} {'gpu_ms':>9} "
+                        f"{'Cols':>8} {'NNZB':>8} {'ELLW':>6} {'MiB':>8} {'DCols':>6} {'ms':>9} {'gpu_ms':>9} "
                         f"{'cpu_ms':>9}"
                         + (f" {'gpu_proc':>9} {'compute':>9}" if args.timing else "")
                         + f" {'Err':>10} {'Status':>6}"
@@ -566,6 +639,7 @@ def main():
                                             args.warmup,
                                             args.iters,
                                             args.timing,
+                                            args.max_bell_storage_mb,
                                         )
                                         rows.append(row)
                                         _print_row(row, timing=args.timing)
@@ -581,4 +655,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
