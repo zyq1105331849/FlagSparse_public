@@ -15,6 +15,17 @@ import torch
 from scipy.io import mmread
 
 
+class NonSquareMatrixError(ValueError):
+    """Raised when a matrix cannot be used by a square sparse solve."""
+
+    def __init__(self, operation, shape):
+        self.operation = str(operation)
+        self.shape = (int(shape[0]), int(shape[1]))
+        super().__init__(
+            f"{self.operation} requires a square matrix, got {self.shape}"
+        )
+
+
 def read_scipy_csr(file_path):
     """Return a canonical scipy CSR (symmetry expanded, duplicates summed, sorted)."""
     csr = mmread(str(file_path)).tocsr()
@@ -104,6 +115,8 @@ def load_csr_spsv(file_path, dtype=torch.float32, device=None, lower=True):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     A = mmread(str(file_path)).tocsr()
+    if A.shape[0] != A.shape[1]:
+        raise NonSquareMatrixError("SpSV", A.shape)
     A.sum_duplicates()
     A.sort_indices()
     if np.iscomplexobj(A.data):
