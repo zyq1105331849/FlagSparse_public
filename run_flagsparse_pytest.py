@@ -253,9 +253,35 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "--csv-bsr",
         "{csv}",
         "--ops",
+        "non,trans,conj",
+        "--block-dims",
+        "2",
+        "--warmup",
+        "{warmup}",
+        "--iters",
+        "{iters}",
+    ),
+    "spmm_bell": (
+        "tests/test_spmm_bell.py",
+        "{input}",
+        "--csv-bell",
+        "{csv}",
+        "--ops",
         "non",
         "--block-dims",
         "2",
+        "--warmup",
+        "{warmup}",
+        "--iters",
+        "{iters}",
+    ),
+    "spmm_csc": (
+        "tests/test_spmm_csc.py",
+        "{input}",
+        "--csv-csc",
+        "{csv}",
+        "--ops",
+        "non,trans,conj",
         "--warmup",
         "{warmup}",
         "--iters",
@@ -387,6 +413,8 @@ OP_TEST_CONFIGS: dict[str, OperatorTestConfig] = {
     "spmm_csr": OperatorTestConfig("spmm_csr", PERFORMANCE_COMMANDS["spmm_csr"]),
     "spmm_coo": OperatorTestConfig("spmm_coo", PERFORMANCE_COMMANDS["spmm_coo"]),
     "spmm_bsr": OperatorTestConfig("spmm_bsr", PERFORMANCE_COMMANDS["spmm_bsr"]),
+    "spmm_bell": OperatorTestConfig("spmm_bell", PERFORMANCE_COMMANDS["spmm_bell"]),
+    "spmm_csc": OperatorTestConfig("spmm_csc", PERFORMANCE_COMMANDS["spmm_csc"]),
     "spmm_csr_opt": OperatorTestConfig(
         "spmm_csr_opt", PERFORMANCE_COMMANDS["spmm_csr_opt"]
     ),
@@ -1224,7 +1252,15 @@ def run_accuracy(
     if result_path.exists():
         parsed = parse_accuracy_json(result_path)
         data_file = str(result_path.relative_to(op_dir.parent))
-        status = str(parsed.get("status") or status)
+        status = resolve_status_with_parsed(
+            status,
+            parsed.get("status"),
+            returncode=returncode,
+            timed_out=timed_out,
+        )
+        # ``parsed`` is splatted into the result below, so keep its status in
+        # sync or it would overwrite the one just resolved.
+        parsed["status"] = status
     else:
         parsed = {
             "passed": counts["passed"],
@@ -1408,11 +1444,16 @@ def _benchmark_json_detail(row: dict[str, str], index: int) -> dict[str, object]
     base = _to_float(row.get(base_key)) if base_key else None
     latency = _to_float(row.get(latency_key)) if latency_key else None
     speedup = _to_float(row.get(speedup_key))
+    # ``None`` means "no measurement", which is not the same claim as a
+    # measured 0.0: benchmarks whose CSV carries no speedup column (SpMV CSC,
+    # SpMM CSC/BSR on DCU, where no vendor baseline runs) used to be reported
+    # as a 0.00x speedup, indistinguishable from a real result.  The HTML
+    # renderer already prints an empty cell for None.
     result = {
         "shape_detail": _row_shape(row, index),
-        "latency_base": 0.0 if base is None else base,
-        "latency": 0.0 if latency is None else latency,
-        "speedup": 0.0 if speedup is None else speedup,
+        "latency_base": base,
+        "latency": latency,
+        "speedup": speedup,
     }
     for key, value in row.items():
         if key in result or value in (None, ""):
@@ -1481,6 +1522,26 @@ def _flaggems_perf_data(rows: list[dict[str, str]]) -> dict[str, object]:
         if values:
             grouped[dtype]["speedup"] = statistics.mean(values)
     return grouped
+
+
+def resolve_status_with_parsed(
+    base_status: str,
+    parsed_status: object,
+    *,
+    returncode: int,
+    timed_out: bool,
+) -> str:
+    """Let parsed artifacts refine a status without masking a process failure.
+
+    A run killed by ``--timeout`` (or one that crashed) can still leave a
+    partial CSV/JSON behind, and the summary parsed from it reports only the
+    rows that made it to disk.  Letting that upgrade the phase to ``Passed``
+    hides a truncated result, so a process-level failure always wins.
+    """
+
+    if timed_out or returncode != 0:
+        return base_status
+    return str(parsed_status or base_status)
 
 
 def parse_performance_json(op: str, path: Path) -> dict[str, object]:
@@ -1688,7 +1749,14 @@ def run_performance(
         try:
             write_benchmark_json_from_csv(op, csv_path, result_path)
             result.update(summarize_performance_csv(csv_path))
-            result.update(parse_performance_json(op, result_path))
+            parsed = parse_performance_json(op, result_path)
+            parsed["status"] = resolve_status_with_parsed(
+                status,
+                parsed.get("status"),
+                returncode=returncode,
+                timed_out=timed_out,
+            )
+            result.update(parsed)
             result["data_file"] = str(result_path.relative_to(op_dir.parent))
         except Exception as exc:
             result["csv_parse_error"] = str(exc)

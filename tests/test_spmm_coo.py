@@ -687,6 +687,29 @@ def _skip_alg_row(
 def _time_cusparse_coo(prepared_case, ref_C, dtype, warmup, iters, layout="row"):
     if dtype not in (torch.float32, torch.float64, torch.complex64, torch.complex128):
         return None, None, "dtype not supported by CuPy/cuSPARSE reference"
+    sparse_ref_backend, _ = ast_ops._spmm_coo_sparse_ref_backend(
+        prepared_case["cusparse_data"].dtype, prepared_case["cusparse_row"].dtype
+    )
+    if sparse_ref_backend == "hipsparse":
+        # DCU/ROCm: hipSPARSE replaces cuSPARSE as the vendor baseline. COO SpMM
+        # materialises the op before the call, so every op is covered. Without
+        # this branch the DCU run silently reports the baseline as unavailable.
+        try:
+            ref = ast_ops._benchmark_spmm_coo_sparse_ref(
+                prepared_case["cusparse_data"],
+                prepared_case["cusparse_row"],
+                prepared_case["cusparse_col"],
+                prepared_case["native_B"],
+                (prepared_case["n_rows"], prepared_case["n_cols"]),
+                warmup,
+                iters,
+            )
+        except Exception as exc:
+            return None, None, str(exc)
+        if ref["values"] is None:
+            return None, None, ref["reason"] or "hipSPARSE COO SpMM reference skipped"
+        del ref_C
+        return ref["values"], ref["ms"], ref["reason"] or ""
     try:
         import cupy as cp
         import cupyx.scipy.sparse as cpx
@@ -1477,7 +1500,43 @@ def run_one_mtx(
         torch.complex64,
         torch.complex128,
     )
-    if run_cusparse:
+    # Vendor baseline per backend: hipSPARSE on DCU/ROCm, cuSPARSE via CuPy on CUDA.
+    sparse_ref_backend, sparse_ref_reason = ast_ops._spmm_coo_sparse_ref_backend(
+        value_dtype, prepared["cusparse_row"].dtype
+    )
+    if run_cusparse and sparse_ref_backend == "hipsparse":
+        try:
+            cs_C_t, result["cusparse_ms"] = ast_ops._benchmark_prepared_cuda_op(
+                lambda: ast_ops._prepare_spmm_coo_ref_hipsparse(
+                    prepared["cusparse_data"],
+                    prepared["cusparse_row"],
+                    prepared["cusparse_col"],
+                    prepared["native_B"],
+                    (prepared["n_rows"], prepared["n_cols"]),
+                ),
+                ast_ops._run_spmm_coo_ref_hipsparse_prepared,
+                ast_ops._destroy_spmm_coo_ref_hipsparse_prepared,
+                warmup=warmup,
+                iters=iters,
+            )
+            cusparse_metrics = ast_ops._spmm_validation_metrics(cs_C_t, ref_C)
+            result["cusparse_abs_err"] = cusparse_metrics["max_abs_error"]
+            result["cusparse_relative_error_diag"] = cusparse_metrics[
+                "max_relative_error"
+            ]
+            if triton_C is not None:
+                result["err_cu"] = _scaled_allclose_error(triton_C, cs_C_t, value_dtype)
+                result["triton_ok_cu"] = torch.allclose(
+                    triton_C, cs_C_t, atol=atol, rtol=rtol
+                )
+        except Exception as exc:
+            result["cusparse_ms"] = None
+            result["err_cu"] = None
+            result["cusparse_abs_err"] = None
+            result["cusparse_relative_error_diag"] = None
+            result["triton_ok_cu"] = None
+            result["cusparse_reason"] = str(exc)
+    elif run_cusparse:
         if value_dtype not in _cupy_supported_dtypes:
             result["cusparse_reason"] = (
                 "float16/bfloat16 not supported by CuPy sparse; skipped"
@@ -1810,7 +1869,34 @@ def _benchmark_spmm_coo_synthetic_policy(
     cusparse_reason = None
     cusparse_values = None
     cusparse_summary = None
-    if run_cusparse:
+    bench_ref_backend, bench_ref_reason = ast_ops._spmm_coo_sparse_ref_backend(
+        value_dtype, prepared["cusparse_row"].dtype
+    )
+    if run_cusparse and bench_ref_backend == "hipsparse":
+        try:
+            cusparse_values, cusparse_ms = ast_ops._benchmark_prepared_cuda_op(
+                lambda: ast_ops._prepare_spmm_coo_ref_hipsparse(
+                    prepared["cusparse_data"],
+                    prepared["cusparse_row"],
+                    prepared["cusparse_col"],
+                    prepared["native_B"],
+                    (prepared["n_rows"], prepared["n_cols"]),
+                ),
+                ast_ops._run_spmm_coo_ref_hipsparse_prepared,
+                ast_ops._destroy_spmm_coo_ref_hipsparse_prepared,
+                warmup=warmup,
+                iters=iters,
+            )
+            cusparse_summary = ast_ops._spmm_validation_metrics(
+                cusparse_values, expected
+            )
+            atol, rtol = _tolerance_for_dtype(value_dtype)
+            cusparse_match = torch.allclose(
+                cusparse_values, expected, atol=atol, rtol=rtol
+            )
+        except Exception as exc:
+            cusparse_reason = str(exc)
+    elif run_cusparse:
         if value_dtype not in (
             torch.float32,
             torch.float64,

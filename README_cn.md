@@ -32,6 +32,108 @@ pip install . --no-deps --no-build-isolation
 pip install torch triton cupy-cuda12x
 ```
 
+## 后端（CUDA / DCU）
+
+FlagSparse 按检测到的运行时对**厂商参考实现与基线**进行分发；Triton 内核本身在各后端保持不变。
+
+| 运行时 | 判定方式 | 厂商稀疏库 | Python 绑定 |
+| --- | --- | --- | --- |
+| NVIDIA CUDA | `torch.version.hip is None` | cuSPARSE | CuPy（`cupy-cuda12x`） |
+| DCU / ROCm | `torch.version.hip is not None` | hipSPARSE | `hip-python` |
+
+在 DCU/ROCm 机器上，安装与 ROCm 版本匹配的 hip-python：
+
+```bash
+pip install hip-python
+```
+
+两种绑定都是可选的。若都不可用，基准测试会回退到通用的 `torch.sparse` 参考实现，
+并在 `*_reason` / `backend_status` 字段中给出原因，而不是直接报错。
+
+分发逻辑位于各 `_*_sparse_ref_backend()` 辅助函数，返回
+`("hipsparse" | "cupy_cusparse" | None, reason)`：
+
+- `flagsparse.sparse_operations._common` —— SpMV CSR/COO
+- `.spmm_csr` / `.spmm_coo` / `.spgemm_csr` / `.gather_scatter` —— 其余算子
+
+### 在 DCU 上跑测试
+
+所有命令都要带 `PYTHONPATH=src`。开工先确认没跑到旧的已安装包 —— 这是 DCU 上最容易踩的坑：
+
+```bash
+python -c "import flagsparse; print(flagsparse.__file__)"   # 必须指向 <仓库>/src/flagsparse/__init__.py
+```
+
+**1. 先 diagnose，再跑基准。** hipSPARSE 用错时是挂住而不是报错，所以要逐级探，
+不要一上来就 `--op all`：
+
+```bash
+python tests/diagnose_hipsparse_ref.py --op env        # 先探环境，不碰任何算子
+python tests/diagnose_hipsparse_ref.py --timing-only   # HIP 事件计时链
+python tests/diagnose_hipsparse_ref.py --op spmv-csr   # 再一次一个算子
+python tests/diagnose_hipsparse_ref.py --op all        # 单点全部通过后才跑这个
+```
+
+**2. 正确性套件。**
+
+```bash
+PYTHONPATH=src python -m pytest tests/pytest -q
+```
+
+SpSV 和 SpSM 目前在 DCU 上会 GPU 内核死锁（见 [docs/DCU_TESTING.md](docs/DCU_TESTING.md)
+已知限制一节），需要排除掉才能跑完：
+
+```bash
+PYTHONPATH=src python -m pytest tests/pytest -q \
+  --ignore=tests/pytest/test_spsv_csr_accuracy.py \
+  --ignore=tests/pytest/test_spsv_coo_accuracy.py \
+  --ignore=tests/pytest/test_spsv_sell_accuracy.py \
+  --ignore=tests/pytest/test_spsm_accuracy.py
+```
+
+DCU 基准线：排除 851 个 SpSV/SpSM 用例后 `984 passed / 1 failed`，约 60 秒。
+那个失败是 `spmv_coo` / `spmv_csc` 的容差抖动 —— 每次失败的 dtype 参数都不一样，
+且单独跑就过；参数固定不变的失败才是真问题。CUDA 全量基准线：`1613 passed / 3 failed`。
+
+**3. 策略/契约类测试** —— 不需要 GPU，秒级：
+
+```bash
+python -m pytest tests/ci -q     # 期望 39 passed / 3 skipped
+```
+
+**4. 逐算子基准：**
+
+```bash
+M=matrix   # 任意 .mtx 目录
+python tests/test_spmv.py     $M --warmup 2 --iters 5
+python tests/test_spmm.py     $M --warmup 2 --iters 5
+python tests/test_spgemm.py   $M --warmup 2 --iters 5
+python tests/test_spmm_coo.py $M --warmup 2 --iters 5
+```
+
+看时间数据前先确认没有别的任务在争抢 GPU。
+
+**5. 统一运行器。** `run_flagsparse_pytest.py` 没有后端感知，默认算子清单包含
+`spsv_csr`、`spsv_coo`、`spsv_sell`、`spsm_csr`、`spsm_coo` —— 这五个在 DCU 上都会死锁。
+而且 `--timeout` 默认是 `0`（关闭），一旦卡住就是无限等待而不会跳过。
+所以在 DCU 上要显式指定算子，并加超时兜底：
+
+```bash
+python run_flagsparse_pytest.py --phase both --mode quick --benchmark-input matrix \
+  --timeout 3600 \
+  --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_bell,spmm_csc,spgemm_csr,sddmm_csr
+```
+
+这个算子清单就是 `--list-ops` 的全集去掉那五个求解器条目。`--timeout 3600` 只是兜底：
+真卡住的会记成 `TIMEOUT` 并继续往下跑，而不是整轮停摆。DCU 实测 30 个矩阵跑完全程约 3.3 小时，
+其中 `spmv_bsr`、`spmm_coo`、`spmm_bsr`、`spmm_bell`、`spmm_csc` 等算子的矩阵 x dtype 网格单个就超过 1800 秒，
+所以预算给到 3600。
+
+注意 `--gpus 0,1` 单独用没有用 —— 它只是把算子分成两条队列，含 SpSV/SpSM 的那条照样堵死。
+
+DCU 上的完整验证流程（环境检查、旧安装包陷阱、如何确认真的走了 hipSPARSE、
+已知限制、排查速查表）见 [docs/DCU_TESTING.md](docs/DCU_TESTING.md)。
+
 ## 目录说明
 
 - `src/flagsparse/` - 核心包（`sparse_operations/` 由 `flagsparse.py` 内嵌字符串生成多个 `.py`）
@@ -142,7 +244,14 @@ python tests/test_spgemm.py <目录/> --csv results.csv    # 可选：--dtype fl
 
 **test_spsv.py** - CSR/COO SpSV（三角求解；**仅方阵**）。
 
-**test_spsv_sell.py** - 下三角、UNIT/NON_UNIT、实数/复数、原生列主序 SELL SpSV
+**test_spsv_sell.py** - 下三角、UNIT/NON_UNIT、实数/复数、原生列主序 SELL SpSV，
+支持 NON/TRANS/CONJ 操作模式。CSV 和终端字段
+遵循 CSR SpSV 输出；`FlagSparse_ms` 和 `cuSPARSE_ms` 都覆盖每次调用的准备/
+分析加求解，静态 descriptor 与 SELL 转换不计时。直接
+`flagsparse_spsv_sell` API 默认使用 ALG1；使用 `--alg_num 2` 或显式
+`flagsparse_spsv_analysis_sell` + `flagsparse_spsv_solve_sell` 生命周期可启用
+slice-cooperative ALG2 路径。TRANS/CONJ 使用专用反向依赖 kernel，且不接受
+`--alg_num` 或 `--alg2-workers`。
 
 ```bash
 python tests/test_spsv.py --synthetic
@@ -155,6 +264,8 @@ python tests/test_spsv_sell.py --csv sell_non.csv --ops NON <目录或文件.mtx
 python tests/test_spsv_sell.py --csv sell_trans.csv --dtype float32 --slice-size 32 --ops TRANS <目录或文件.mtx>
 python tests/test_spsv_sell.py --csv sell_conj.csv --dtype complex64 --slice-size 32 --ops CONJ <目录或文件.mtx>
 python tests/test_spsv_sell.py <目录或文件.mtx> --csv sell_unit.csv --unit-diagonal
+python tests/test_spsv_sell.py --csv sell_trans.csv --dtype float32 --slice-size 32 --ops TRANS <目录或文件.mtx>
+python tests/test_spsv_sell.py --csv sell_conj.csv --dtype complex64 --slice-size 32 --ops CONJ <目录或文件.mtx>
 python tests/test_spsv_sell.py <目录或文件.mtx> --csv sell_complex.csv --dtype complex
 # 可选 ALG2 调优：追加 --alg2-workers 32|64|128|256|512
 ```

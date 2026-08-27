@@ -16,6 +16,115 @@ Runtime dependencies (install when needed):
 pip install torch triton cupy-cuda12x
 ```
 
+## Backends (CUDA / DCU)
+
+FlagSparse dispatches its **vendor reference and baseline** paths on the detected
+runtime; the Triton kernels themselves are unchanged across backends.
+
+| Runtime | Detected by | Vendor sparse library | Python binding |
+| --- | --- | --- | --- |
+| NVIDIA CUDA | `torch.version.hip is None` | cuSPARSE | CuPy (`cupy-cuda12x`) |
+| DCU / ROCm | `torch.version.hip is not None` | hipSPARSE | `hip-python` |
+
+On a DCU/ROCm host, install the hip-python bindings matching your ROCm release:
+
+```bash
+pip install hip-python
+```
+
+Both bindings are optional. When neither is importable the benchmarks fall back to the
+portable `torch.sparse` reference and report the reason in the `*_reason` /
+`backend_status` fields rather than failing.
+
+Selection happens in `_*_sparse_ref_backend()` helpers, which return
+`("hipsparse" | "cupy_cusparse" | None, reason)`:
+
+- `flagsparse.sparse_operations._common` - SpMV CSR/COO
+- `.spmm_csr` / `.spmm_coo` / `.spgemm_csr` / `.gather_scatter` - the remaining operators
+
+### Running the tests on DCU
+
+Prefix every command with `PYTHONPATH=src`, and first confirm you are not running a stale
+installed copy — the most common DCU pitfall:
+
+```bash
+python -c "import flagsparse; print(flagsparse.__file__)"   # must be <repo>/src/flagsparse/__init__.py
+```
+
+**1. Diagnose before benchmarking.** A hipSPARSE misuse hangs instead of raising, so probe
+phase by phase rather than starting with `--op all`:
+
+```bash
+python tests/diagnose_hipsparse_ref.py --op env        # environment probe, touches no operator
+python tests/diagnose_hipsparse_ref.py --timing-only   # HIP event timing chain
+python tests/diagnose_hipsparse_ref.py --op spmv-csr   # then one operator at a time
+python tests/diagnose_hipsparse_ref.py --op all        # only once every single probe passes
+```
+
+**2. Correctness suite.**
+
+```bash
+PYTHONPATH=src python -m pytest tests/pytest -q
+```
+
+SpSV and SpSM currently deadlock in the GPU kernel on DCU (see the known-limits section of
+[docs/DCU_TESTING.md](docs/DCU_TESTING.md)), so exclude them for a run that terminates:
+
+```bash
+PYTHONPATH=src python -m pytest tests/pytest -q \
+  --ignore=tests/pytest/test_spsv_csr_accuracy.py \
+  --ignore=tests/pytest/test_spsv_coo_accuracy.py \
+  --ignore=tests/pytest/test_spsv_sell_accuracy.py \
+  --ignore=tests/pytest/test_spsm_accuracy.py
+```
+
+DCU baseline: `984 passed / 1 failed` in ~60 s, with 851 SpSV/SpSM tests excluded. The single
+failure is `spmv_coo` / `spmv_csc` tolerance jitter — a different dtype parameter each run, and
+it passes when run alone. Only a failure whose parameter stays fixed is a real one. CUDA
+baseline for the full suite: `1613 passed / 3 failed`.
+
+**3. Policy/contract tests** — no GPU needed, runs in seconds:
+
+```bash
+python -m pytest tests/ci -q     # expect 39 passed / 3 skipped
+```
+
+**4. Per-operator benchmarks:**
+
+```bash
+M=matrix   # any directory of .mtx files
+python tests/test_spmv.py     $M --warmup 2 --iters 5
+python tests/test_spmm.py     $M --warmup 2 --iters 5
+python tests/test_spgemm.py   $M --warmup 2 --iters 5
+python tests/test_spmm_coo.py $M --warmup 2 --iters 5
+```
+
+Make sure no other job is competing for the GPU before trusting the timings.
+
+**5. Unified runner.** `run_flagsparse_pytest.py` has no backend awareness, and its default
+sweep includes `spsv_csr`, `spsv_coo`, `spsv_sell`, `spsm_csr`, and `spsm_coo` — all five
+deadlock on DCU. `--timeout` also defaults to `0` (disabled), so the run would hang forever
+rather than move on. Name the operators explicitly and set a timeout as a backstop:
+
+```bash
+python run_flagsparse_pytest.py --phase both --mode quick --benchmark-input matrix \
+  --timeout 3600 \
+  --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_bell,spmm_csc,spgemm_csr,sddmm_csr
+```
+
+That op list is the full `--list-ops` set minus the five solver entries. `--timeout 3600` is
+only a backstop: anything that does hang is recorded as `TIMEOUT` and the sweep continues
+instead of stalling. Measured on DCU, a full 30-matrix sweep takes ~3.3 h in total, and the
+heaviest per-operator benchmarks (`spmv_bsr`, `spmm_coo`, `spmm_bsr`, `spmm_bell`, `spmm_csc`) each need
+more than 1800 s to finish their matrix x dtype grid — hence the 3600 s budget.
+
+Note that `--gpus 0,1` does not help on its own: it splits the operators into two queues, and
+whichever queue holds SpSV/SpSM still blocks.
+
+For the full DCU bring-up procedure — environment checks, the stale-install trap, how to
+confirm hipSPARSE was actually selected, known limits, and a troubleshooting table — see
+[docs/DCU_TESTING.md](docs/DCU_TESTING.md).
+
 ## Layout
 
 - `src/flagsparse/` - core package (`sparse_operations/` is emitted as several `.py` modules from string literals in `flagsparse.py`)
@@ -134,7 +243,17 @@ python tests/test_spgemm.py <dir/> --csv results.csv     # optional: --dtype flo
 # common options: --dtype, --index-dtype, --warmup, --iters, --input-mode, --adaptive-loops, --no-cusparse, --ref-blocked-retry, --ref-isolated-retry, --ref-block-rows, --compare-device, --run-api-checks
 ```
 
-**test_spsv.py** - CSR/COO SpSV (triangular solve; **square** matrices only).
+**test_spsv.py** - SpSV (triangular solve; **square** matrices only). CSR and COO share this script; there is **no** `test_spsv_coo.py`.
+
+**test_spsv_sell.py** - lower, UNIT/NON_UNIT, real/complex, native column-major
+SELL SpSV with NON/TRANS/CONJ operation modes. Its CSV and
+terminal fields follow the CSR SpSV output. `FlagSparse_ms` and `cuSPARSE_ms`
+both cover every per-call preparation/analysis plus solve; static descriptors
+and SELL conversion are outside the timed interval. The direct
+`flagsparse_spsv_sell` API defaults to ALG1; use `--alg_num 2` or the explicit
+`flagsparse_spsv_analysis_sell` + `flagsparse_spsv_solve_sell` lifecycle for
+the slice-cooperative ALG2 path. TRANS/CONJ use a dedicated reverse-dependency
+kernel and do not accept `--alg_num` or `--alg2-workers`.
 
 **test_spsv_sell.py** - lower, UNIT/NON_UNIT, real/complex, native column-major
 SELL SpSV. 
@@ -149,6 +268,8 @@ python tests/test_spsv_sell.py --csv sell_non.csv --ops NON <dir_or_file.mtx>
 python tests/test_spsv_sell.py --csv sell_trans.csv --dtype float32 --slice-size 32 --ops TRANS <dir_or_file.mtx>
 python tests/test_spsv_sell.py --csv sell_conj.csv --dtype complex64 --slice-size 32 --ops CONJ <dir_or_file.mtx>
 python tests/test_spsv_sell.py <dir_or_file.mtx> --csv sell_unit.csv --unit-diagonal
+python tests/test_spsv_sell.py --csv sell_trans.csv --dtype float32 --slice-size 32 --ops TRANS <dir_or_file.mtx>
+python tests/test_spsv_sell.py --csv sell_conj.csv --dtype complex64 --slice-size 32 --ops CONJ <dir_or_file.mtx>
 python tests/test_spsv_sell.py <dir_or_file.mtx> --csv sell_complex.csv --dtype complex
 # Optional ALG2 tuning: append --alg2-workers 32|64|128|256|512
 ```

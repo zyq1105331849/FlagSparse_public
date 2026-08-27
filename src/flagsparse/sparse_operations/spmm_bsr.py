@@ -16,10 +16,15 @@
 
 from dataclasses import dataclass
 
+from . import _common as _common_mod
 from ._common import *
 
 import triton
 import triton.language as tl
+
+# `HipPointer` is a plain module attribute rather than an `__all__` export, so
+# the star import above does not bring it in.
+HipPointer = _common_mod.HipPointer
 
 
 SUPPORTED_SPMM_BSR_VALUE_DTYPES = (
@@ -37,7 +42,7 @@ SPMM_BSR_OP_NAMES = {
     SPMM_BSR_OP_TRANS: "trans",
     SPMM_BSR_OP_CONJ_TRANS: "conj",
 }
-SPMM_BSR_SUPPORTED_OP_NAMES = ("non",)
+SPMM_BSR_SUPPORTED_OP_NAMES = ("non", "trans", "conj")
 _SPMM_BSR_OP_NAME_TO_CODE = {name: code for code, name in SPMM_BSR_OP_NAMES.items()}
 
 SPMM_BSR_ALG_BASE = "spmm_bsr_base"
@@ -87,7 +92,8 @@ def _spmm_bsr_op_transposes(op):
 def _ensure_spmm_bsr_supported_op(op_code):
     op_name = _spmm_bsr_op_to_name(op_code)
     if op_name not in SPMM_BSR_SUPPORTED_OP_NAMES:
-        raise ValueError("spmm_bsr v1 only supports op='non'")
+        supported = ", ".join(SPMM_BSR_SUPPORTED_OP_NAMES)
+        raise ValueError(f"spmm_bsr supports ops: {supported}")
 
 
 def _normalize_spmm_bsr_alg(alg):
@@ -293,6 +299,125 @@ def _spmm_bsr_non_complex_kernel(
     )
 
 
+@triton.jit
+def _spmm_bsr_trans_real_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    c_ptr,
+    n_block_rows,
+    n_dense_cols,
+    stride_bm,
+    stride_bn,
+    stride_ck,
+    stride_cn,
+    BLOCK_DIM: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+    SEG: tl.constexpr,
+):
+    brow = tl.program_id(0)
+    inner_row = tl.program_id(1)
+    pid_n = tl.program_id(2)
+    if brow >= n_block_rows:
+        return
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    row = brow * BLOCK_DIM + inner_row
+    b_vals = tl.load(
+        b_ptr + row * stride_bm + offs_n * stride_bn,
+        mask=mask_n,
+        other=0.0,
+    )
+    start = tl.load(indptr_ptr + brow)
+    end = tl.load(indptr_ptr + brow + 1)
+    offs = start + SEG * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
+    mask = offs < end
+    bcols = tl.load(indices_ptr + offs, mask=mask, other=0)
+    for inner_col in tl.static_range(0, BLOCK_DIM):
+        cols = bcols * BLOCK_DIM + inner_col
+        vals = tl.load(
+            data_ptr + offs * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM + inner_col,
+            mask=mask,
+            other=0.0,
+        )
+        tl.atomic_add(
+            c_ptr + cols[:, None] * stride_ck + offs_n[None, :] * stride_cn,
+            vals[:, None] * b_vals[None, :],
+            mask=mask[:, None] & mask_n[None, :],
+        )
+
+
+@triton.jit
+def _spmm_bsr_trans_complex_kernel(
+    data_ri_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ri_ptr,
+    c_ri_ptr,
+    n_block_rows,
+    n_dense_cols,
+    stride_bm,
+    stride_bn,
+    stride_br,
+    stride_ck,
+    stride_cn,
+    stride_cr,
+    BLOCK_DIM: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+    SEG: tl.constexpr,
+    CONJ: tl.constexpr,
+):
+    brow = tl.program_id(0)
+    inner_row = tl.program_id(1)
+    pid_n = tl.program_id(2)
+    if brow >= n_block_rows:
+        return
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    row = brow * BLOCK_DIM + inner_row
+    b_re = tl.load(
+        b_ri_ptr + row * stride_bm + offs_n * stride_bn,
+        mask=mask_n,
+        other=0.0,
+    )
+    b_im = tl.load(
+        b_ri_ptr + row * stride_bm + offs_n * stride_bn + stride_br,
+        mask=mask_n,
+        other=0.0,
+    )
+    start = tl.load(indptr_ptr + brow)
+    end = tl.load(indptr_ptr + brow + 1)
+    offs = start + SEG * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
+    mask = offs < end
+    bcols = tl.load(indices_ptr + offs, mask=mask, other=0)
+    for inner_col in tl.static_range(0, BLOCK_DIM):
+        cols = bcols * BLOCK_DIM + inner_col
+        elem = offs * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM + inner_col
+        a_re = tl.load(data_ri_ptr + elem * 2, mask=mask, other=0.0)
+        a_im_raw = tl.load(data_ri_ptr + elem * 2 + 1, mask=mask, other=0.0)
+        a_im = a_im_raw
+        if CONJ:
+            a_im = -a_im_raw
+        prod_re = a_re[:, None] * b_re[None, :] - a_im[:, None] * b_im[None, :]
+        prod_im = a_re[:, None] * b_im[None, :] + a_im[:, None] * b_re[None, :]
+        tl.atomic_add(
+            c_ri_ptr + cols[:, None] * stride_ck + offs_n[None, :] * stride_cn,
+            prod_re,
+            mask=mask[:, None] & mask_n[None, :],
+        )
+        tl.atomic_add(
+            c_ri_ptr
+            + cols[:, None] * stride_ck
+            + offs_n[None, :] * stride_cn
+            + stride_cr,
+            prod_im,
+            mask=mask[:, None] & mask_n[None, :],
+        )
+
+
 def _prepare_spmm_bsr_matrix(data, indices, indptr, shape, block_dim):
     if not torch.is_tensor(data) or not torch.is_tensor(indices) or not torch.is_tensor(indptr):
         raise TypeError("data, indices, and indptr must be torch.Tensor")
@@ -407,7 +532,7 @@ def prepare_spmm_bsr_route(
     )
 
 
-def _validate_spmm_bsr_B(B, prepared):
+def _validate_spmm_bsr_B(B, prepared, op_code):
     if B is None or not torch.is_tensor(B):
         raise TypeError("B must be a torch.Tensor")
     if B.ndim != 2:
@@ -418,23 +543,33 @@ def _validate_spmm_bsr_B(B, prepared):
         raise ValueError("B must be on the same CUDA device as sparse matrix data")
     if B.dtype != prepared.data.dtype:
         raise TypeError("B dtype must match sparse matrix dtype")
-    if B.shape[0] not in (prepared.n_cols, prepared.padded_n_cols):
+    if _spmm_bsr_op_transposes(op_code):
+        logical_rows = prepared.n_rows
+        padded_rows = prepared.padded_n_rows
+        logical_name = "n_rows"
+        padded_name = "padded_n_rows"
+    else:
+        logical_rows = prepared.n_cols
+        padded_rows = prepared.padded_n_cols
+        logical_name = "n_cols"
+        padded_name = "padded_n_cols"
+    if B.shape[0] not in (logical_rows, padded_rows):
         raise ValueError(
-            f"B.shape[0] must be n_cols={prepared.n_cols} or padded_n_cols={prepared.padded_n_cols}, got {B.shape[0]}"
+            f"B.shape[0] must be {logical_name}={logical_rows} or {padded_name}={padded_rows}, got {B.shape[0]}"
         )
-    if B.shape[0] == prepared.padded_n_cols:
+    if B.shape[0] == padded_rows:
         return B
     if B.stride(0) == 1 and B.shape[0] > 1:
         padded = torch.empty_strided(
-            (prepared.padded_n_cols, B.shape[1]),
-            (1, max(1, prepared.padded_n_cols)),
+            (padded_rows, B.shape[1]),
+            (1, max(1, padded_rows)),
             dtype=B.dtype,
             device=B.device,
         )
         padded.zero_()
     else:
         padded = torch.zeros(
-            (prepared.padded_n_cols, B.shape[1]),
+            (padded_rows, B.shape[1]),
             dtype=B.dtype,
             device=B.device,
         )
@@ -442,23 +577,34 @@ def _validate_spmm_bsr_B(B, prepared):
     return padded
 
 
-def _select_block_n(n_dense_cols, dtype):
+def _select_block_n(n_dense_cols, dtype, device=None):
+    rocm_launch = _spmm_rocm_launch_overrides(
+        n_dense_cols=n_dense_cols,
+        fmt="bsr",
+        dtype=dtype,
+        device=device,
+    )
+    if rocm_launch is not None and rocm_launch.get("block_n") is not None:
+        return int(rocm_launch["block_n"])
     if dtype in (torch.float64, torch.complex128):
         return 16 if n_dense_cols >= 16 else 8
     return 32 if n_dense_cols >= 32 else 16
 
 
-def _triton_spmm_bsr_base_kernel(prepared, B):
+def _triton_spmm_bsr_base_kernel(prepared, B, op_code=None):
+    op_code = _normalize_spmm_bsr_op(prepared.op if op_code is None else op_code)
+    transposes = _spmm_bsr_op_transposes(op_code)
     dtype = prepared.data.dtype
     n_dense_cols = int(B.shape[1])
+    out_rows = prepared.padded_n_cols if transposes else prepared.padded_n_rows
     C = torch.zeros(
-        (prepared.padded_n_rows, n_dense_cols),
+        (out_rows, n_dense_cols),
         dtype=dtype,
         device=prepared.data.device,
     )
     if prepared.nnzb == 0 or n_dense_cols == 0:
         return C
-    block_n = _select_block_n(n_dense_cols, dtype)
+    block_n = _select_block_n(n_dense_cols, dtype, prepared.data.device)
     grid = (
         prepared.n_block_rows,
         prepared.block_dim,
@@ -469,57 +615,100 @@ def _triton_spmm_bsr_base_kernel(prepared, B):
             data_ri = torch.view_as_real(prepared.data)
             B_ri = torch.view_as_real(B)
             C_ri = torch.view_as_real(C)
-            _spmm_bsr_non_complex_kernel[grid](
-                data_ri.reshape(-1),
-                prepared.kernel_indices,
-                prepared.kernel_indptr,
-                B_ri,
-                C_ri,
-                prepared.n_block_rows,
-                n_dense_cols,
-                B_ri.stride(0),
-                B_ri.stride(1),
-                B_ri.stride(2),
-                C_ri.stride(0),
-                C_ri.stride(1),
-                C_ri.stride(2),
-                BLOCK_DIM=prepared.block_dim,
-                BLOCK_N=block_n,
-                BLOCK_NNZ=prepared.block_nnz,
-                SEG=seg,
-                ACC_DTYPE=tl.float64 if dtype == torch.complex128 else tl.float32,
-            )
+            if transposes:
+                _spmm_bsr_trans_complex_kernel[grid](
+                    data_ri.reshape(-1),
+                    prepared.kernel_indices,
+                    prepared.kernel_indptr,
+                    B_ri,
+                    C_ri,
+                    prepared.n_block_rows,
+                    n_dense_cols,
+                    B_ri.stride(0),
+                    B_ri.stride(1),
+                    B_ri.stride(2),
+                    C_ri.stride(0),
+                    C_ri.stride(1),
+                    C_ri.stride(2),
+                    BLOCK_DIM=prepared.block_dim,
+                    BLOCK_N=block_n,
+                    BLOCK_NNZ=prepared.block_nnz,
+                    SEG=seg,
+                    CONJ=op_code == SPMM_BSR_OP_CONJ_TRANS,
+                )
+            else:
+                _spmm_bsr_non_complex_kernel[grid](
+                    data_ri.reshape(-1),
+                    prepared.kernel_indices,
+                    prepared.kernel_indptr,
+                    B_ri,
+                    C_ri,
+                    prepared.n_block_rows,
+                    n_dense_cols,
+                    B_ri.stride(0),
+                    B_ri.stride(1),
+                    B_ri.stride(2),
+                    C_ri.stride(0),
+                    C_ri.stride(1),
+                    C_ri.stride(2),
+                    BLOCK_DIM=prepared.block_dim,
+                    BLOCK_N=block_n,
+                    BLOCK_NNZ=prepared.block_nnz,
+                    SEG=seg,
+                    ACC_DTYPE=tl.float64 if dtype == torch.complex128 else tl.float32,
+                )
         else:
-            _spmm_bsr_non_real_kernel[grid](
-                prepared.data,
-                prepared.kernel_indices,
-                prepared.kernel_indptr,
-                B,
-                C,
-                prepared.n_block_rows,
-                n_dense_cols,
-                B.stride(0),
-                B.stride(1),
-                C.stride(0),
-                C.stride(1),
-                BLOCK_DIM=prepared.block_dim,
-                BLOCK_N=block_n,
-                BLOCK_NNZ=prepared.block_nnz,
-                SEG=seg,
-                ACC_DTYPE=tl.float64 if dtype == torch.float64 else tl.float32,
-            )
+            if transposes:
+                _spmm_bsr_trans_real_kernel[grid](
+                    prepared.data,
+                    prepared.kernel_indices,
+                    prepared.kernel_indptr,
+                    B,
+                    C,
+                    prepared.n_block_rows,
+                    n_dense_cols,
+                    B.stride(0),
+                    B.stride(1),
+                    C.stride(0),
+                    C.stride(1),
+                    BLOCK_DIM=prepared.block_dim,
+                    BLOCK_N=block_n,
+                    BLOCK_NNZ=prepared.block_nnz,
+                    SEG=seg,
+                )
+            else:
+                _spmm_bsr_non_real_kernel[grid](
+                    prepared.data,
+                    prepared.kernel_indices,
+                    prepared.kernel_indptr,
+                    B,
+                    C,
+                    prepared.n_block_rows,
+                    n_dense_cols,
+                    B.stride(0),
+                    B.stride(1),
+                    C.stride(0),
+                    C.stride(1),
+                    BLOCK_DIM=prepared.block_dim,
+                    BLOCK_N=block_n,
+                    BLOCK_NNZ=prepared.block_nnz,
+                    SEG=seg,
+                    ACC_DTYPE=tl.float64 if dtype == torch.float64 else tl.float32,
+                )
     return C
 
 
 def _run_spmm_bsr_base_route(prepared, B, *, timing=False, diagnostics=False):
     del diagnostics
     compute_ms = None
+    block_n = _select_block_n(int(B.shape[1]), prepared.data.dtype, prepared.data.device)
+    backend_info = _get_device_backend_info(prepared.data.device)
     if timing:
         torch.cuda.synchronize()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-    C = _triton_spmm_bsr_base_kernel(prepared, B)
+    C = _triton_spmm_bsr_base_kernel(prepared, B, _normalize_spmm_bsr_op(prepared.op))
     if timing:
         end.record()
         torch.cuda.synchronize()
@@ -528,6 +717,10 @@ def _run_spmm_bsr_base_route(prepared, B, *, timing=False, diagnostics=False):
         "process_cpu_ms": 0.0,
         "process_gpu_ms": 0.0 if timing else None,
         "compute_ms": compute_ms,
+        "block_n": int(block_n),
+        "block_nnz": int(prepared.block_nnz),
+        "launch_backend": backend_info["backend"],
+        "device_warp_size": int(backend_info["device_warp_size"]),
     }
 
 
@@ -535,7 +728,7 @@ SPMM_BSR_ALGORITHMS = {
     SPMM_BSR_ALG_BASE: SpmmBsrAlgorithm(
         name=SPMM_BSR_ALG_BASE,
         display_name="BSRBase",
-        supported_ops=("non",),
+        supported_ops=SPMM_BSR_SUPPORTED_OP_NAMES,
         supported_dtypes=SUPPORTED_SPMM_BSR_VALUE_DTYPES,
         run=_run_spmm_bsr_base_route,
     ),
@@ -647,9 +840,11 @@ def flagsparse_spmm_bsr_run(
         raise TypeError("prepared must be a PreparedBsrSpmm instance")
     op_name = prepared.op if op is None else _spmm_bsr_op_to_name(op)
     _ensure_spmm_bsr_supported_op(_normalize_spmm_bsr_op(op_name))
+    if op_name != prepared.op:
+        raise ValueError(f"op={op_name} does not match prepared.op={prepared.op}")
     alg_name = prepared.alg if alg is None else _normalize_spmm_bsr_alg(alg)
     algorithm = resolve_spmm_bsr_algorithm(alg_name, op_name, prepared.data.dtype)
-    B = _validate_spmm_bsr_B(B, prepared)
+    B = _validate_spmm_bsr_B(B, prepared, _normalize_spmm_bsr_op(op_name))
     collect_timing = bool(return_time or return_meta)
     if collect_timing:
         torch.cuda.synchronize()
@@ -682,6 +877,10 @@ def flagsparse_spmm_bsr_run(
             "n_block_cols": prepared.n_block_cols,
             "nnzb": prepared.nnzb,
             "stored_nnz": prepared.stored_nnz,
+            "block_n": route_meta.get("block_n"),
+            "block_nnz": route_meta.get("block_nnz"),
+            "launch_backend": route_meta.get("launch_backend"),
+            "device_warp_size": route_meta.get("device_warp_size"),
             "operator_ms": operator_ms,
             "gpu_ms": gpu_ms,
             "process_cpu_ms": process_cpu_ms,
@@ -730,8 +929,9 @@ def flagsparse_spmm_bsr(
 ):
     """BSR SpMM using native Triton BSR kernels.
 
-    The native compute layer follows padded block-grid semantics and returns a
-    tensor with ``padded_rows`` rows for ``op='non'``.
+    The native compute layer follows padded block-grid semantics. It returns
+    ``padded_rows`` rows for ``op='non'`` and ``padded_cols`` rows for
+    ``op='trans'`` or ``op='conj'``.
     """
     op_explicit = op is not None
     op_code = _normalize_spmm_bsr_op(
@@ -765,6 +965,8 @@ def flagsparse_spmm_bsr(
     else:
         if op_explicit and _spmm_bsr_op_to_name(op_code) != prepared.op:
             raise ValueError(f"op={_spmm_bsr_op_to_name(op_code)} does not match prepared.op={prepared.op}")
+        if transpose is not None and bool(transpose) != _spmm_bsr_op_transposes(prepared.op):
+            raise ValueError(f"transpose={bool(transpose)} does not match prepared.op={prepared.op}")
         if not op_explicit:
             op_code = _normalize_spmm_bsr_op(prepared.op)
     C = flagsparse_spmm_bsr_run(
@@ -793,3 +995,267 @@ def flagsparse_spmm_bsr(
     if return_meta:
         return out, C[1]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Vendor BSR SpMM reference
+#
+# The generic hipsparseSpMM API has no BSR format, so this rides the legacy
+# hipsparseXbsrmm entry point instead of the descriptor-based path the CSR/CSC
+# references use.  That brings two constraints worth stating up front: the
+# legacy API takes a hipsparseMatDescr_t rather than a sparse descriptor, and
+# its dense operands are column-major.
+# ---------------------------------------------------------------------------
+
+_HIPSPARSE_BSRMM_PREFIX = {
+    torch.float32: "S",
+    torch.float64: "D",
+    torch.complex64: "C",
+    torch.complex128: "Z",
+}
+
+
+def _hipsparse_bsrmm_function(value_dtype):
+    prefix = _HIPSPARSE_BSRMM_PREFIX.get(value_dtype)
+    if prefix is None:
+        raise TypeError(f"hipSPARSE bsrmm does not support {value_dtype}")
+    name = f"hipsparse{prefix}bsrmm"
+    fn = getattr(hipsparse, name, None)
+    if fn is None:
+        raise RuntimeError(f"hipSPARSE BSR SpMM is unavailable: missing {name}")
+    return fn
+
+
+def _hipsparse_spmm_bsr_skip_reason(value_dtype, index_dtype, op="non"):
+    if not _is_rocm_runtime():
+        return "hipSPARSE BSR SpMM reference requires a ROCm runtime"
+    unavailable_reason = _hipsparse_unavailable_reason()
+    if unavailable_reason is not None:
+        return unavailable_reason
+    for symbol in (
+        "hipsparseCreate",
+        "hipsparseDestroy",
+        "hipsparseCreateMatDescr",
+        "hipsparseDestroyMatDescr",
+        "hipsparseSetMatIndexBase",
+        "hipsparseSetMatType",
+    ):
+        if not hasattr(hipsparse, symbol):
+            return f"hipSPARSE BSR SpMM direct API is unavailable: missing {symbol}"
+    if value_dtype not in _HIPSPARSE_BSRMM_PREFIX:
+        return f"hipSPARSE BSR SpMM has no value dtype mapping for {value_dtype}"
+    if index_dtype != torch.int32:
+        # The legacy entry point is int32-only; there is no int64 bsrmm to fall
+        # back to, and silently downcasting would misreport what was measured.
+        return "hipSPARSE BSR SpMM requires int32 block indices/offsets"
+    if op != "non":
+        # rocsparse_bsrmm fixes trans_A to none, so trans/conj would have to be
+        # materialised first -- which is a different measurement.
+        return f"hipSPARSE BSR SpMM covers op=non only; {op} skipped"
+    try:
+        _ = _hipsparse_bsrmm_function(value_dtype)
+        _ = _hipsparse_scalar(value_dtype, 1.0, 0.0)
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _spmm_bsr_sparse_ref_backend(value_dtype, index_dtype, op="non"):
+    """Pick the vendor sparse library for a BSR SpMM reference, per backend."""
+    if _is_rocm_runtime():
+        reason = _hipsparse_spmm_bsr_skip_reason(value_dtype, index_dtype, op=op)
+        if reason is None:
+            return "hipsparse", None
+        return None, reason
+    if cp is None or cpx_sparse is None:
+        return None, "CuPy/cuSPARSE is not available"
+    if not hasattr(cpx_sparse, "bsr_matrix"):
+        return None, "CuPy cupyx.scipy.sparse has no bsr_matrix baseline"
+    return "cupy_cusparse", None
+
+
+def _prepare_spmm_bsr_ref_hipsparse(
+    data, indices, indptr, B, shape, block_dim, out=None, op="non"
+):
+    skip_reason = _hipsparse_spmm_bsr_skip_reason(data.dtype, indices.dtype, op=op)
+    if skip_reason is not None:
+        raise RuntimeError(skip_reason)
+    if indptr.dtype != torch.int32:
+        raise RuntimeError("hipSPARSE BSR SpMM requires int32 block indices/offsets")
+    if not all(t.is_cuda for t in (data, indices, indptr, B)):
+        raise ValueError("data, indices, indptr, B must all be CUDA tensors")
+    if B.ndim != 2:
+        raise ValueError("hipSPARSE BSR SpMM reference expects a 2D dense RHS")
+
+    block_dim = int(block_dim)
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if n_rows % block_dim or n_cols % block_dim:
+        raise ValueError("shape must already be padded to a block_dim multiple")
+    mb, kb = n_rows // block_dim, n_cols // block_dim
+    if indptr.numel() != mb + 1:
+        raise ValueError(f"indptr length must be mb+1={mb + 1}")
+    if int(B.shape[0]) != n_cols:
+        raise ValueError(f"B.shape[0] must equal n_cols={n_cols}")
+    if B.dtype != data.dtype:
+        raise TypeError("B dtype must match sparse value dtype")
+
+    n_dense_cols = int(B.shape[1])
+    if n_dense_cols == 0 or mb == 0:
+        return {
+            "backend": "hipsparse",
+            "C": torch.zeros((n_rows, 0), dtype=data.dtype, device=data.device),
+            "empty": True,
+        }
+
+    data = data.contiguous()
+    indices = indices.contiguous()
+    indptr = indptr.contiguous()
+    B = B.contiguous()
+
+    # bsrmm is column-major.  Row-major B (n_cols x n_dense_cols) reads as a
+    # column-major (n_dense_cols x n_cols) matrix with ldb = n_dense_cols, so
+    # transB=TRANSPOSE recovers the operand we want without a copy.  The output
+    # has no such trick available -- it must be written column-major, so C is
+    # allocated transposed and viewed back afterwards.
+    C_colmajor = torch.zeros(
+        (n_dense_cols, n_rows), dtype=data.dtype, device=data.device
+    )
+
+    alpha = _hipsparse_scalar(data.dtype, 1.0, 0.0)
+    beta = _hipsparse_scalar(data.dtype, 0.0, 0.0)
+    handle = None
+    descr = None
+    try:
+        handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        ptr_type = type(handle)
+        descr = ptr_type()
+        _hip_check_result(
+            hipsparse.hipsparseCreateMatDescr(descr.createRef()),
+            "hipsparseCreateMatDescr",
+        )
+        _hip_check_result(
+            hipsparse.hipsparseSetMatIndexBase(
+                descr,
+                _hipsparse_lookup(
+                    "hipsparseIndexBase_t", ("HIPSPARSE_INDEX_BASE_ZERO",)
+                ),
+            ),
+            "hipsparseSetMatIndexBase",
+        )
+        _hip_check_result(
+            hipsparse.hipsparseSetMatType(
+                descr,
+                _hipsparse_lookup(
+                    "hipsparseMatrixType_t", ("HIPSPARSE_MATRIX_TYPE_GENERAL",)
+                ),
+            ),
+            "hipsparseSetMatType",
+        )
+        return {
+            "backend": "hipsparse",
+            "empty": False,
+            "fn": _hipsparse_bsrmm_function(data.dtype),
+            "handle": handle,
+            "descr": descr,
+            # blocks are stored row-major inside each block
+            "dir_enum": _hipsparse_lookup(
+                "hipsparseDirection_t", ("HIPSPARSE_DIRECTION_ROW",)
+            ),
+            "op_none": _hipsparse_lookup(
+                "hipsparseOperation_t", ("HIPSPARSE_OPERATION_NON_TRANSPOSE",)
+            ),
+            "op_trans": _hipsparse_lookup(
+                "hipsparseOperation_t", ("HIPSPARSE_OPERATION_TRANSPOSE",)
+            ),
+            "mb": mb,
+            "kb": kb,
+            "n": n_dense_cols,
+            "nnzb": int(indices.numel()),
+            "block_dim": block_dim,
+            "alpha": alpha,
+            "beta": beta,
+            "val_ptr": HipPointer.fromObj(data.data_ptr()),
+            "row_ptr": HipPointer.fromObj(indptr.data_ptr()),
+            "col_ptr": HipPointer.fromObj(indices.data_ptr()),
+            "b_ptr": HipPointer.fromObj(B.data_ptr()),
+            "c_ptr": HipPointer.fromObj(C_colmajor.data_ptr()),
+            "ldb": n_dense_cols,
+            "ldc": n_rows,
+            "C_colmajor": C_colmajor,
+            "C": C_colmajor.t(),
+        }
+    except Exception:
+        _destroy_spmm_bsr_ref_hipsparse_prepared(
+            {"handle": handle, "descr": descr}
+        )
+        raise
+
+
+def _run_spmm_bsr_ref_hipsparse_prepared(state):
+    if state.get("empty"):
+        return state["C"]
+    _hip_check_result(
+        state["fn"](
+            state["handle"],
+            state["dir_enum"],
+            state["op_none"],
+            state["op_trans"],
+            state["mb"],
+            state["n"],
+            state["kb"],
+            state["nnzb"],
+            state["alpha"],
+            state["descr"],
+            state["val_ptr"],
+            state["row_ptr"],
+            state["col_ptr"],
+            state["block_dim"],
+            state["b_ptr"],
+            state["ldb"],
+            state["beta"],
+            state["c_ptr"],
+            state["ldc"],
+        ),
+        "hipsparseXbsrmm",
+    )
+    return state["C"]
+
+
+def _destroy_spmm_bsr_ref_hipsparse_prepared(state):
+    descr = state.get("descr")
+    handle = state.get("handle")
+    if descr is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyMatDescr(descr), "hipsparseDestroyMatDescr"
+            )
+        except Exception:
+            pass
+    if handle is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+        except Exception:
+            pass
+
+
+def _benchmark_spmm_bsr_sparse_ref(
+    data, indices, indptr, B, shape, block_dim, warmup, iters, op="non"
+):
+    """Vendor BSR SpMM baseline: hipSPARSE on ROCm, CuPy/cuSPARSE on CUDA."""
+    backend, reason = _spmm_bsr_sparse_ref_backend(data.dtype, indices.dtype, op=op)
+    result = {"backend": backend, "values": None, "ms": None, "reason": reason}
+    if backend != "hipsparse":
+        return result
+    values, ms = _benchmark_prepared_cuda_op(
+        lambda: _prepare_spmm_bsr_ref_hipsparse(
+            data, indices, indptr, B, shape, block_dim, op=op
+        ),
+        _run_spmm_bsr_ref_hipsparse_prepared,
+        _destroy_spmm_bsr_ref_hipsparse_prepared,
+        warmup=warmup,
+        iters=iters,
+    )
+    result["values"] = values.contiguous()
+    result["ms"] = ms
+    result["reason"] = None
+    return result
