@@ -242,7 +242,7 @@ python tests/test_spgemm.py <目录/> --csv results.csv    # 可选：--dtype fl
 # 常用选项：--dtype、--index-dtype、--warmup、--iters、--input-mode、--adaptive-loops、--no-cusparse、--ref-blocked-retry、--ref-isolated-retry、--ref-block-rows、--compare-device、--run-api-checks
 ```
 
-**test_spsv.py** - SpSV（三角求解；**仅方阵**）。CSR 与 COO 共用本脚本；**不存在** `test_spsv_coo.py`。
+**test_spsv.py** - CSR/COO SpSV（三角求解；**仅方阵**）。
 
 **test_spsv_sell.py** - 下三角、UNIT/NON_UNIT、实数/复数、原生列主序 SELL SpSV，
 支持 NON/TRANS/CONJ 操作模式。CSV 和终端字段
@@ -260,6 +260,9 @@ python tests/test_spsv.py <目录/> --csv-coo out.csv     # 列与 CSR 相同
 pytest -q -s tests/test_spsv_sell.py
 python tests/test_spsv_sell.py <目录或文件.mtx> --csv sell_alg1.csv --slice-size 32 --alg_num 1
 python tests/test_spsv_sell.py <目录或文件.mtx> --csv sell_alg2.csv --slice-size 32 --alg_num 2
+python tests/test_spsv_sell.py --csv sell_non.csv --ops NON <目录或文件.mtx>
+python tests/test_spsv_sell.py --csv sell_trans.csv --dtype float32 --slice-size 32 --ops TRANS <目录或文件.mtx>
+python tests/test_spsv_sell.py --csv sell_conj.csv --dtype complex64 --slice-size 32 --ops CONJ <目录或文件.mtx>
 python tests/test_spsv_sell.py <目录或文件.mtx> --csv sell_unit.csv --unit-diagonal
 python tests/test_spsv_sell.py --csv sell_trans.csv --dtype float32 --slice-size 32 --ops TRANS <目录或文件.mtx>
 python tests/test_spsv_sell.py --csv sell_conj.csv --dtype complex64 --slice-size 32 --ops CONJ <目录或文件.mtx>

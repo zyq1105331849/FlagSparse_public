@@ -37,7 +37,10 @@ EXPECTED_TOP_LEVEL = {
     "flagsparse_sddmm_csr",
     "flagsparse_spsv_csr",
     "flagsparse_spsv_coo",
+<<<<<<< HEAD
+=======
     "flagsparse_spsv_sell",
+>>>>>>> origin/main
     "flagsparse_spsv_analysis_sell",
     "flagsparse_spsv_solve_sell",
     "flagsparse_spsm_csr",

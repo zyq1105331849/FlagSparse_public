@@ -214,7 +214,6 @@ def benchmark_gather_case(
     triton_speedup_vs_cusparse = (
         cusparse_ms / triton_ms if (cusparse_ms is not None and triton_ms > 0) else None
     )
-
     return {
         "parameters": {
             "dense_size": dense_size,

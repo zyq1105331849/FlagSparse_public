@@ -115,6 +115,8 @@ def load_csr_spsv(file_path, dtype=torch.float32, device=None, lower=True):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     A = mmread(str(file_path)).tocsr()
+    if A.shape[0] != A.shape[1]:
+        raise NonSquareMatrixError("SpSV", A.shape)
     A.sum_duplicates()
     A.sort_indices()
     if A.shape[0] != A.shape[1]:

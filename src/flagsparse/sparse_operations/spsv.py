@@ -553,6 +553,10 @@ def _clear_spsv_csr_preprocess_cache():
     _SPSV_CSR_PREPROCESS_CACHE.clear()
 
 
+def _clear_spsv_sell_trans_analysis_cache():
+    _SPSV_SELL_TRANS_ANALYSIS_CACHE.clear()
+
+
 def _as_strided_contiguous(tensor):
     if tensor is None:
         return None
@@ -1457,17 +1461,14 @@ def _build_spsv_workspace_layout(n_rows, solve_kind, value_dtype=None):
             _workspace_entry("ready", n_rows, torch.int32),
             _workspace_entry("row_counter", 1, torch.int32),
         )
-    if solve_kind == "sell_trans":
+    if solve_kind == "sell_trans_queue":
         if value_dtype is None:
             raise ValueError("value_dtype is required for SELL TRANS workspace sizing")
         return (
-            _workspace_entry(
-                "residual",
-                n_rows,
-                _spsv_sell_trans_residual_dtype(value_dtype),
-            ),
+            _workspace_entry("residual", n_rows, value_dtype),
             _workspace_entry("indegree", n_rows, torch.int32),
-            _workspace_entry("row_counter", 1, torch.int32),
+            _workspace_entry("ready_queue", n_rows, torch.int32),
+            _workspace_entry("queue_state", 2, torch.int32),
         )
     if solve_kind == "csr_roc":
         return (
@@ -3025,7 +3026,7 @@ def _spsv_csr_cw_kernel_complex(
 
 
 @triton.jit
-def _spsv_sell_trans_analysis_kernel(
+def _spsv_sell_trans_structure_kernel(
     col_indices_ptr,
     slice_offsets_ptr,
     indegree_init_ptr,
@@ -3033,69 +3034,79 @@ def _spsv_sell_trans_analysis_kernel(
     row_widths_ptr,
     n_rows,
     SLICE_SIZE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
 ):
-    """Build immutable transpose metadata from column-major SELL."""
+    """Analyze transpose dependencies directly from the input SELL rows."""
 
-    row = tl.program_id(0)
+    slice_id = tl.program_id(0)
+    row_in_slice = tl.arange(0, BLOCK_ROWS)
+    row = slice_id * SLICE_SIZE + row_in_slice
+    valid_row = (row_in_slice < SLICE_SIZE) & (row < n_rows)
     row_i64 = row.to(tl.int64)
-    slice_id = row // SLICE_SIZE
-    row_in_slice = row_i64 - slice_id.to(tl.int64) * SLICE_SIZE
-    # Normalize analysis indexing to int64 for both supported SELL index
-    # dtypes.  This keeps every loop-carried index independent of pointer dtype.
     slice_start = tl.load(slice_offsets_ptr + slice_id).to(tl.int64)
     slice_end = tl.load(slice_offsets_ptr + slice_id + 1).to(tl.int64)
     width = (slice_end - slice_start) // SLICE_SIZE
-    zero_i64 = tl.zeros((), dtype=tl.int64)
-    # NON_UNIT validation guarantees that the diagonal replaces this value;
-    # UNIT does not read the recorded diagonal offset.
-    diag_offset = zero_i64
-    row_width = width
-    slot = zero_i64
+    diag_offset = tl.zeros((BLOCK_ROWS,), dtype=tl.int64)
+    row_width = tl.zeros((BLOCK_ROWS,), dtype=tl.int64) + width
+    slot = tl.zeros((), dtype=tl.int64)
     while slot < width:
         offset = slice_start + slot * SLICE_SIZE + row_in_slice
-        col = tl.load(col_indices_ptr + offset)
+        col = tl.load(col_indices_ptr + offset, mask=valid_row, other=-1)
         diag_offset = tl.where(col.to(tl.int64) == row_i64, offset, diag_offset)
         row_width = tl.where((col < 0) & (row_width == width), slot, row_width)
-        # For a lower A, row i of A^T depends on every A row j>i that
-        # contains column i.  Padding and the diagonal are not dependencies.
-        dependency = (col >= 0) & (col.to(tl.int64) < row_i64)
+        dependency = valid_row & (col >= 0) & (col.to(tl.int64) < row_i64)
         tl.atomic_add(indegree_init_ptr + col, 1, mask=dependency)
         slot += 1
-    tl.store(diag_offsets_ptr + row, diag_offset)
-    tl.store(row_widths_ptr + row, row_width.to(tl.int32))
+    tl.store(diag_offsets_ptr + row, diag_offset, mask=valid_row)
+    tl.store(row_widths_ptr + row, row_width.to(tl.int32), mask=valid_row)
 
 
 @triton.jit
-def _spsv_sell_trans_init_kernel(
+def _spsv_sell_trans_queue_clear_kernel(
+    ready_queue_ptr,
+    queue_state_ptr,
+    n_rows,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    tl.store(ready_queue_ptr + offsets, -1, mask=offsets < n_rows)
+    tl.store(queue_state_ptr + offsets, 0, mask=offsets < 2)
+
+
+@triton.jit
+def _spsv_sell_trans_queue_init_kernel(
     b_ptr,
     residual_ptr,
     indegree_init_ptr,
     indegree_ptr,
+    ready_queue_ptr,
+    queue_state_ptr,
     n_rows,
     BLOCK_SIZE: tl.constexpr,
     VALUE_ELEMENTS_PER_ROW: tl.constexpr,
-    RESIDUAL_FP64: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     value_mask = offsets < n_rows * VALUE_ELEMENTS_PER_ROW
     row_mask = offsets < n_rows
     rhs = tl.load(b_ptr + offsets, mask=value_mask, other=0.0)
-    if RESIDUAL_FP64:
-        rhs = rhs.to(tl.float64)
-    tl.store(
-        residual_ptr + offsets,
-        rhs,
-        mask=value_mask,
+    tl.store(residual_ptr + offsets, rhs, mask=value_mask)
+    initial_degree = tl.load(
+        indegree_init_ptr + offsets, mask=row_mask, other=0
     )
-    tl.store(
-        indegree_ptr + offsets,
-        tl.load(indegree_init_ptr + offsets, mask=row_mask, other=0),
-        mask=row_mask,
+    tl.store(indegree_ptr + offsets, initial_degree, mask=row_mask)
+    initially_ready = row_mask & (initial_degree == 0)
+    queue_tail_ptrs = queue_state_ptr + 1 + offsets * 0
+    queue_slot = tl.atomic_add(
+        queue_tail_ptrs,
+        1,
+        mask=initially_ready,
+        sem="relaxed",
     )
+    tl.store(ready_queue_ptr + queue_slot, offsets, mask=initially_ready)
 
 
 @triton.jit
-def _spsv_sell_trans_kernel(
+def _spsv_sell_trans_queue_kernel(
     values_ptr,
     col_indices_ptr,
     slice_offsets_ptr,
@@ -3104,66 +3115,52 @@ def _spsv_sell_trans_kernel(
     residual_ptr,
     x_ptr,
     indegree_ptr,
-    block_counter_ptr,
+    ready_queue_ptr,
+    queue_state_ptr,
     n_rows,
-    n_blocks,
     SLICE_SIZE: tl.constexpr,
-    BLOCK_ROWS: tl.constexpr,
+    BLOCK_SLOTS: tl.constexpr,
     UNIT_DIAG: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
 ):
-    """Slice-cooperative transpose SELL solver."""
+    """Solve A^T from source SELL using a bounded ready-row queue."""
 
-    lanes = tl.arange(0, BLOCK_ROWS)
-    zero_i32 = tl.zeros((BLOCK_ROWS,), dtype=tl.int32)
-    logical_block = tl.atomic_add(block_counter_ptr, 1, sem="relaxed")
-    while logical_block < n_blocks:
-        first_row = n_rows - (logical_block + 1) * BLOCK_ROWS
-        raw_row = first_row + (BLOCK_ROWS - 1 - lanes)
-        valid_row = (raw_row >= 0) & (raw_row < n_rows)
-        row = tl.maximum(raw_row, 0)
-        slice_id = row // SLICE_SIZE
-        row_in_slice = row - slice_id * SLICE_SIZE
-        slice_start = tl.load(slice_offsets_ptr + slice_id, mask=valid_row, other=0)
-        row_width = tl.load(row_widths_ptr + row, mask=valid_row, other=0)
-        pending = valid_row
-
-        while tl.sum(pending.to(tl.int32), axis=0) != 0:
-            ready_hint = tl.load(
-                indegree_ptr + row,
-                mask=pending,
-                other=1,
-                cache_modifier=".cv",
-                volatile=True,
+    slots = tl.arange(0, BLOCK_SLOTS)
+    queue_tail_ptrs = queue_state_ptr + 1 + slots * 0
+    queue_index = tl.atomic_add(queue_state_ptr, 1, sem="relaxed")
+    while queue_index < n_rows:
+        row = tl.atomic_add(
+            ready_queue_ptr + queue_index, 0, sem="acquire"
+        )
+        while row < 0:
+            row = tl.atomic_add(
+                ready_queue_ptr + queue_index, 0, sem="acquire"
             )
-            candidate = pending & (ready_hint == 0)
-            ready_value = tl.atomic_add(
-                indegree_ptr + row,
-                zero_i32,
-                mask=candidate,
-                sem="acquire",
-            )
-            ready = candidate & (ready_value == 0)
+        if row >= 0:
+            slice_id = row // SLICE_SIZE
+            row_in_slice = row - slice_id * SLICE_SIZE
+            slice_start = tl.load(slice_offsets_ptr + slice_id)
+            row_width = tl.load(row_widths_ptr + row)
             if USE_FP64_ACC:
-                rhs = tl.load(residual_ptr + row, mask=ready, other=0.0).to(tl.float64)
+                rhs = tl.load(residual_ptr + row).to(tl.float64)
             else:
-                rhs = tl.load(residual_ptr + row, mask=ready, other=0.0).to(tl.float32)
+                rhs = tl.load(residual_ptr + row).to(tl.float32)
             if UNIT_DIAG:
                 diag = rhs * 0.0 + 1.0
             else:
-                diag_offset = tl.load(diag_offsets_ptr + row, mask=ready, other=0)
-                diag = tl.load(values_ptr + diag_offset, mask=ready, other=1.0)
+                diag_offset = tl.load(diag_offsets_ptr + row)
+                diag = tl.load(values_ptr + diag_offset)
                 if USE_FP64_ACC:
                     diag = diag.to(tl.float64)
                 else:
                     diag = diag.to(tl.float32)
-
             x_row = rhs / diag
-            tl.store(x_ptr + row, x_row, mask=ready)
+            tl.store(x_ptr + row, x_row)
 
-            slot = zero_i32
-            while tl.sum((ready & (slot < row_width)).to(tl.int32), axis=0) != 0:
-                active = ready & (slot < row_width)
+            slot_base = 0
+            while slot_base < row_width:
+                slot = slot_base + slots
+                active = slot < row_width
                 offset = slice_start + slot * SLICE_SIZE + row_in_slice
                 col = tl.load(col_indices_ptr + offset, mask=active, other=-1)
                 dependency = active & (col >= 0) & (col < row)
@@ -3174,25 +3171,32 @@ def _spsv_sell_trans_kernel(
                 else:
                     a = a.to(tl.float32)
                     x_value = x_row.to(tl.float32)
-                tl.atomic_add(
-                    residual_ptr + col,
-                    -a * x_value,
-                    mask=dependency,
-                )
-                tl.atomic_add(
+                tl.atomic_add(residual_ptr + col, -a * x_value, mask=dependency)
+                old_degree = tl.atomic_add(
                     indegree_ptr + col,
                     -1,
                     mask=dependency,
+                    sem="acq_rel",
+                )
+                became_ready = dependency & (old_degree == 1)
+                queue_slot = tl.atomic_add(
+                    queue_tail_ptrs,
+                    1,
+                    mask=became_ready,
+                    sem="relaxed",
+                )
+                tl.atomic_add(
+                    ready_queue_ptr + queue_slot,
+                    col + 1,
+                    mask=became_ready,
                     sem="release",
                 )
-                slot += 1
-            pending = pending & ~ready
-
-        logical_block = tl.atomic_add(block_counter_ptr, 1, sem="relaxed")
+                slot_base += BLOCK_SLOTS
+        queue_index = tl.atomic_add(queue_state_ptr, 1, sem="relaxed")
 
 
 @triton.jit
-def _spsv_sell_trans_kernel_complex(
+def _spsv_sell_trans_queue_complex_kernel(
     values_ri_ptr,
     col_indices_ptr,
     slice_offsets_ptr,
@@ -3201,49 +3205,35 @@ def _spsv_sell_trans_kernel_complex(
     residual_ri_ptr,
     x_ri_ptr,
     indegree_ptr,
-    block_counter_ptr,
+    ready_queue_ptr,
+    queue_state_ptr,
     n_rows,
-    n_blocks,
     SLICE_SIZE: tl.constexpr,
-    BLOCK_ROWS: tl.constexpr,
+    BLOCK_SLOTS: tl.constexpr,
     UNIT_DIAG: tl.constexpr,
     CONJ_TRANS: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
 ):
-    """Complex slice-cooperative transpose SELL solver."""
+    """Solve complex A^T/A^H from source SELL using a ready queue."""
 
-    lanes = tl.arange(0, BLOCK_ROWS)
-    zero_i32 = tl.zeros((BLOCK_ROWS,), dtype=tl.int32)
-    logical_block = tl.atomic_add(block_counter_ptr, 1, sem="relaxed")
-    while logical_block < n_blocks:
-        first_row = n_rows - (logical_block + 1) * BLOCK_ROWS
-        raw_row = first_row + (BLOCK_ROWS - 1 - lanes)
-        valid_row = (raw_row >= 0) & (raw_row < n_rows)
-        row = tl.maximum(raw_row, 0)
-        slice_id = row // SLICE_SIZE
-        row_in_slice = row - slice_id * SLICE_SIZE
-        slice_start = tl.load(slice_offsets_ptr + slice_id, mask=valid_row, other=0)
-        row_width = tl.load(row_widths_ptr + row, mask=valid_row, other=0)
-        pending = valid_row
-
-        while tl.sum(pending.to(tl.int32), axis=0) != 0:
-            ready_hint = tl.load(
-                indegree_ptr + row,
-                mask=pending,
-                other=1,
-                cache_modifier=".cv",
-                volatile=True,
+    slots = tl.arange(0, BLOCK_SLOTS)
+    queue_tail_ptrs = queue_state_ptr + 1 + slots * 0
+    queue_index = tl.atomic_add(queue_state_ptr, 1, sem="relaxed")
+    while queue_index < n_rows:
+        row = tl.atomic_add(
+            ready_queue_ptr + queue_index, 0, sem="acquire"
+        )
+        while row < 0:
+            row = tl.atomic_add(
+                ready_queue_ptr + queue_index, 0, sem="acquire"
             )
-            candidate = pending & (ready_hint == 0)
-            ready_value = tl.atomic_add(
-                indegree_ptr + row,
-                zero_i32,
-                mask=candidate,
-                sem="acquire",
-            )
-            ready = candidate & (ready_value == 0)
-            rhs_re = tl.load(residual_ri_ptr + row * 2, mask=ready, other=0.0)
-            rhs_im = tl.load(residual_ri_ptr + row * 2 + 1, mask=ready, other=0.0)
+        if row >= 0:
+            slice_id = row // SLICE_SIZE
+            row_in_slice = row - slice_id * SLICE_SIZE
+            slice_start = tl.load(slice_offsets_ptr + slice_id)
+            row_width = tl.load(row_widths_ptr + row)
+            rhs_re = tl.load(residual_ri_ptr + row * 2)
+            rhs_im = tl.load(residual_ri_ptr + row * 2 + 1)
             if USE_FP64_ACC:
                 rhs_re = rhs_re.to(tl.float64)
                 rhs_im = rhs_im.to(tl.float64)
@@ -3254,17 +3244,9 @@ def _spsv_sell_trans_kernel_complex(
                 diag_re = rhs_re * 0.0 + 1.0
                 diag_im = rhs_im * 0.0
             else:
-                diag_offset = tl.load(diag_offsets_ptr + row, mask=ready, other=0)
-                diag_re = tl.load(
-                    values_ri_ptr + diag_offset * 2,
-                    mask=ready,
-                    other=1.0,
-                )
-                diag_im = tl.load(
-                    values_ri_ptr + diag_offset * 2 + 1,
-                    mask=ready,
-                    other=0.0,
-                )
+                diag_offset = tl.load(diag_offsets_ptr + row)
+                diag_re = tl.load(values_ri_ptr + diag_offset * 2)
+                diag_im = tl.load(values_ri_ptr + diag_offset * 2 + 1)
                 if CONJ_TRANS:
                     diag_im = -diag_im
                 if USE_FP64_ACC:
@@ -3273,23 +3255,21 @@ def _spsv_sell_trans_kernel_complex(
                 else:
                     diag_re = diag_re.to(tl.float32)
                     diag_im = diag_im.to(tl.float32)
-
             den = diag_re * diag_re + diag_im * diag_im
             x_re = (rhs_re * diag_re + rhs_im * diag_im) / den
             x_im = (rhs_im * diag_re - rhs_re * diag_im) / den
-            tl.store(x_ri_ptr + row * 2, x_re, mask=ready)
-            tl.store(x_ri_ptr + row * 2 + 1, x_im, mask=ready)
+            tl.store(x_ri_ptr + row * 2, x_re)
+            tl.store(x_ri_ptr + row * 2 + 1, x_im)
 
-            slot = zero_i32
-            while tl.sum((ready & (slot < row_width)).to(tl.int32), axis=0) != 0:
-                active = ready & (slot < row_width)
+            slot_base = 0
+            while slot_base < row_width:
+                slot = slot_base + slots
+                active = slot < row_width
                 offset = slice_start + slot * SLICE_SIZE + row_in_slice
                 col = tl.load(col_indices_ptr + offset, mask=active, other=-1)
                 dependency = active & (col >= 0) & (col < row)
                 a_re = tl.load(
-                    values_ri_ptr + offset * 2,
-                    mask=dependency,
-                    other=0.0,
+                    values_ri_ptr + offset * 2, mask=dependency, other=0.0
                 )
                 a_im = tl.load(
                     values_ri_ptr + offset * 2 + 1,
@@ -3311,25 +3291,34 @@ def _spsv_sell_trans_kernel_complex(
                 delta_re = -(a_re * x_re_acc - a_im * x_im_acc)
                 delta_im = -(a_re * x_im_acc + a_im * x_re_acc)
                 tl.atomic_add(
-                    residual_ri_ptr + col * 2,
-                    delta_re,
-                    mask=dependency,
+                    residual_ri_ptr + col * 2, delta_re, mask=dependency
                 )
                 tl.atomic_add(
                     residual_ri_ptr + col * 2 + 1,
                     delta_im,
                     mask=dependency,
                 )
-                tl.atomic_add(
+                old_degree = tl.atomic_add(
                     indegree_ptr + col,
                     -1,
                     mask=dependency,
+                    sem="acq_rel",
+                )
+                became_ready = dependency & (old_degree == 1)
+                queue_slot = tl.atomic_add(
+                    queue_tail_ptrs,
+                    1,
+                    mask=became_ready,
+                    sem="relaxed",
+                )
+                tl.atomic_add(
+                    ready_queue_ptr + queue_slot,
+                    col + 1,
+                    mask=became_ready,
                     sem="release",
                 )
-                slot += 1
-            pending = pending & ~ready
-
-        logical_block = tl.atomic_add(block_counter_ptr, 1, sem="relaxed")
+                slot_base += BLOCK_SLOTS
+        queue_index = tl.atomic_add(queue_state_ptr, 1, sem="relaxed")
 
 
 @triton.jit
@@ -4849,7 +4838,50 @@ def _launch_spsv_sell(
     return out
 
 
-def _launch_spsv_sell_trans(
+def _build_spsv_sell_trans_queue_metadata(
+    col_indices, slice_offsets, n_rows, slice_size
+):
+    """Build the minimal dependency metadata for direct SELL transpose."""
+
+    n_rows = int(n_rows)
+    device = col_indices.device
+    if n_rows == 0:
+        return {
+            "indegree_init32": torch.empty(0, dtype=torch.int32, device=device),
+            "diag_offsets": torch.empty(0, dtype=torch.int64, device=device),
+            "row_widths32": torch.empty(0, dtype=torch.int32, device=device),
+            "block_slots": 32,
+            "worker_count": 0,
+        }
+    indegree_init32 = torch.zeros(n_rows, dtype=torch.int32, device=device)
+    diag_offsets = torch.empty(n_rows, dtype=torch.int64, device=device)
+    row_widths32 = torch.empty(n_rows, dtype=torch.int32, device=device)
+    n_slices = (n_rows + int(slice_size) - 1) // int(slice_size)
+    block_rows = 1 << (int(slice_size) - 1).bit_length()
+    _spsv_sell_trans_structure_kernel[(n_slices,)](
+        col_indices,
+        slice_offsets,
+        indegree_init32,
+        diag_offsets,
+        row_widths32,
+        n_rows,
+        SLICE_SIZE=int(slice_size),
+        BLOCK_ROWS=int(block_rows),
+        num_warps=1,
+    )
+    # The shared queue eliminates blocked row tasks; this cap supplies enough
+    # active warps without recreating the old 2048-way polling contention.
+    worker_count = _snap_cw_worker_count(min(1024, n_rows), n_rows)
+    return {
+        "indegree_init32": indegree_init32,
+        "diag_offsets": diag_offsets,
+        "row_widths32": row_widths32,
+        "block_slots": 32,
+        "worker_count": int(worker_count),
+    }
+
+
+def _launch_spsv_sell_trans_queue(
     values,
     col_indices,
     slice_offsets,
@@ -4860,31 +4892,47 @@ def _launch_spsv_sell_trans(
     n_rows,
     *,
     slice_size,
+    block_slots,
+    worker_count,
     out,
-    residual,
-    indegree,
-    row_counter,
+    residual_in,
+    indegree_in,
+    ready_queue_in,
+    queue_state_in,
     unit_diagonal=False,
     conj_trans=False,
     values_ri_in=None,
 ):
-    """Launch the dedicated SELL transpose dependency-propagation route."""
+    """Launch direct ready-queue propagation from the original SELL matrix."""
 
-    row_counter.zero_()
-    if n_rows == 0:
+    if int(n_rows) == 0:
         return out
-
     is_complex = torch.is_complex(values)
+    use_fp64_acc = values.dtype in (torch.float64, torch.complex128)
     if is_complex:
-        b_init = torch.view_as_real(b_vec).reshape(-1)
-        residual_init = torch.view_as_real(residual).reshape(-1)
+        if values_ri_in is None:
+            raise RuntimeError("SELL TRANS complex analysis is missing interleaved values")
+        values_ri = values_ri_in
+        b_ri = torch.view_as_real(b_vec.contiguous()).reshape(-1).contiguous()
+        residual_ri = torch.view_as_real(residual_in).reshape(-1)
+        out_ri = torch.view_as_real(out.contiguous()).reshape(-1).contiguous()
+        init_b = b_ri
+        init_residual = residual_ri
         value_elements_per_row = 2
     else:
-        b_init = b_vec
-        residual_init = residual
+        init_b = b_vec
+        init_residual = residual_in
         value_elements_per_row = 1
     init_block_size = 256
-    _spsv_sell_trans_init_kernel[
+    init_grid = (triton.cdiv(int(n_rows), init_block_size),)
+    _spsv_sell_trans_queue_clear_kernel[init_grid](
+        ready_queue_in,
+        queue_state_in,
+        int(n_rows),
+        BLOCK_SIZE=init_block_size,
+        num_warps=4,
+    )
+    _spsv_sell_trans_queue_init_kernel[
         (
             triton.cdiv(
                 int(n_rows) * value_elements_per_row,
@@ -4892,35 +4940,19 @@ def _launch_spsv_sell_trans(
             ),
         )
     ](
-        b_init,
-        residual_init,
+        init_b,
+        init_residual,
         indegree_init,
-        indegree,
-        n_rows,
+        indegree_in,
+        ready_queue_in,
+        queue_state_in,
+        int(n_rows),
         BLOCK_SIZE=init_block_size,
         VALUE_ELEMENTS_PER_ROW=value_elements_per_row,
-        RESIDUAL_FP64=bool(residual.dtype in (torch.float64, torch.complex128)),
         num_warps=4,
     )
-    # The residual buffer controls the accumulation dtype.  For float32 and
-    # complex64 input, only this internal buffer is widened; x remains in the
-    # original user-visible dtype.
-    use_fp64_acc = residual.dtype in (torch.float64, torch.complex128)
     if is_complex:
-        values_ri = (
-            values_ri_in
-            if values_ri_in is not None
-            else _complex_interleaved_view(values)
-        )
-        residual_ri = torch.view_as_real(residual).reshape(-1)
-        out_ri = torch.view_as_real(out).reshape(-1)
-
-    block_rows = 1 << (int(slice_size) - 1).bit_length()
-    n_blocks = (int(n_rows) + block_rows - 1) // block_rows
-    worker_count = _snap_cw_worker_count(min(512, n_blocks), n_blocks)
-
-    if is_complex:
-        _spsv_sell_trans_kernel_complex[(int(worker_count),)](
+        _spsv_sell_trans_queue_complex_kernel[(int(worker_count),)](
             values_ri,
             col_indices,
             slice_offsets,
@@ -4928,34 +4960,34 @@ def _launch_spsv_sell_trans(
             row_widths,
             residual_ri,
             out_ri,
-            indegree,
-            row_counter,
-            n_rows,
-            int(n_blocks),
+            indegree_in,
+            ready_queue_in,
+            queue_state_in,
+            int(n_rows),
             SLICE_SIZE=int(slice_size),
-            BLOCK_ROWS=int(block_rows),
+            BLOCK_SLOTS=int(block_slots),
             UNIT_DIAG=bool(unit_diagonal),
             CONJ_TRANS=bool(conj_trans),
-            USE_FP64_ACC=use_fp64_acc,
+            USE_FP64_ACC=bool(use_fp64_acc),
             num_warps=1,
         )
     else:
-        _spsv_sell_trans_kernel[(int(worker_count),)](
+        _spsv_sell_trans_queue_kernel[(int(worker_count),)](
             values,
             col_indices,
             slice_offsets,
             diag_offsets,
             row_widths,
-            residual,
+            residual_in,
             out,
-            indegree,
-            row_counter,
-            n_rows,
-            int(n_blocks),
+            indegree_in,
+            ready_queue_in,
+            queue_state_in,
+            int(n_rows),
             SLICE_SIZE=int(slice_size),
-            BLOCK_ROWS=int(block_rows),
+            BLOCK_SLOTS=int(block_slots),
             UNIT_DIAG=bool(unit_diagonal),
-            USE_FP64_ACC=use_fp64_acc,
+            USE_FP64_ACC=bool(use_fp64_acc),
             num_warps=1,
         )
     return out
@@ -6866,36 +6898,18 @@ def flagsparse_spsv_analysis_sell(
         if alg2_worker_count is not None:
             raise ValueError("SELL TRANS/CONJ do not accept worker-count tuning")
         if trans_analysis is None:
-            indegree_init = torch.zeros(
+            queue_meta = _build_spsv_sell_trans_queue_metadata(
+                cols,
+                offsets,
                 n_rows,
-                dtype=torch.int32,
-                device=values.device,
+                slice_size,
             )
-            diag_offsets = torch.empty(
-                n_rows,
-                dtype=torch.int64,
-                device=values.device,
-            )
-            row_widths = torch.empty(
-                n_rows,
-                dtype=torch.int32,
-                device=values.device,
-            )
-            if n_rows > 0:
-                _spsv_sell_trans_analysis_kernel[(n_rows,)](
-                    cols,
-                    offsets,
-                    indegree_init,
-                    diag_offsets,
-                    row_widths,
-                    n_rows,
-                    SLICE_SIZE=int(slice_size),
-                    num_warps=1,
-                )
             trans_analysis = {
-                "indegree_init": indegree_init,
-                "diag_offsets": diag_offsets,
-                "row_widths": row_widths,
+                "indegree_init32": queue_meta["indegree_init32"],
+                "diag_offsets": queue_meta["diag_offsets"],
+                "row_widths32": queue_meta["row_widths32"],
+                "block_slots": int(queue_meta["block_slots"]),
+                "worker_count": int(queue_meta["worker_count"]),
             }
             if trans_analysis_key is not None:
                 _spsv_cache_put(
@@ -6904,7 +6918,7 @@ def flagsparse_spsv_analysis_sell(
                     trans_analysis,
                     _SPSV_SELL_TRANS_ANALYSIS_CACHE_SIZE,
                 )
-        solve_kind = "sell_trans"
+        solve_kind = "sell_trans_queue"
     layout = _build_spsv_workspace_layout(
         n_rows, solve_kind, value_dtype=values.dtype
     )
@@ -6919,9 +6933,11 @@ def flagsparse_spsv_analysis_sell(
         solve_plan["alg_num"] = int(alg_num)
         solve_plan["alg2_worker_count"] = resolved_workers
     else:
-        solve_plan["indegree_init"] = trans_analysis["indegree_init"]
-        solve_plan["diag_offsets"] = trans_analysis["diag_offsets"]
-        solve_plan["row_widths"] = trans_analysis["row_widths"]
+        solve_plan["trans_indegree_init32"] = trans_analysis["indegree_init32"]
+        solve_plan["trans_diag_offsets"] = trans_analysis["diag_offsets"]
+        solve_plan["trans_row_widths32"] = trans_analysis["row_widths32"]
+        solve_plan["trans_block_slots"] = int(trans_analysis["block_slots"])
+        solve_plan["trans_worker_count"] = int(trans_analysis["worker_count"])
     _attach_spsv_complex_plan_views(solve_plan)
     return FlagSparseSpSVDescr(
         format="sell",
@@ -6992,20 +7008,27 @@ def flagsparse_spsv_solve_sell(
     )
     plan = descr.solve_plan
     if descr.transpose_mode in ("T", "C"):
-        return _launch_spsv_sell_trans(
+        if descr.solve_kind != "sell_trans_queue":
+            raise RuntimeError(
+                "SELL TRANS/CONJ must use the direct ready-queue route"
+            )
+        return _launch_spsv_sell_trans_queue(
             descr.data,
             descr.indices,
             descr.indptr,
-            plan["indegree_init"],
-            plan["diag_offsets"],
-            plan["row_widths"],
+            plan["trans_indegree_init32"],
+            plan["trans_diag_offsets"],
+            plan["trans_row_widths32"],
             _as_strided_contiguous(b),
             n_rows,
             slice_size=int(plan["slice_size"]),
+            block_slots=int(plan["trans_block_slots"]),
+            worker_count=int(plan["trans_worker_count"]),
             out=out,
-            residual=buffers.get("residual"),
-            indegree=buffers.get("indegree"),
-            row_counter=buffers.get("row_counter"),
+            residual_in=buffers["residual"],
+            indegree_in=buffers["indegree"],
+            ready_queue_in=buffers["ready_queue"],
+            queue_state_in=buffers["queue_state"],
             unit_diagonal=bool(descr.unit_diagonal),
             conj_trans=descr.transpose_mode == "C",
             values_ri_in=plan.get("kernel_data_ri"),
@@ -7024,37 +7047,6 @@ def flagsparse_spsv_solve_sell(
         alg2_worker_count=plan.get("alg2_worker_count"),
         unit_diagonal=bool(descr.unit_diagonal),
         values_ri_in=plan.get("kernel_data_ri"),
-    )
-
-
-def flagsparse_spsv_sell(
-    values,
-    col_indices,
-    slice_offsets,
-    b,
-    shape,
-    *,
-    slice_size,
-    alg_num=None,
-    alg2_worker_count=None,
-    unit_diagonal=False,
-    transpose=False,
-    out=None,
-    workspace=None,
-):
-    """Analyze and solve a lower SELL SpSV problem."""
-
-    descr = flagsparse_spsv_analysis_sell(
-        values,
-        col_indices,
-        slice_offsets,
-        shape,
-        slice_size=slice_size,
-        alg_num=alg_num,
-        alg2_worker_count=alg2_worker_count,
-        unit_diagonal=unit_diagonal,
-        transpose=transpose,
-        workspace=workspace,
     )
     return flagsparse_spsv_solve_sell(descr, b, out=out, workspace=workspace)
 

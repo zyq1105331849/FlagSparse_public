@@ -515,9 +515,25 @@ def _prepare_canonical_case(data, row, col, shape, B, op="non", layout="row"):
         cusparse_col,
         n_cols,
     )
+<<<<<<< HEAD
+    cusparse_data, cusparse_row, cusparse_col = ast_ops._coalesce_coo_entries(
+        native_data,
+        native_row,
+        native_col,
+        (n_rows, n_cols),
+    )
+    cusparse_data, cusparse_row, cusparse_col = ast_ops._sort_coo_lex_inplace(
+        cusparse_data,
+        cusparse_row,
+        cusparse_col,
+        n_cols,
+    )
+    native_coo = ast_ops._build_torch_sparse_coo(native_data, native_row, native_col, shape)
+=======
     native_coo = ast_ops._build_torch_sparse_coo(
         native_data, native_row, native_col, shape
     )
+>>>>>>> origin/main
     return {
         "native_data": native_data,
         "native_row": native_row,

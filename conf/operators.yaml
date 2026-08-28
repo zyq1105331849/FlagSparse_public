@@ -373,7 +373,6 @@ ops:
       NON_TRANS, while TRANS/CONJ uses one dedicated slice-cooperative
       reverse-dependency kernel.
     for:
-      - flagsparse_spsv_sell
       - flagsparse_spsv_analysis_sell
       - flagsparse_spsv_solve_sell
     labels:

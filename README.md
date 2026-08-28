@@ -255,6 +255,8 @@ and SELL conversion are outside the timed interval. The direct
 the slice-cooperative ALG2 path. TRANS/CONJ use a dedicated reverse-dependency
 kernel and do not accept `--alg_num` or `--alg2-workers`.
 
+**test_spsv_sell.py** - lower, UNIT/NON_UNIT, real/complex, native column-major
+SELL SpSV. 
 ```bash
 python tests/test_spsv.py --synthetic
 python tests/test_spsv.py <dir/> --csv-csr spsv.csv
@@ -262,6 +264,9 @@ python tests/test_spsv.py <dir/> --csv-coo out.csv      # same CSV columns as CS
 pytest -q -s tests/test_spsv_sell.py
 python tests/test_spsv_sell.py <dir_or_file.mtx> --csv sell_alg1.csv --slice-size 32 --alg_num 1
 python tests/test_spsv_sell.py <dir_or_file.mtx> --csv sell_alg2.csv --slice-size 32 --alg_num 2
+python tests/test_spsv_sell.py --csv sell_non.csv --ops NON <dir_or_file.mtx>
+python tests/test_spsv_sell.py --csv sell_trans.csv --dtype float32 --slice-size 32 --ops TRANS <dir_or_file.mtx>
+python tests/test_spsv_sell.py --csv sell_conj.csv --dtype complex64 --slice-size 32 --ops CONJ <dir_or_file.mtx>
 python tests/test_spsv_sell.py <dir_or_file.mtx> --csv sell_unit.csv --unit-diagonal
 python tests/test_spsv_sell.py --csv sell_trans.csv --dtype float32 --slice-size 32 --ops TRANS <dir_or_file.mtx>
 python tests/test_spsv_sell.py --csv sell_conj.csv --dtype complex64 --slice-size 32 --ops CONJ <dir_or_file.mtx>
