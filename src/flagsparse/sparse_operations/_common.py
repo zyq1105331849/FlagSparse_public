@@ -705,6 +705,7 @@ def _hipsparse_unavailable_reason():
 
 
 def _hipsparse_create_coo_descriptor(
+    spmat_ref,
     n_rows,
     n_cols,
     nnz,
@@ -715,11 +716,12 @@ def _hipsparse_create_coo_descriptor(
     index_base,
     value_type,
 ):
-    # hip-python returns the sparse descriptor as a payload rather than filling
-    # an output slot, unlike hipsparseCreateDnVec/DnMat which keep the
-    # out-parameter form. Some wrappers also split the COO index type in two.
+    # hip-python sparse descriptors follow the same out-parameter form as
+    # dense descriptors: callers create a descriptor object and pass
+    # descriptor.createRef() as the first argument.
     attempts = (
         (
+            spmat_ref,
             n_rows,
             n_cols,
             nnz,
@@ -731,6 +733,7 @@ def _hipsparse_create_coo_descriptor(
             value_type,
         ),
         (
+            spmat_ref,
             n_rows,
             n_cols,
             nnz,
@@ -759,6 +762,7 @@ def _hipsparse_create_coo_descriptor(
 
 
 def _hipsparse_create_csc_descriptor(
+    spmat_ref,
     n_rows,
     n_cols,
     nnz,
@@ -770,10 +774,11 @@ def _hipsparse_create_csc_descriptor(
     index_base,
     value_type,
 ):
-    # Same payload-style return as CreateCsr; the operand order is
-    # (colOffsets, rowInd) rather than (rowOffsets, colInd).
+    # The operand order is (colOffsets, rowInd) rather than
+    # (rowOffsets, colInd).
     return _hip_check_result(
         hipsparse.hipsparseCreateCsc(
+            spmat_ref,
             n_rows,
             n_cols,
             nnz,
@@ -790,6 +795,7 @@ def _hipsparse_create_csc_descriptor(
 
 
 def _hipsparse_create_csr_descriptor(
+    spmat_ref,
     n_rows,
     n_cols,
     nnz,
@@ -801,10 +807,9 @@ def _hipsparse_create_csr_descriptor(
     index_base,
     value_type,
 ):
-    # As with COO, the CSR descriptor comes back as a payload instead of being
-    # written into a leading output slot.
     return _hip_check_result(
         hipsparse.hipsparseCreateCsr(
+            spmat_ref,
             n_rows,
             n_cols,
             nnz,
@@ -1311,8 +1316,10 @@ def _prepare_spmv_coo_ref_hipsparse(
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
         ptr_type = type(handle)
 
+        spmat = ptr_type()
         vecx = ptr_type()
         vecy = ptr_type()
+        spmat_ref = spmat.createRef()
         vecx_ref = vecx.createRef()
         vecy_ref = vecy.createRef()
 
@@ -1330,7 +1337,8 @@ def _prepare_spmv_coo_ref_hipsparse(
             ("HIPSPARSE_SPMV_ALG_DEFAULT", "HIPSPARSE_MV_ALG_DEFAULT"),
         )
 
-        spmat = _hipsparse_create_coo_descriptor(
+        _hipsparse_create_coo_descriptor(
+            spmat_ref,
             n_rows,
             n_cols,
             int(data.numel()),
@@ -1639,9 +1647,11 @@ def _prepare_spmv_ref_hipsparse(
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
         ptr_type = type(handle)
 
-        # hip-python dense descriptor outputs must be created via createRef().
+        # hip-python descriptor outputs must be created via createRef().
+        spmat = ptr_type()
         vecx = ptr_type()
         vecy = ptr_type()
+        spmat_ref = spmat.createRef()
         vecx_ref = vecx.createRef()
         vecy_ref = vecy.createRef()
 
@@ -1665,7 +1675,8 @@ def _prepare_spmv_ref_hipsparse(
             if layout == "csr"
             else _hipsparse_create_csc_descriptor
         )
-        spmat = make_descriptor(
+        make_descriptor(
+            spmat_ref,
             n_rows,
             n_cols,
             int(data.numel()),

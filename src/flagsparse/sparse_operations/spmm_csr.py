@@ -4648,8 +4648,10 @@ def _prepare_spmm_ref_hipsparse(
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
         ptr_type = type(handle)
 
+        spmat = ptr_type()
         matb = ptr_type()
         matc = ptr_type()
+        spmat_ref = spmat.createRef()
         matb_ref = matb.createRef()
         matc_ref = matc.createRef()
 
@@ -4668,7 +4670,8 @@ def _prepare_spmm_ref_hipsparse(
             if layout == "csr"
             else _hipsparse_create_csc_descriptor
         )
-        spmat = make_descriptor(
+        make_descriptor(
+            spmat_ref,
             n_rows,
             n_cols,
             int(data.numel()),

@@ -33,6 +33,11 @@ if str(_SRC_ROOT) not in sys.path:
 
 import flagsparse as fs
 from flagsparse.sparse_operations import spmm_bsr as bsr_ops
+from baseline_backend import (
+    expected_vendor_label,
+    expected_vendor_short,
+    print_backend_summary,
+)
 
 try:
     import cupy as cp
@@ -782,6 +787,20 @@ def _resolve_input_paths(input_paths):
 
 
 def _print_notes(run_cusparse):
+    vendor_backend = None
+    vendor_reason = None
+    if run_cusparse:
+        vendor_backend, vendor_reason = bsr_ops._spmm_bsr_sparse_ref_backend(
+            VALUE_DTYPES[0], INDEX_DTYPES[0], op="non"
+        )
+    print_backend_summary(
+        op_name="SpMM BSR",
+        native_format="BSR",
+        correctness_ref="Ref=torch_spmm_coo",
+        vendor_backend=vendor_backend,
+        vendor_reason=vendor_reason,
+        run_vendor=run_cusparse,
+    )
     print("FlagSparse BSR SpMM follows padded block-grid semantics; native output is padded and correctness checks slice back to logical rows/cols by op.")
     print("Accuracy reference: Ref=torch_spmm_coo expands the same BSR arrays to COO and runs torch.sparse.mm; this is correctness-only, not the FlagSparse compute path.")
     print("PyTorch BSR baseline is attempted only for same-format supported cases; CUDA BSR transpose-family is recorded as N/A with no fallback.")
@@ -790,9 +809,11 @@ def _print_notes(run_cusparse):
     else:
         print("SciPy CPU BSR baseline: same BSR arrays with padded shape; CPU-vs-GPU speedup is diagnostic only.")
     if run_cusparse:
-        reason = _cupy_bsr_unavailable_reason()
+        _backend, reason = bsr_ops._spmm_bsr_sparse_ref_backend(
+            VALUE_DTYPES[0], INDEX_DTYPES[0], op="non"
+        )
         if reason:
-            print(f"CuPy baseline: unavailable for BSR ({reason}); CU(ms)=N/A.")
+            print(f"{expected_vendor_label()} baseline: unavailable for BSR ({reason}); {expected_vendor_short()}(ms)=N/A.")
 
 
 def _print_row(row, timing=False):
@@ -857,7 +878,7 @@ def main():
         print(
             f"{'Matrix':<28} {'DType':<10} {'Index':<5} {'Op':<4} {'Lay':<4} {'Alg':<14} "
             f"{'BDim':>4} {'Rows':>7} {'Cols':>7} {'NNZB':>8} {'DCols':>5} "
-            f"{'MS':>9} {'GPU':>9} {'CPUProc':>9} {'PT':>9} {'CU':>9} {'SciPy':>9} "
+            f"{'MS':>9} {'GPU':>9} {'CPUProc':>9} {'PT':>9} {expected_vendor_short():>9} {'SciPy':>9} "
             f"{'PT/Alg':>8} {'Sci/Alg':>8} {'Err':>10} {'SciErr':>10} {'Status':>6}"
             + (f" {'GPUProc':>9} {'Compute':>9}" if args.timing else "")
         )

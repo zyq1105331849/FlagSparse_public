@@ -37,6 +37,11 @@ if str(_SRC_ROOT) not in sys.path:
 
 import flagsparse as fs
 from flagsparse.sparse_operations import spmm_csr as spmm_ops
+from baseline_backend import (
+    expected_vendor_label,
+    expected_vendor_short,
+    print_backend_summary,
+)
 
 
 VALUE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
@@ -564,6 +569,20 @@ def _resolve_input_paths(input_paths):
 
 
 def _print_notes(run_cusparse):
+    vendor_backend = None
+    vendor_reason = None
+    if run_cusparse:
+        vendor_backend, vendor_reason = spmm_ops._spmm_csc_sparse_ref_backend(
+            VALUE_DTYPES[0], INDEX_DTYPES[0], INDEX_DTYPES[0]
+        )
+    print_backend_summary(
+        op_name="SpMM CSC",
+        native_format="CSC",
+        correctness_ref="Ref=torch_spmm_coo",
+        vendor_backend=vendor_backend,
+        vendor_reason=vendor_reason,
+        run_vendor=run_cusparse,
+    )
     print("FlagSparse CSC SpMM supports native op=non/trans/conj without CSR/COO conversion.")
     print("Accuracy reference: Ref=torch_spmm_coo expands the same CSC arrays to COO and runs torch.sparse.mm; this is correctness-only, not the FlagSparse compute path.")
     print("PyTorch CSC SpMM baseline: unavailable; torch.sparse.mm documents CSC @ Dense as unsupported, so no PyTorch CSC fallback is used.")
@@ -571,9 +590,9 @@ def _print_notes(run_cusparse):
         if _is_rocm_runtime_for_tests():
             print("hipSPARSE CSC baseline: HS(ms) uses hipSPARSE CSC SpMM for op=non when supported; trans/conj report HS=N/A with reason.")
         elif (reason := _cupy_csc_unavailable_reason()):
-            print(f"CuPy CSC baseline: unavailable ({reason}); CU(ms)=N/A.")
+            print(f"{expected_vendor_label()} CSC baseline: unavailable ({reason}); {expected_vendor_short()}(ms)=N/A.")
         else:
-            print("CuPy CSC baseline: CU(ms) uses cupyx.scipy.sparse.csc_matrix op @ dense with construction outside timing.")
+            print(f"{expected_vendor_label()} CSC baseline: {expected_vendor_short()}(ms) uses cupyx.scipy.sparse.csc_matrix op @ dense with construction outside timing.")
     else:
         print("Vendor CSC baseline disabled by --no-cusparse; vendor ms=N/A.")
     print("Timing policy: ms = process_cpu_ms + gpu_ms; CSC SpMM v1 has no process phase.")
@@ -638,8 +657,8 @@ def main():
         print(
             f"{'Matrix':<28} {'DType':<10} {'Index':<5} {'Op':<5} {'Lay':<4} {'Alg':<14} "
             f"{'Rows':>7} {'Cols':>7} {'NNZ':>9} {'DCols':>5} "
-            f"{'MS':>9} {'GPU':>9} {'CPUProc':>9} {'CU':>9} {'CU/Alg':>8} "
-            f"{'Err':>10} {'CUErr':>10} {'Status':>6}"
+            f"{'MS':>9} {'GPU':>9} {'CPUProc':>9} {expected_vendor_short():>9} {('V/Alg'):>8} "
+            f"{'Err':>10} {('Err' + expected_vendor_short()):>10} {'Status':>6}"
             + (f" {'GPUProc':>9} {'Compute':>9}" if args.timing else "")
         )
         print("-" * 150)

@@ -35,6 +35,7 @@ if str(_SRC_ROOT) not in sys.path:
 
 import flagsparse as fs
 import flagsparse.sparse_operations.spmm_csr as spmm_ops
+from baseline_backend import print_backend_summary
 
 from test_spmm import (
     _build_dense_matrix,
@@ -796,6 +797,19 @@ def main():
     _print_tle_availability(alg_names)
     vendor_label = _vendor_label()
     vendor_column = _vendor_column_label()
+    first_dtype = DTYPE_MAP[dtype_names[0]]
+    first_index_dtype = INDEX_DTYPE_MAP[index_dtype_names[0]]
+    vendor_backend, vendor_reason = spmm_ops._spmm_csr_sparse_ref_backend(
+        first_dtype, first_index_dtype, first_index_dtype
+    )
+    print_backend_summary(
+        op_name="SpMM CSR",
+        native_format="CSR",
+        correctness_ref="PyTorch CSR/COO",
+        vendor_backend=vendor_backend,
+        vendor_reason=vendor_reason,
+        run_vendor=not args.no_cusparse,
+    )
     print(
         f"Vendor sparse baseline: {vendor_label}; unsupported combinations are reported as N/A with reason."
     )
