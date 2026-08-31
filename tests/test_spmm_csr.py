@@ -291,6 +291,43 @@ def _expand_algs(alg_names, op, dtype):
     return deduped
 
 
+def _selected_tle_algs(alg_names):
+    selected = set()
+    for alg in alg_names:
+        if alg == "all":
+            selected.update(("alpha_alg1_tle_opt", "alpha_alg1_tle_opt2"))
+        elif alg in ("alpha_alg1_tle_opt", "alpha_alg1_tle_opt2"):
+            selected.add(alg)
+    return tuple(
+        name
+        for name in ("alpha_alg1_tle_opt", "alpha_alg1_tle_opt2")
+        if name in selected
+    )
+
+
+def _print_tle_availability(alg_names):
+    selected = _selected_tle_algs(alg_names)
+    if not selected:
+        return
+    checks = {
+        "alpha_alg1_tle_opt": (
+            fs.is_alpha_spmm_alg1_tle_opt_available,
+            fs.alpha_spmm_alg1_tle_opt_unavailable_reason,
+        ),
+        "alpha_alg1_tle_opt2": (
+            fs.is_alpha_spmm_alg1_tle_opt2_available,
+            fs.alpha_spmm_alg1_tle_opt2_unavailable_reason,
+        ),
+    }
+    print("TLE runtime availability:")
+    for name in selected:
+        available_fn, reason_fn = checks[name]
+        if available_fn():
+            print(f"  {name}: available")
+        else:
+            print(f"  {name}: unavailable ({reason_fn()})")
+
+
 def _cuda_event_benchmark(op, warmup, iters):
     out = None
     for _ in range(max(0, int(warmup))):
@@ -415,7 +452,40 @@ def _skip_row(
     return row
 
 
-def _time_cusparse(data, indices, indptr, shape, B, op, warmup, iters, layout="row"):
+def _vendor_label():
+    return "hipSPARSE" if spmm_ops._is_rocm_runtime() else "cuSPARSE"
+
+
+def _vendor_column_label():
+    return "hs" if spmm_ops._is_rocm_runtime() else "cu"
+
+
+def _time_vendor_sparse_ref(
+    data, indices, indptr, shape, B, op, warmup, iters, layout="row"
+):
+    if spmm_ops._is_rocm_runtime():
+        if op != "non":
+            return (
+                None,
+                None,
+                f"hipSPARSE CSR SpMM baseline only supports op=non in this runner, got op={op}",
+            )
+        if layout != "row" or not B.is_contiguous():
+            return (
+                None,
+                None,
+                "hipSPARSE CSR SpMM baseline requires row-major contiguous dense RHS",
+            )
+        try:
+            sparse_ref = spmm_ops._benchmark_spmm_csr_sparse_ref(
+                data, indices, indptr, B, shape, warmup=warmup, iters=iters
+            )
+        except Exception as exc:
+            return None, None, str(exc)
+        if sparse_ref["backend"] is None:
+            return None, None, sparse_ref["reason"]
+        return sparse_ref["values"], sparse_ref["ms"], None
+
     if data.dtype not in CUSPARSE_DTYPES:
         return None, None, "dtype not supported by CuPy/cuSPARSE reference"
     try:
@@ -484,7 +554,7 @@ def run_one_case(
     cusparse_ms = None
     cusparse_reason = ""
     if run_cusparse:
-        cusparse_out, cusparse_ms, cusparse_reason = _time_cusparse(
+        cusparse_out, cusparse_ms, cusparse_reason = _time_vendor_sparse_ref(
             data, indices, indptr, shape, B, op, warmup, iters, layout=layout
         )
 
@@ -675,7 +745,15 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--csv", default=None, help="Performance CSV path")
     parser.add_argument(
-        "--no-cusparse", action="store_true", help="Disable cuSPARSE reference"
+        "--no-cusparse",
+        action="store_true",
+        help="Disable vendor sparse reference (cuSPARSE on CUDA, hipSPARSE on ROCm)",
+    )
+    parser.add_argument(
+        "--no-hipsparse",
+        dest="no_cusparse",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--timing", action="store_true", help="Add process_gpu_ms/compute_ms columns"
@@ -715,10 +793,16 @@ def main():
     fields = PERF_FIELDS + (TIMING_FIELDS if args.timing else [])
     rows = []
     diag_rows = []
+    _print_tle_availability(alg_names)
+    vendor_label = _vendor_label()
+    vendor_column = _vendor_column_label()
+    print(
+        f"Vendor sparse baseline: {vendor_label}; unsupported combinations are reported as N/A with reason."
+    )
     print(
         f"{'Matrix':<28} {'DType':<10} {'Idx':<5} {'Op':<5} {'Lay':<4} {'Alg':<10} "
-        f"{'ms':>9} {'gpu_ms':>9} {'cpu_ms':>9} {'torch':>9} {'cu':>9} "
-        f"{'PT/Alg':>9} {'CU/Alg':>9} {'ErrPT':>10} {'Status':>6}"
+        f"{'ms':>9} {'gpu_ms':>9} {'cpu_ms':>9} {'torch':>9} {vendor_column:>9} "
+        f"{'PT/Alg':>9} {'V/Alg':>9} {'ErrPT':>10} {'Status':>6}"
     )
     for dtype_name in dtype_names:
         dtype = DTYPE_MAP[dtype_name]
