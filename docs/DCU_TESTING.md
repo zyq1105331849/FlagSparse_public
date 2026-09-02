@@ -246,7 +246,7 @@ FLAGSPARSE_SPMV_CSR_KERNEL=segbin python tests/test_spmv.py <dir/> --csv-csr seg
 > `num_stages` 固定为 **1**。这些分支在 CUDA 上全部是恒等变换（已逐项验证）。
 
 **wavefront=64 的适配情况按算子而异。** AMD 的 wavefront 通常是 **64**，NVIDIA warp 是 32。
-**SpSV 已适配**（ALG3/ALG4 在 DCU 上以 64 宽 wavefront 启动，见下方环境开关）；
+**SpSV 已适配**（DCU ALG3 复用 CUDA ALG8 的 NNZ-balanced 算法，见下方）；
 **SpMM/alg1 尚未适配**。下表按路径区分：
 
 | 路径 | `warp_size` 来源 | wavefront=64 时 |
@@ -271,57 +271,48 @@ print('max_threads_per_mp =', p.max_threads_per_multi_processor)
 这属于"**待调优**"而非"合并遗漏"——DCU 分支本身也没解决。
 DCU 上若 alg1 相关算子性能明显偏低，先查这里，不要怀疑是合并出了问题。
 
-### SpSV 在 DCU 上的专属行为（已合入）
+### SpSV 在 DCU 上的共享执行策略（待实机验收）
 
-SpSV 是目前唯一做了完整 DCU 内核适配的算子，DCU 上的默认行为与 CUDA **明显不同**：
+SpSV 现在按与 SpMM/SpMV 相同的原则组织：尽量复用算法和 kernel 主体，但允许 ROCm
+为 wavefront、前向推进和 launch 方式保留少量专用实现，不要求两个后端逐行完全相同。
 
 | 行为 | DCU/ROCm | CUDA |
 | --- | --- | --- |
-| NON_TRANS 默认路由 | 强制 **ALG1 (`csr_cw`)** | ALG4 (`csr_smblk`) |
-| ALG1 worker 数 | 强制 **1（串行）** | 多 worker 并行 |
-| ALG3/ALG4 wavefront | **64** | 32 |
-| level-schedule 元数据 | 走 host 路径 | 走 GPU 内核 |
+| NON_TRANS lower 默认路由 | ALG3 `csr_nnz_balance`；环境变量可退回 ALG1 | 保持原 AUTO 选择 |
+| CW kernel | 同一个 `_spsv_csr_cw_kernel`，CU-capped persistent launch | 同一个 `_spsv_csr_cw_kernel` |
+| CW worker 数 | 不超过 CU 数 | 按矩阵并行度选择 |
+| TRANS/CONJ kernel | 共享 TRANS kernel，串行 | 共享 TRANS kernel，多 worker |
+| 拓扑分析 | ALG2 使用 CU-capped persistent 分析 | 原 GPU level-analysis |
+| ALG2 | 逐 level 的标量 row kernel | 原 level-scheduled kernel |
+| ALG3 | `csr_nnz_balance`：复用 CUDA ALG8 的数学 kernel，DCU 使用不超过 CU 数的常驻 workgroup | 原 32-lane ROC kernel |
+| ALG4 | 不提供（显式请求会报 CUDA-only） | 原 `csr_smblk` |
+| ALG8 | 不提供；其算法已作为 DCU ALG3 | 原 `csr_nnz_balance` |
 
-ALG1 在 DCU 上被强制串行，是因为跨 program 的 ready-flag 轮询在当前 gfx936 Triton
-栈上无法可靠推进——这是**正确性保护，不是性能选择**，放开可能导致 hang 或错误结果。
+`SERIAL_EXECUTION` 是 launch-time constexpr：DCU 路径按三角顺序逐行执行，kernel 编译时
+会消掉 ready-flag 轮询和依赖计数；CUDA 路径保留原来的 acquire/release 并行同步。
+这种差异属于启动/同步策略，不是两套数学算法。
 
-四个环境开关可覆盖默认值（仅用于实验，不要在验收测试里改）：
+DCU ALG3 的 analysis 与 CUDA ALG8 一样生成 `csr_row_idx` 和 `in_degree`，但预处理按
+DCU 的 64-lane wavefront 配置（CUDA 保持 32）。solve 复用同一套 ALG8 数学 kernel；
+CUDA 仍编译为一-NNZ-一-program、`num_warps=1`。DCU 则把 grid 限制为不超过 CU 数，
+每个常驻 workgroup 默认用 256 个 NNZ lane，并按递增 NNZ 块继续取任务；依赖通过
+GPU-scope acquire/release 发布。这既避免海量等待 program 把生产者堵在调度队列中，
+又恢复上一版的向量吞吐。`FLAGSPARSE_SPSV_ROCM_ALG3_BLOCK_NNZ=1|64|128|256`
+可用于实机 A/B，默认 256；复验通过前仍不应把“无 hang”标记为已验收。
 
-```bash
-FLAGSPARSE_SPSV_ROCM_ENABLE_ADVANCED_AUTO=1   # 放开高级 AUTO 路由（默认 0）
-FLAGSPARSE_SPSV_ROCM_ALG3_WARP_SIZE=32|64     # 默认 64
-FLAGSPARSE_SPSV_ROCM_ALG4_WARP_SIZE=32|64     # 默认 64
-FLAGSPARSE_SPSV_ROCM_ALG4_WORKER_COUNT=N      # 默认 0 = 每个 CU 一个持久 program
-```
+当前性能版还保持生产者/消费者对 `x` 的 GPU-scope 原子发布协议，但不再把
+float32/complex64 的 `tmp_sum` 提升到双精度；此前双精度也出现过相同的大误差，说明
+根因是可见性而不是舍入精度。DCU 下三角路径直接使用 identity `val_id`，不再分配或
+读取 nnz 长度的 `launch_order`。`x/tmp_sum/ready/indegree` 使用框架原生的
+fill/copy kernel 初始化一次；实测它比合并的 Triton 初始化 kernel 更快，尤其是复数类型。
+CUDA 继续使用原有显式 launch order 和初始化路径。
+NNZ-balanced solve 使用 GPU-scope release/acquire 原子链发布 `tmp_sum`、
+`indegree`、`x` 和 `ready`；不再使用 256-thread workgroup barrier，避免四个
+wavefront 因无关依赖互相等待。CU 数量封顶保持不变，因此不会恢复到全网格
+自旋等待的旧调度方式。
 
-**ALG4 在 DCU 上用的是另一个内核（持久化 worker）。** 与 SpMV 同样的做法——两个内核
-并存，按后端选，CUDA 完全不受影响：
-
-| 运行时 | ALG4 内核 | 差异 |
-| --- | --- | --- |
-| CUDA | `_spsv_csr_smblk_kernel` | 一行一 program |
-| **DCU/ROCm** | `_spsv_csr_smblk_persistent_kernel` | 持久化 worker + AMD 内存语义修正 |
-
-DCU 版有三处 AMD 特定改动（不只是性能）：
-
-1. **持久化 worker**：`NUM_WORKERS` + `tl.range(worker_id, n_rows, NUM_WORKERS)`，
-   grid 从 `n_rows` 变成 `worker_count`（默认每 CU 一个 program）；
-2. **显式 acquire 语义**：ready 标志读取用 `sem="acquire", scope="gpu"`，与生产者的
-   release 存储配对；
-3. **规避 AMD lowering 缺陷**：依赖值用普通 `tl.load` 而非 `tl.atomic_add(x, 0)`
-   ——后者在 Triton 3.6 的 AMD lowering 里会产生低效的 float 原子 RMW 广播。
-
-第 3 条是 DCU 上**必须**的，不是可选优化。
-
-可用环境变量强制以做 A/B：
-
-```bash
-FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog      # 强制 CUDA 版（一行一 program）
-FLAGSPARSE_SPSV_SMBLK_KERNEL=persistent   # 强制 DCU 版（持久化 worker）
-```
-
-> 注意：ALG4 只有在 `FLAGSPARSE_SPSV_ROCM_ENABLE_ADVANCED_AUTO=1` 时才会在 DCU 上被
-> 默认路由选中（否则强制 ALG1）。要测 ALG4 需同时设这两个变量，或显式指定 route。
+可用 `FLAGSPARSE_SPSV_ROCM_ENABLE_ADVANCED_AUTO=0` 强制 AUTO 使用 ALG1。
+但 0.8 加速比必须以 gfx936 和正式矩阵集的 CSV 为准，静态检查不能代替性能验收。
 
 ---
 
@@ -369,11 +360,31 @@ python tests/test_gather.py   --value-dtypes float32 --warmup 3 --iters 10
 python tests/test_scatter.py  --value-dtypes float32 --warmup 3 --iters 10
 ```
 
-**怎么看结果**：表格里 `cuSPARSE(ms)` / `CSR(ms)` / `CS(ms)` 这一列在 DCU 上装的是
-**hipSPARSE 的数字**（列名沿用历史命名，没有改）。
+SpSV 先逐算法跑 CSR/COO，既能定位 hang，也能比较 allinone 风格的多路径：
+
+```bash
+mkdir -p results
+for ALG in 1 2 3 4 8; do
+  python tests/test_spsv.py "$M" --csv-csr "results/spsv_csr_alg${ALG}.csv" \
+    --ops NON --value-dtypes float --index-dtypes int32 --alg-num "$ALG" \
+    --warmup 2 --iters 10
+  python tests/test_spsv.py "$M" --csv-coo "results/spsv_coo_alg${ALG}.csv" \
+    --ops NON --value-dtypes float --index-dtypes int32 --alg-num "$ALG" \
+    --warmup 2 --iters 10
+done
+```
+
+先看 `FlagSparse_ms` 是否稳定且程序能退出，再看
+`FlagSparse_vs_vendor_speedup`；二者都按每轮完整的 analysis/preparation+solve 统计，
+不会只摊销 FlagSparse 的 analysis。`vendor_backend` 在 DCU 上为 `hipSPARSE`，在 CUDA
+上为 `cuSPARSE`。正式验收时应使用老师规定的迭代数和矩阵集，不能只用
+`trdheim.mtx` 推断全量是否达到 0.8。
+
+**怎么看结果**：SpSV 会按运行时自动显示 `HIP.ms` 或 `CU.ms`；CSV 分别写入
+`hipSPARSE_ms` 或 `cuSPARSE_ms`，不再用固定的 CUDA 名称表示 DCU 基线。
 
 - 有数值 → hipSPARSE 基线跑通了 ✅
-- `N/A` → 基线没拿到。**这不是测试失败**，去 `reason` / `cusparse_reason` 字段看原因
+- `N/A` → 基线没拿到，去 `vendor_reason` 字段看测试封装的具体原因
 
 带 `--no-cusparse` 的 harness（`test_spmv`、`test_spmm`、`test_spgemm`、`test_gather`、
 `test_scatter`、`test_spmm_coo`）可以用该参数先把基线关掉，单独确认 Triton 内核本身没问题：
@@ -411,14 +422,18 @@ python tests/test_spmv.py $M --no-cusparse --warmup 2 --iters 5
   崩溃后该文件的 `last_completed` 的**下一个**矩阵即为触发者。
   配合 `run_flagsparse_pytest.py` 里状态不被部分产物覆盖的修复，这类崩溃现在表现为
   「部分性能数据 + `Failed` 状态 + 指名凶手」，而不是「整轮数据全丢」。
-- **SpSV / SpSM 在 DCU 上 GPU 内核死锁**（2026-08 实测，gfx936）。Python 层正常返回，
+- **SpSM 在 DCU 上仍有 GPU 内核死锁风险**（2026-08 实测，gfx936）。Python 层正常返回，
   hang 在 `torch.cuda.synchronize()`，16×16 的矩阵跑 15 分钟也不结束。根因是内核里
-  跨 program 的裸自旋等待（`while ready == 0: ready = tl.atomic_or(dep_flag_ptr, 0, sem="acquire")`）：
-  消费者 program 占住 CU，生产者排不进去，flag 永远不会被置位。
-  `spsv.py` 里 `solve_kind == "csr_cw" and _is_rocm_runtime()` → `worker_count_use = 1`
-  这个串行保护并没有真正规避掉它。这是内核层固有问题，与 hipSPARSE 参考层无关，
-  排查时不要往后端分发方向找。影响 `tests/pytest` 1836 个用例中的 851 个
-  （SpSV 341+219+219、SpSM 72），跑套件时需按第 5 节的方式 `--ignore` 掉这四个文件。
+  跨 program 的裸自旋等待：消费者 program 占住 CU，生产者排不进去，flag 永远不会
+  被置位。这是内核层问题，与 hipSPARSE 参考层无关。
+- **SpSV CSR/COO 已加入 DCU 安全并行路径，等待 DCU 实机复验。** DCU 公开 ALG1/2/3；
+  ALG3 是复用 CUDA ALG8 数学逻辑的 `csr_nnz_balance`，ALG4/ALG8 仅保留在 CUDA。
+  DCU analysis 采用 64-lane wavefront，solve 复用 CUDA ALG8 数学 kernel，并把常驻
+  worker 数限制在 CU 数以内，以减少全量 NNZ program 的调度停滞风险。
+  `FLAGSPARSE_SPSV_ROCM_ENABLE_ADVANCED_AUTO=0` 可强制 AUTO 回退 ALG1，默认值为 1。
+  复验通过前不要把“无 hang”或加速比标记为已验收；
+  建议先用小矩阵逐文件运行 `test_spsv_csr_accuracy.py` 和
+  `test_spsv_coo_accuracy.py`，再用正式矩阵集测 ALG1/2/3 与 hipSPARSE 的比值。
 
 ---
 

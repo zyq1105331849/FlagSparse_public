@@ -89,13 +89,8 @@ CSV_FIELDS = [
     "FlagSparse_vs_cuSPARSE_speedup",
     "FlagSparse_vs_PyTorch_speedup",
     "status",
-    "err_ref",
-    "err_res",
     "err_pt",
     "err_cu",
-    "rel_ref",
-    "rel_res",
-    "rel_cu",
     "pytorch_reason",
     "error",
 ]
@@ -152,7 +147,7 @@ def _alpha_one(dtype):
 
 def _spsv_tolerance(dtype):
     if dtype in (torch.float32, torch.complex64):
-        return 1e-4, 1e-2
+        return 1e-6, 1e-5
     if dtype in (torch.float64, torch.complex128):
         return 1e-12, 1e-10
     raise TypeError(f"unsupported SELL value dtype: {dtype}")
@@ -358,34 +353,6 @@ def _spsv_relative_error(actual, reference):
 def _spsv_matches(actual, reference, dtype):
     atol, rtol = _spsv_tolerance(dtype)
     return bool(torch.allclose(actual, reference, atol=atol, rtol=rtol))
-
-
-def _max_abs(tensor):
-    if tensor.numel() == 0:
-        return 0.0
-    return float(torch.max(torch.abs(tensor)).item())
-
-
-def _sell_relative_residual(
-    values, cols, row_ptr, x, b, reconstructed_b, *, unit_diagonal
-):
-    """Compute a scale-invariant backward residual for reporting only."""
-
-    n_rows = int(row_ptr.numel() - 1)
-    rows = torch.repeat_interleave(
-        torch.arange(n_rows, device=values.device, dtype=torch.int64),
-        row_ptr[1:].to(torch.int64) - row_ptr[:-1].to(torch.int64),
-    )
-    magnitudes = torch.abs(values)
-    if unit_diagonal:
-        magnitudes = magnitudes.clone()
-        magnitudes[cols.to(torch.int64) == rows] = 0
-    row_sums = torch.zeros(n_rows, dtype=magnitudes.dtype, device=values.device)
-    row_sums.scatter_add_(0, rows, magnitudes)
-    if unit_diagonal:
-        row_sums += 1
-    denominator = _max_abs(row_sums) * _max_abs(x) + _max_abs(b)
-    return _max_abs(reconstructed_b - b) / max(1.0, denominator)
 
 
 def _index_dtype(dtype):
@@ -775,7 +742,6 @@ def _run_case(
     cols,
     row_ptr,
     b,
-    expected,
     slice_size,
     alg_num=None,
     alg2_worker_count=None,
@@ -795,15 +761,6 @@ def _run_case(
         analysis_kwargs["alg_num"] = alg_num
         if alg2_worker_count is not None:
             analysis_kwargs["alg2_worker_count"] = alg2_worker_count
-    public_descr = fs.flagsparse_spsv_analysis_sell(
-        sell_values, sell_cols, offsets, (n_rows, n_rows), **analysis_kwargs
-    )
-    public_workspace = fs.flagsparse_spsv_create_workspace(public_descr)
-    public_result = fs.flagsparse_spsv_solve_sell(
-        public_descr,
-        b,
-        workspace=public_workspace,
-    )
     triton_result, triton_ms = _benchmark_triton(
         sell_values,
         sell_cols,
@@ -843,7 +800,6 @@ def _run_case(
     finally:
         baseline.close()
 
-    err_ref = float(torch.max(torch.abs(public_result - expected)).item())
     if unit_diagonal:
         reconstructed_b = _apply_unit_diagonal_csr(
             values,
@@ -865,17 +821,6 @@ def _run_case(
         )
     err_res = float(torch.max(torch.abs(reconstructed_b - b)).item())
     err_cu = float(torch.max(torch.abs(triton_result - cusparse_result)).item())
-    rel_ref = _spsv_relative_error(public_result, expected)
-    rel_res = _sell_relative_residual(
-        values,
-        cols,
-        row_ptr,
-        triton_result,
-        b,
-        reconstructed_b,
-        unit_diagonal=unit_diagonal,
-    )
-    rel_cu = _spsv_relative_error(triton_result, cusparse_result)
     record = {
         "matrix": matrix,
         "value_dtype": _dtype_name(values.dtype),
@@ -895,15 +840,11 @@ def _run_case(
             if _spsv_matches(triton_result, cusparse_result, values.dtype)
             else "FAIL"
         ),
-        "err_ref": err_ref,
-        "err_res": err_res,
         "err_pt": None,
         "err_cu": err_cu,
-        "rel_ref": rel_ref,
-        "rel_res": rel_res,
-        "rel_cu": rel_cu,
         "pytorch_reason": "not used for SELL",
         "error": None,
+        "_err_res": err_res,
     }
     return record, triton_result, cusparse_result
 
@@ -947,16 +888,13 @@ def _print_header(
             "FS.ms and CU.ms are (one analysis + iter solves) / iter."
         )
     print("CU.spd = CU.ms / FS.ms; PT.spd = PT.ms / FS.ms.")
-    print(
-        "Status compares FlagSparse with cuSPARSE; Eref/Eres and residual "
-        "diagnostics do not affect PASS/FAIL."
-    )
+    print("Status compares FlagSparse with cuSPARSE.")
     print("-" * 144)
     print(
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
         f"{'FS.ms':>10} {'CU.ms':>10} {'PT.ms':>10} "
         f"{'CU.spd':>10} {'PT.spd':>10} {'Status':>6} "
-        f"{'Eref':>10} {'Eres':>10} {'Ept':>10} {'Ecu':>10}"
+        f"{'Ept':>10} {'Ecu':>10}"
     )
     print("-" * 144)
 
@@ -972,10 +910,14 @@ def _print_record(record):
         f"{_fmt_ms(record['PyTorch_ms']):>10} "
         f"{_fmt_ratio(record['FlagSparse_vs_cuSPARSE_speedup']):>10} "
         f"{_fmt_ratio(record['FlagSparse_vs_PyTorch_speedup']):>10} "
-        f"{record['status']:>6} {_fmt_err(record['err_ref']):>10} "
-        f"{_fmt_err(record['err_res']):>10} {_fmt_err(record['err_pt']):>10} "
+        f"{record['status']:>6} {_fmt_err(record['err_pt']):>10} "
         f"{_fmt_err(record['err_cu']):>10}"
     )
+    if record["status"] in ("FAIL", "REF_FAIL"):
+        print(
+            "  Diagnostic residual |op(A)*x-b|: "
+            f"{_fmt_err(record.get('_err_res'))}"
+        )
 
 
 def test_spsv_sell_matches_cusparse(
@@ -1026,7 +968,6 @@ def test_spsv_sell_matches_cusparse(
             cols,
             row_ptr,
             b,
-            expected,
             slice_size,
             alg_num,
             unit_diagonal=unit_diagonal,
@@ -1080,7 +1021,6 @@ def test_spsv_sell_trans_matches_cusparse(
             cols,
             row_ptr,
             b,
-            expected,
             slice_size,
             unit_diagonal=unit_diagonal,
             op_mode=op_mode,
@@ -1151,7 +1091,6 @@ def test_spsv_sell_complex_unsorted_matches_cusparse(alg_num):
             cols,
             row_ptr,
             b,
-            expected,
             8,
             alg_num,
         )
@@ -1338,7 +1277,6 @@ def main():
                         cols,
                         row_ptr,
                         b,
-                        expected,
                         args.slice_size,
                         None if op_mode != "NON" else alg_num,
                         None if op_mode != "NON" else args.alg2_workers,

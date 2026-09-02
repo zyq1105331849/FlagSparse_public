@@ -187,12 +187,15 @@ def _hipsparse_csrsm2_skip_reason(value_dtype, index_dtype, indptr_dtype=None):
 
 
 def _spsm_csr_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None):
-    reason = _hipsparse_csrsm2_skip_reason(
-        value_dtype, index_dtype, indptr_dtype
-    )
-    if reason is None:
-        return "hipsparse_csrsm2", None
-    return None, reason
+    """Pick hipSPARSE on ROCm/DCU or native cuSPARSE on CUDA."""
+    if _is_rocm_runtime():
+        reason = _hipsparse_csrsm2_skip_reason(
+            value_dtype, index_dtype, indptr_dtype
+        )
+        if reason is None:
+            return "hipsparse", None
+        return None, reason
+    return "native_cusparse", None
 
 
 def _destroy_spsm_csr_ref_hipsparse_prepared(state):
@@ -313,7 +316,7 @@ def _prepare_spsm_csr_ref_hipsparse(
         raise TypeError("B dtype must match sparse value dtype")
 
     state = {
-        "backend": "hipsparse_csrsm2",
+        "backend": "hipsparse",
         "handle": None,
         "descr": None,
         "info": None,
@@ -487,7 +490,7 @@ def _spsm_csr_ref_hipsparse(
     try:
         values = _run_spsm_csr_ref_hipsparse_prepared(state)
         metadata = {
-            "backend": "hipsparse_csrsm2",
+            "backend": "hipsparse",
             "analysis_ms": float(state.get("analysis_ms", 0.0)),
             "buffer_size": int(state.get("buffer_size", 0)),
             "format": "csr",
@@ -519,6 +522,11 @@ def _benchmark_spsm_csr_sparse_ref(
         "reason": reason,
     }
     if backend is None:
+        return result
+    if backend != "hipsparse":
+        result["reason"] = (
+            "native cuSPARSE SpSM execution is provided by the benchmark harness"
+        )
         return result
     state = None
     try:
