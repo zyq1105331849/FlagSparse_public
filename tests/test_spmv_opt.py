@@ -14,7 +14,7 @@
 
 """
 SpMV optimisation A/B test: compare _impl (baseline) vs _impl_opt (optimised)
-side-by-side, together with PyTorch and cuSPARSE baselines.
+side-by-side, together with PyTorch and the active vendor sparse baseline.
 
 Usage:
     python tests/test_spmv_opt.py <dir/>                # batch run, default float32
@@ -40,6 +40,7 @@ if str(_SRC_ROOT) not in sys.path:
 import flagsparse as fs
 import flagsparse.sparse_operations._common as fs_common
 import flagsparse.sparse_operations.spmv_csr as spmv_csr_mod
+from baseline_backend import expected_vendor_short, print_backend_summary
 
 VALUE_DTYPES = [torch.float32, torch.float64]
 INDEX_DTYPES = [torch.int32]
@@ -254,12 +255,14 @@ def _err(v):
 
 def _header(timing=False):
     split = f"{'OptPGPU':>9} {'OptComp':>9} " if timing else ""
+    vendor_ms = f"{expected_vendor_short()}(ms)"
+    opt_vendor = f"Opt/{expected_vendor_short()}"
     return (
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10}  "
         f"{'Base(ms)':>9} {'BaseGPU':>9} {'BaseCPU':>9} "
         f"{'Opt(ms)':>9} {'OptGPU':>9} {'OptCPU':>9} {split}"
-        f"{'PT(ms)':>9} {'CU(ms)':>9}  "
-        f"{'Opt/Base':>8} {'Opt/PT':>8} {'Opt/CU':>8}  "
+        f"{'PT(ms)':>9} {vendor_ms:>9}  "
+        f"{'Opt/Base':>8} {'Opt/PT':>8} {opt_vendor:>8}  "
         f"{'Err(Base)':>10} {'Err(Opt)':>10} {'Status':>6}"
     )
 
@@ -428,6 +431,16 @@ def run_all_csv(paths, csv_path, warmup, iters, dtype_filter=None, timing=False)
             iname = str(idx_dtype).replace("torch.", "")
             print("=" * (210 if timing else 190))
             print(f"Value dtype: {dname}  |  Index dtype: {iname}")
+            vendor_backend, vendor_reason = fs_common._spmv_csr_sparse_ref_backend(
+                dtype, idx_dtype, op="non"
+            )
+            print_backend_summary(
+                op_name="SpMV CSR opt",
+                native_format="CSR",
+                correctness_ref="PyTorch CSR or COO",
+                vendor_backend=vendor_backend,
+                vendor_reason=vendor_reason,
+            )
             print(
                 "Base = prepared baseline kernel. "
                 "Opt = CSR-Vector with bucket execution-plan data. "
@@ -539,7 +552,7 @@ def run_all_csv(paths, csv_path, warmup, iters, dtype_filter=None, timing=False)
 
 def main():
     parser = argparse.ArgumentParser(
-        description="SpMV opt A/B: baseline vs optimised, with PyTorch/cuSPARSE."
+        description="SpMV opt A/B: baseline vs optimised, with PyTorch/vendor sparse baseline."
     )
     parser.add_argument("mtx", nargs="*", help=".mtx files or directories")
     parser.add_argument(
@@ -589,6 +602,16 @@ def main():
         dname = str(dtype).replace("torch.", "")
         print("=" * (210 if args.timing else 190))
         print(f"FLAGSPARSE SpMV Optimisation A/B Test")
+        vendor_backend, vendor_reason = fs_common._spmv_csr_sparse_ref_backend(
+            dtype, torch.int32, op="non"
+        )
+        print_backend_summary(
+            op_name="SpMV CSR opt",
+            native_format="CSR",
+            correctness_ref="PyTorch CSR or COO",
+            vendor_backend=vendor_backend,
+            vendor_reason=vendor_reason,
+        )
         print(
             f"GPU: {torch.cuda.get_device_name(0)}  |  dtype: {dname}  |  Files: {len(paths)}"
         )

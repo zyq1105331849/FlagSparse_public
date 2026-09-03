@@ -31,6 +31,11 @@ if str(_SRC_ROOT) not in sys.path:
 
 import flagsparse as fs
 from flagsparse.sparse_operations import _common as ast_ops
+from baseline_backend import (
+    expected_vendor_label,
+    expected_vendor_short,
+    print_backend_summary,
+)
 
 try:
     import cupy as cp
@@ -247,7 +252,9 @@ def _time_pytorch(data, indices, indptr, x, shape, op, warmup, iters):
 
 
 def _time_cusparse(data, indices, indptr, x, shape, op, warmup, iters):
-    backend, _ = ast_ops._spmv_csc_sparse_ref_backend(data.dtype, indices.dtype, op=op)
+    backend, backend_reason = ast_ops._spmv_csc_sparse_ref_backend(
+        data.dtype, indices.dtype, op=op
+    )
     if backend == "hipsparse":
         # DCU/ROCm: hipSPARSE replaces cuSPARSE as the vendor baseline, via
         # hipsparseCreateCsc + the generic SpMV.  Without this branch the DCU
@@ -256,16 +263,18 @@ def _time_cusparse(data, indices, indptr, x, shape, op, warmup, iters):
         ref = ast_ops._benchmark_spmv_csc_sparse_ref(
             data, indices, indptr, x, shape, warmup, iters, op=op
         )
-        return ref["ms"]
+        return ref["ms"], ref["reason"]
+    if backend is None and ast_ops._is_rocm_runtime():
+        return None, backend_reason
     if cp is None or cpx_sparse is None:
-        return None
+        return None, "CuPy/cupyx.scipy.sparse is not available"
     if data.dtype not in (
         torch.float32,
         torch.float64,
         torch.complex64,
         torch.complex128,
     ):
-        return None
+        return None, f"unsupported vendor sparse dtype: {_dtype_name(data.dtype)}"
     data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
     ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
     ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr.to(torch.int64)))
@@ -288,7 +297,7 @@ def _time_cusparse(data, indices, indptr, x, shape, op, warmup, iters):
         _ = fn()
     end.record()
     end.synchronize()
-    return cp.cuda.get_elapsed_time(start, end) / count
+    return cp.cuda.get_elapsed_time(start, end) / count, None
 
 
 def _fmt(v):
@@ -311,10 +320,12 @@ def _status(ok):
 
 def _header(timing=False):
     split = f" {'ProcGPU':>9} {'Compute':>9}" if timing else ""
+    vendor_ms = f"{expected_vendor_short()}(ms)"
+    csc_vendor = f"CSC/{expected_vendor_short()}"
     return (
         f"{'Matrix':<28} {'Op':>5} {'Out':>7} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10}  "
         f"{'CSC(ms)':>9} {'CSCGPU':>9} {'CPUProc':>9}{split} "
-        f"{'PT(ms)':>9} {'CU(ms)':>9}  {'CSC/PT':>8} {'CSC/CU':>8} "
+        f"{'PT(ms)':>9} {vendor_ms:>9}  {'CSC/PT':>8} {csc_vendor:>8} "
         f"{'Err':>10} {'Status':>6}"
     )
 
@@ -342,6 +353,8 @@ def _print_row(row, timing=False):
     error = row.get("error")
     if error:
         print(f"  error: {str(error)[:240]}")
+    if row.get("cusparse_error"):
+        print(f"  {expected_vendor_label()}: {str(row['cusparse_error'])[:240]}")
 
 
 def _run_one_case(
@@ -378,6 +391,7 @@ def _run_one_case(
         "compute_ms": None,
         "pytorch_ms": None,
         "cusparse_ms": None,
+        "cusparse_error": None,
         "err": None,
         "status": "ERROR",
         "error": None,
@@ -412,9 +426,12 @@ def _run_one_case(
         pass
     if run_cusparse:
         try:
-            cu_ms = _time_cusparse(data, indices, indptr, x, shape, op, warmup, iters)
-        except Exception:
-            pass
+            cu_ms, cu_reason = _time_cusparse(
+                data, indices, indptr, x, shape, op, warmup, iters
+            )
+            base_row["cusparse_error"] = cu_reason
+        except Exception as exc:
+            base_row["cusparse_error"] = str(exc)
     ok = (not math.isnan(err)) and err <= 1.0
     base_row.update(
         {
@@ -463,6 +480,17 @@ def run_synthetic(
     print("=" * 140)
     print("FLAGSPARSE SpMV CSC BENCHMARK (native CSC Triton)")
     print("=" * 140)
+    vendor_backend, vendor_reason = ast_ops._spmv_csc_sparse_ref_backend(
+        value_dtypes[0], index_dtypes[0], op=ops[0]
+    )
+    print_backend_summary(
+        op_name="SpMV CSC",
+        native_format="CSC",
+        correctness_ref="Ref=spmv-coo",
+        vendor_backend=vendor_backend,
+        vendor_reason=vendor_reason,
+        run_vendor=run_cusparse,
+    )
     print(
         "Timing policy: csc_ms = process_cpu_ms + csc_gpu_ms; CSC v1 has no process phase."
     )
@@ -592,6 +620,7 @@ def run_csv(
         "compute_ms",
         "pytorch_ms",
         "cusparse_ms",
+        "cusparse_error",
         "err",
         "status",
         "error",

@@ -31,6 +31,12 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
+from baseline_backend import (
+    expected_vendor_label,
+    expected_vendor_short,
+    print_backend_summary,
+)
+from flagsparse.sparse_operations import _common as fs_common
 
 try:
     import cupy as cp
@@ -64,6 +70,25 @@ def _cupy_bsr_unavailable_reason():
 
 
 def _print_baseline_notes(run_cusparse=True):
+    vendor_backend = None
+    vendor_reason = None
+    if run_cusparse:
+        if fs_common._is_rocm_runtime():
+            vendor_reason = (
+                "hipSPARSE BSR SpMV direct baseline is not wired; "
+                "CuPy fallback is disabled on ROCm"
+            )
+        else:
+            vendor_reason = _cupy_bsr_unavailable_reason()
+            vendor_backend = None if vendor_reason else "cupy_cusparse"
+    print_backend_summary(
+        op_name="SpMV BSR",
+        native_format="BSR",
+        correctness_ref="Ref=spmv-coo",
+        vendor_backend=vendor_backend,
+        vendor_reason=vendor_reason,
+        run_vendor=run_cusparse,
+    )
     print(
         "FlagSparse BSR follows AlphaSparse/cuSPARSE-style padded block-grid semantics; native output is padded and correctness checks slice back to the logical output length."
     )
@@ -78,9 +103,16 @@ def _print_baseline_notes(run_cusparse=True):
         "PyTorch BSR trans/conj baseline: unsupported on CUDA because BSR transpose becomes SparseBsc; PT(ms)/PTPad(ms)=N/A for those ops."
     )
     if run_cusparse:
-        reason = _cupy_bsr_unavailable_reason()
+        reason = (
+            vendor_reason
+            if fs_common._is_rocm_runtime()
+            else _cupy_bsr_unavailable_reason()
+        )
         if reason:
-            print(f"CuPy baseline: unavailable for BSR ({reason}); CU(ms)=N/A.")
+            print(
+                f"{expected_vendor_label()} baseline: unavailable for BSR "
+                f"({reason}); {expected_vendor_short()}(ms)=N/A."
+            )
 
 
 def _dtype_name(dtype):
@@ -512,6 +544,11 @@ def _time_pytorch_padded(data, indices, indptr, x, shape, block_dim, op, warmup,
 
 
 def _time_cusparse(data, indices, indptr, x, shape, block_dim, op, warmup, iters):
+    if fs_common._is_rocm_runtime():
+        return None, (
+            "hipSPARSE BSR SpMV direct baseline is not wired; "
+            "CuPy fallback is disabled on ROCm"
+        )
     if cp is None or cpx_sparse is None:
         return None, "CuPy/cupyx.scipy.sparse is not available"
     if not hasattr(cpx_sparse, "bsr_matrix"):
@@ -578,10 +615,12 @@ def _status(ok):
 
 def _header(timing=False):
     split = f" {'ProcGPU':>9} {'Compute':>9}" if timing else ""
+    vendor_ms = f"{expected_vendor_short()}(ms)"
+    vendor_speedup = f"BSR/{expected_vendor_short()}"
     return (
         f"{'Matrix':<28} {'Alg':>15} {'Op':>5} {'BDim':>5} {'Ref':>8} {'Out':>7} {'PadOut':>7} {'PadRows':>7} {'Rows':>7} {'Cols':>7} {'NNZB':>9} {'Pad':>7}  "
         f"{'BSR(ms)':>9} {'BSRGPU':>9} {'CPUProc':>9}{split} "
-        f"{'PT(ms)':>9} {'PTPad':>9} {'PTPMode':>9} {'CU(ms)':>9}  {'BSR/PT':>8} {'BSR/CU':>8} "
+        f"{'PT(ms)':>9} {'PTPad':>9} {'PTPMode':>9} {vendor_ms:>9}  {'BSR/PT':>8} {vendor_speedup:>8} "
         f"{'BSRErr':>10} {'PTPadErr':>10} {'B/PT':>10} {'B/PTPad':>10} {'Status':>6}"
     )
 

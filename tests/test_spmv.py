@@ -35,6 +35,11 @@ if str(_SRC_ROOT) not in sys.path:
 import flagsparse as ast
 import flagsparse.sparse_operations._common as ast_common
 import flagsparse.sparse_operations.spmv_csr as spmv_csr_mod
+from baseline_backend import (
+    expected_vendor_label,
+    expected_vendor_short,
+    print_backend_summary,
+)
 
 VALUE_DTYPES = [
     torch.float32,
@@ -612,10 +617,23 @@ def _status_str(ok, available):
 def _print_mtx_header(value_dtype, index_dtype, op="non"):
     op = _normalize_op(op)
     transpose = _op_transposes(op)
+    vendor_backend, vendor_reason = ast_common._spmv_csr_sparse_ref_backend(
+        value_dtype, index_dtype, op=op
+    )
+    print_backend_summary(
+        op_name="SpMV CSR",
+        native_format="CSR",
+        correctness_ref="PyTorch CSR or COO",
+        vendor_backend=vendor_backend,
+        vendor_reason=vendor_reason,
+    )
     print(
         f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}  |  op: {op}  |  transpose: {bool(transpose)}"
     )
-    print("Formats: FlagSparse=CSR, cuSPARSE=CSR/CSC, PyTorch=CSR or COO.")
+    print(
+        f"Formats: FlagSparse=CSR, {expected_vendor_short()}=CSR"
+        f"{'/CSC' if not ast_common._is_rocm_runtime() else ''}, PyTorch=CSR or COO."
+    )
     print(
         "Timing stays in native dtype. For float32, correctness references use float64 compute then cast."
     )
@@ -628,8 +646,8 @@ def _print_mtx_header(value_dtype, index_dtype, op="non"):
     print("-" * 150)
     print(
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
-        f"{'FlagSparse(ms)':>10} {'CSR(ms)':>10} {'CSC(ms)':>10} {'PyTorch(ms)':>11} "
-        f"{'FS/CSR':>7} {'FS/PT':>7} {'PT':>6} {'CU':>6} {'Err(PT)':>10} {'Err(CU)':>10}"
+        f"{'FlagSparse(ms)':>10} {(expected_vendor_short() + '-CSR'):>10} {'CSC(ms)':>10} {'PyTorch(ms)':>11} "
+        f"{('FS/' + expected_vendor_short()):>7} {'FS/PT':>7} {'PT':>6} {expected_vendor_short():>6} {'Err(PT)':>10} {('Err(' + expected_vendor_short() + ')'):>10}"
     )
     print("-" * 150)
 
@@ -784,11 +802,16 @@ def run_comprehensive_synthetic(op="non"):
     print("=" * 110)
     print("FLAGSPARSE SpMV BENCHMARK (synthetic CSR)")
     print("=" * 110)
+    print_backend_summary(
+        op_name="SpMV CSR",
+        native_format="CSR",
+        correctness_ref="PyTorch CSR or COO",
+    )
     print(
         f"GPU: {torch.cuda.get_device_name(0)}  |  Warmup: {WARMUP}  Iters: {ITERS}  |  op: {op}  |  transpose: {bool(transpose)}"
     )
     print(
-        "Formats: FlagSparse=CSR, cuSPARSE=CSR (when supported), Reference=CuPy CSR or PyTorch COO"
+        f"Formats: FlagSparse=CSR, {expected_vendor_label()}=CSR when supported, Reference=PyTorch CSR or COO"
     )
     print(
         "When CuPy does not support dtype (e.g. bfloat16/float16), reference = PyTorch (float32 then cast)."

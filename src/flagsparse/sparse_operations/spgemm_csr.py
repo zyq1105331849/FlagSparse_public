@@ -1385,6 +1385,7 @@ def _hipsparse_spgemm_create_descr():
 
 
 def _hipsparse_create_csr_descriptor_from_tensors(
+    ptr_type,
     n_rows,
     n_cols,
     nnz,
@@ -1396,7 +1397,10 @@ def _hipsparse_create_csr_descriptor_from_tensors(
     index_base,
     value_type,
 ):
-    return _hipsparse_create_csr_descriptor(
+    spmat = ptr_type()
+    spmat_ref = spmat.createRef()
+    _hipsparse_create_csr_descriptor(
+        spmat_ref,
         n_rows,
         n_cols,
         nnz,
@@ -1408,6 +1412,7 @@ def _hipsparse_create_csr_descriptor_from_tensors(
         index_base,
         value_type,
     )
+    return spmat
 
 
 def _hipsparse_spgemm_work_estimation(
@@ -1583,6 +1588,7 @@ def _prepare_spgemm_csr_ref_hipsparse(
         ptr_type = type(handle)
 
         mat_a = _hipsparse_create_csr_descriptor_from_tensors(
+            ptr_type,
             m,
             k_a,
             int(a_data.numel()),
@@ -1595,6 +1601,7 @@ def _prepare_spgemm_csr_ref_hipsparse(
             value_type,
         )
         mat_b = _hipsparse_create_csr_descriptor_from_tensors(
+            ptr_type,
             k_b,
             n,
             int(b_data.numel()),
@@ -1607,6 +1614,7 @@ def _prepare_spgemm_csr_ref_hipsparse(
             value_type,
         )
         mat_c = _hipsparse_create_csr_descriptor_from_tensors(
+            ptr_type,
             m,
             n,
             0,

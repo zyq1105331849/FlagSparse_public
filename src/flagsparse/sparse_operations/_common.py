@@ -79,7 +79,11 @@ __all__ = (
     "_tolerance_for_dtype",
     "_is_rocm_runtime",
     "_get_device_backend_info",
+    "_clip_num_warps_for_backend",
+    "_clip_block_tile_for_backend",
+    "_backend_launch_overrides",
     "_spmm_rocm_launch_overrides",
+    "_spmv_rocm_launch_overrides",
     "_is_hipsparse_available",
     "_require_cupy",
     "_cupy_dtype_from_torch",
@@ -101,6 +105,7 @@ __all__ = (
     "_hipsparse_scalar",
     "_hipsparse_index_type",
     "_hipsparse_spmv_operation",
+    "_hipsparse_spmm_operation",
     "_hipsparse_spmm_order",
     "_hipsparse_spmm_algorithm",
     "_hipsparse_create_coo_descriptor",
@@ -250,6 +255,115 @@ def _get_device_backend_info(device=None):
     return info
 
 
+def _clip_num_warps_for_backend(num_warps, device=None, backend_info=None):
+    info = _get_device_backend_info(device) if backend_info is None else backend_info
+    num_warps = max(1, int(num_warps))
+    wave = max(1, int(info.get("device_warp_size") or 32))
+    max_threads = max(1, int(info.get("max_threads_per_block") or 1024))
+    while num_warps > 1 and num_warps * wave > max_threads:
+        num_warps //= 2
+    return int(num_warps)
+
+
+def _clip_block_tile_for_backend(block_size, *, device=None, backend_info=None):
+    info = _get_device_backend_info(device) if backend_info is None else backend_info
+    block_size = max(1, int(block_size))
+    max_threads = max(1, int(info.get("max_threads_per_block") or 1024))
+    if info.get("backend") == "hip":
+        max_threads = min(max_threads, 512)
+    while block_size > max_threads:
+        block_size = max(1, block_size // 2)
+    return int(block_size)
+
+
+def _backend_launch_overrides(
+    *,
+    kind,
+    fmt,
+    dtype=None,
+    n_dense_cols=None,
+    max_row_nnz=0,
+    nnz=0,
+    block_n=None,
+    block_nnz=None,
+    block_size=None,
+    num_warps=None,
+    num_stages=None,
+    device=None,
+):
+    info = _get_device_backend_info(device)
+    result = {
+        "backend": info["backend"],
+        "device_name": info["device_name"],
+        "device_warp_size": int(info["device_warp_size"]),
+    }
+    if info["backend"] != "hip":
+        return result
+
+    kind = str(kind).strip().lower()
+    fmt = str(fmt).strip().lower()
+    dense_n = max(1, int(n_dense_cols or 1))
+    max_row_nnz = max(0, int(max_row_nnz or 0))
+    nnz = max(0, int(nnz or 0))
+    fp64_like = dtype in (torch.float64, torch.complex128)
+
+    if kind == "spmm":
+        if block_n is None:
+            if dense_n <= 16:
+                block_n = 16
+                default_warps = 1
+            elif dense_n <= 64:
+                block_n = 32 if result["device_warp_size"] >= 64 else 64
+                default_warps = 2
+            else:
+                block_n = 64
+                default_warps = 4
+        else:
+            default_warps = 4
+        if block_nnz is None:
+            block_nnz = 64 if fmt == "csr" else 128
+            if max_row_nnz >= 512 or nnz >= 1_000_000:
+                block_nnz = 128 if fmt == "csr" else 256
+        result.update(
+            {
+                "block_n": int(block_n),
+                "block_nnz": int(block_nnz),
+                "num_warps": _clip_num_warps_for_backend(
+                    default_warps if num_warps is None else num_warps,
+                    backend_info=info,
+                ),
+                "num_stages": int(1 if num_stages is None else num_stages),
+            }
+        )
+        return result
+
+    if kind == "spmv":
+        if block_size is None:
+            block_size = 128 if fp64_like else 256
+        if block_nnz is None:
+            block_nnz = 128 if fp64_like else 256
+            if fmt == "bsr":
+                block_nnz = 64 if fp64_like else 128
+        result.update(
+            {
+                "block_size": _clip_block_tile_for_backend(
+                    block_size, backend_info=info
+                ),
+                "block_nnz": _clip_block_tile_for_backend(
+                    block_nnz, backend_info=info
+                ),
+                "num_warps": _clip_num_warps_for_backend(
+                    4 if num_warps is None else num_warps,
+                    backend_info=info,
+                ),
+                "num_stages": int(1 if num_stages is None else num_stages),
+            }
+        )
+        return result
+
+    raise ValueError(f"unsupported launch override kind: {kind!r}")
+
+
 def _spmm_rocm_launch_overrides(
     *,
     n_dense_cols,
@@ -259,43 +373,44 @@ def _spmm_rocm_launch_overrides(
     dtype=None,
     device=None,
 ):
-    del dtype
     if not _is_rocm_runtime():
         return None
-    info = _get_device_backend_info(device)
-    dense_n = max(1, int(n_dense_cols))
-    max_row_nnz = max(0, int(max_row_nnz or 0))
-    nnz = max(0, int(nnz or 0))
-    fmt = str(fmt).strip().lower()
-    wave = max(1, int(info.get("device_warp_size") or 64))
+    return _backend_launch_overrides(
+        kind="spmm",
+        fmt=fmt,
+        dtype=dtype,
+        n_dense_cols=n_dense_cols,
+        max_row_nnz=max_row_nnz,
+        nnz=nnz,
+        device=device,
+    )
 
-    if dense_n <= 16:
-        block_n = 16
-        num_warps = 1
-    elif dense_n <= 64:
-        block_n = 32 if wave >= 64 else 64
-        num_warps = 2
-    else:
-        block_n = 64
-        num_warps = 4
 
-    block_nnz = 64 if fmt == "csr" else 128
-    if max_row_nnz >= 512 or nnz >= 1_000_000:
-        block_nnz = 128 if fmt == "csr" else 256
+def _spmv_rocm_launch_overrides(
+    *,
+    fmt,
+    dtype=None,
+    max_row_nnz=0,
+    nnz=0,
+    block_size=None,
+    block_nnz=None,
+    num_warps=None,
+    device=None,
+):
+    if not _is_rocm_runtime():
+        return None
+    return _backend_launch_overrides(
+        kind="spmv",
+        fmt=fmt,
+        dtype=dtype,
+        max_row_nnz=max_row_nnz,
+        nnz=nnz,
+        block_size=block_size,
+        block_nnz=block_nnz,
+        num_warps=num_warps,
+        device=device,
+    )
 
-    max_threads = max(1, int(info.get("max_threads_per_block") or 1024))
-    while num_warps > 1 and num_warps * wave > max_threads:
-        num_warps //= 2
-
-    return {
-        "block_n": int(block_n),
-        "block_nnz": int(block_nnz),
-        "num_warps": int(num_warps),
-        "num_stages": 1,
-        "backend": info["backend"],
-        "device_name": info["device_name"],
-        "device_warp_size": int(info["device_warp_size"]),
-    }
 
 
 def _is_hipsparse_available():
@@ -591,6 +706,7 @@ def _hipsparse_unavailable_reason():
 
 
 def _hipsparse_create_coo_descriptor(
+    spmat_ref,
     n_rows,
     n_cols,
     nnz,
@@ -601,11 +717,12 @@ def _hipsparse_create_coo_descriptor(
     index_base,
     value_type,
 ):
-    # hip-python returns the sparse descriptor as a payload rather than filling
-    # an output slot, unlike hipsparseCreateDnVec/DnMat which keep the
-    # out-parameter form. Some wrappers also split the COO index type in two.
+    # hip-python sparse descriptors follow the same out-parameter form as
+    # dense descriptors: callers create a descriptor object and pass
+    # descriptor.createRef() as the first argument.
     attempts = (
         (
+            spmat_ref,
             n_rows,
             n_cols,
             nnz,
@@ -617,6 +734,7 @@ def _hipsparse_create_coo_descriptor(
             value_type,
         ),
         (
+            spmat_ref,
             n_rows,
             n_cols,
             nnz,
@@ -645,6 +763,7 @@ def _hipsparse_create_coo_descriptor(
 
 
 def _hipsparse_create_csc_descriptor(
+    spmat_ref,
     n_rows,
     n_cols,
     nnz,
@@ -656,10 +775,11 @@ def _hipsparse_create_csc_descriptor(
     index_base,
     value_type,
 ):
-    # Same payload-style return as CreateCsr; the operand order is
-    # (colOffsets, rowInd) rather than (rowOffsets, colInd).
+    # The operand order is (colOffsets, rowInd) rather than
+    # (rowOffsets, colInd).
     return _hip_check_result(
         hipsparse.hipsparseCreateCsc(
+            spmat_ref,
             n_rows,
             n_cols,
             nnz,
@@ -676,6 +796,7 @@ def _hipsparse_create_csc_descriptor(
 
 
 def _hipsparse_create_csr_descriptor(
+    spmat_ref,
     n_rows,
     n_cols,
     nnz,
@@ -687,17 +808,21 @@ def _hipsparse_create_csr_descriptor(
     index_base,
     value_type,
 ):
-    descriptor_args = (
-        n_rows,
-        n_cols,
-        nnz,
-        row_ptr,
-        col_ptr,
-        values_ptr,
-        row_index_type,
-        col_index_type,
-        index_base,
-        value_type,
+    return _hip_check_result(
+        hipsparse.hipsparseCreateCsr(
+            spmat_ref,
+            n_rows,
+            n_cols,
+            nnz,
+            row_ptr,
+            col_ptr,
+            values_ptr,
+            row_index_type,
+            col_index_type,
+            index_base,
+            value_type,
+        ),
+        "hipsparseCreateCsr",
     )
 
     # hip-python has shipped both wrapper conventions.  Newer generators omit
@@ -844,6 +969,18 @@ def _hipsparse_index_type(index_dtype, context):
 
 def _hipsparse_spmv_operation(op, context):
     op_name = _normalize_spmv_reference_op(op)
+    mapping = {
+        "non": ("HIPSPARSE_OPERATION_NON_TRANSPOSE",),
+        "trans": ("HIPSPARSE_OPERATION_TRANSPOSE",),
+        "conj": ("HIPSPARSE_OPERATION_CONJUGATE_TRANSPOSE",),
+    }
+    if op_name not in mapping:
+        raise RuntimeError(f"{context} does not support op={op_name}")
+    return _hipsparse_lookup("hipsparseOperation_t", mapping[op_name])
+
+
+def _hipsparse_spmm_operation(op, context):
+    op_name = _normalize_sparse_reference_op(op)
     mapping = {
         "non": ("HIPSPARSE_OPERATION_NON_TRANSPOSE",),
         "trans": ("HIPSPARSE_OPERATION_TRANSPOSE",),
@@ -1224,8 +1361,10 @@ def _prepare_spmv_coo_ref_hipsparse(
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
         ptr_type = type(handle)
 
+        spmat = ptr_type()
         vecx = ptr_type()
         vecy = ptr_type()
+        spmat_ref = spmat.createRef()
         vecx_ref = vecx.createRef()
         vecy_ref = vecy.createRef()
 
@@ -1243,7 +1382,8 @@ def _prepare_spmv_coo_ref_hipsparse(
             ("HIPSPARSE_SPMV_ALG_DEFAULT", "HIPSPARSE_MV_ALG_DEFAULT"),
         )
 
-        spmat = _hipsparse_create_coo_descriptor(
+        _hipsparse_create_coo_descriptor(
+            spmat_ref,
             n_rows,
             n_cols,
             int(data.numel()),
@@ -1552,9 +1692,11 @@ def _prepare_spmv_ref_hipsparse(
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
         ptr_type = type(handle)
 
-        # hip-python dense descriptor outputs must be created via createRef().
+        # hip-python descriptor outputs must be created via createRef().
+        spmat = ptr_type()
         vecx = ptr_type()
         vecy = ptr_type()
+        spmat_ref = spmat.createRef()
         vecx_ref = vecx.createRef()
         vecy_ref = vecy.createRef()
 
@@ -1578,7 +1720,8 @@ def _prepare_spmv_ref_hipsparse(
             if layout == "csr"
             else _hipsparse_create_csc_descriptor
         )
-        spmat = make_descriptor(
+        make_descriptor(
+            spmat_ref,
             n_rows,
             n_cols,
             int(data.numel()),

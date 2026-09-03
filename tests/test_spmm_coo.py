@@ -15,7 +15,7 @@
 """
 COO SpMM tests: load SuiteSparse .mtx, batch run, output error and performance.
 Supports: multi .mtx files, value_dtype / index_dtype, CSV export, synthetic cases,
-API validation checks, and PyTorch / CuPy comparison baselines.
+API validation checks, and PyTorch / vendor sparse comparison baselines.
 
 This test module targets the current FlagSparse native COO SpMM implementation.
 The default public route is a sorted row-run Triton COO kernel. A second native
@@ -39,6 +39,11 @@ if str(_SRC_ROOT) not in sys.path:
 
 import flagsparse as ast
 import flagsparse.sparse_operations.spmm_coo as ast_ops
+from baseline_backend import (
+    expected_vendor_label,
+    expected_vendor_short,
+    print_backend_summary,
+)
 
 VALUE_DTYPES = [
     torch.float16,
@@ -750,6 +755,10 @@ def _time_cusparse_coo(prepared_case, ref_C, dtype, warmup, iters, layout="row")
         return None, None, str(exc)
 
 
+def _vendor_sparse_label():
+    return expected_vendor_label()
+
+
 def _cupy_event_benchmark(op, arg, warmup, iters):
     import cupy as cp
 
@@ -842,7 +851,9 @@ def run_one_alg_case(
     cusparse_ms = None
     cusparse_reason = ""
     if run_cusparse:
-        stage_t0 = _start("time CuPy/cuSPARSE COO reference")
+        vendor_label = _vendor_sparse_label()
+        stage_label = f"time {vendor_label} COO reference"
+        stage_t0 = _start(stage_label)
         cusparse_out, cusparse_ms, cusparse_reason = _time_cusparse_coo(
             case,
             ref,
@@ -852,7 +863,7 @@ def run_one_alg_case(
             layout=layout,
         )
         _done(
-            "time CuPy/cuSPARSE COO reference",
+            stage_label,
             stage_t0,
             f"ms={_fmt_ms(cusparse_ms)} reason={cusparse_reason or ''}",
         )
@@ -2112,13 +2123,23 @@ def _print_spmm_coo_mtx_header(
     value_dtype, index_dtype, route, layout=None, timing=False
 ):
     route = _normalize_route(route)
+    vendor_backend, vendor_reason = ast_ops._spmm_coo_sparse_ref_backend(
+        value_dtype, index_dtype
+    )
+    print_backend_summary(
+        op_name="SpMM COO",
+        native_format=_route_label(route),
+        correctness_ref="PyTorch COO sparse.mm",
+        vendor_backend=vendor_backend,
+        vendor_reason=vendor_reason,
+    )
     print(
         f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}"
     )
     if layout is not None:
         print(f"Dense layout: {layout}")
     print(
-        f"Formats: FlagSparse={_route_label(route)}, cuSPARSE=COO dense-mm, PyTorch=COO."
+        f"Formats: FlagSparse={_route_label(route)}, {expected_vendor_label()}=COO dense-mm, PyTorch=COO."
     )
     print(
         "Timing: FS(ms)=process_cpu_ms+FS_GPU(ms); --timing adds process_gpu_ms/compute_ms split."
@@ -2133,7 +2154,7 @@ def _print_spmm_coo_mtx_header(
         "Timing stays in native dtype. For float32, correctness references use float64 compute then cast."
     )
     print(
-        "PT/CU show per-reference correctness. Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|))."
+        f"PT/{expected_vendor_short()} show per-reference correctness. Err(PT)/Err({expected_vendor_short()})=max(|diff| / (atol + rtol*|ref|))."
     )
     print("PyTorch uses COO sparse.mm as the only correctness reference path.")
     if route == "compare":
@@ -2146,7 +2167,7 @@ def _print_spmm_coo_mtx_header(
     print(
         f"{'Matrix':<28} {'Op':>5} {'Lay':>4} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} "
         f"{'FS(ms)':>9} {'FS_GPU':>9} {'CPUProc':>9} {split}"
-        f"{'cuSPARSE':>9} {'PyTorch':>9} {'FS/CU':>7} {'FS/PT':>7} {'PT':>6} {'CU':>6} {'Err(PT)':>10} {'Err(CU)':>10}"
+        f"{expected_vendor_short():>9} {'PyTorch':>9} {('FS/' + expected_vendor_short()):>7} {'FS/PT':>7} {'PT':>6} {expected_vendor_short():>6} {'Err(PT)':>10} {('Err(' + expected_vendor_short() + ')'):>10}"
     )
     print("-" * width)
 
@@ -2619,7 +2640,7 @@ def run_coo_tile_branch_coverage(warmup=WARMUP, iters=ITERS, run_cusparse=True):
     print("=" * 144)
     print(
         f"{'DenseN':>8} {'BLOCK_N':>8} {'NNZTile':>8} {'Runs':>7} {'Tiles':>7} {'Warp':>6} {'Factor':>7} "
-        f"{'PyTorch(ms)':>12} {'FlagSparse(ms)':>14} {'cuSPARSE(ms)':>12} {'PT':>6} {'CU':>6} {'Err(FS)':>11}"
+        f"{'PyTorch(ms)':>12} {'FlagSparse(ms)':>14} {(expected_vendor_short() + '(ms)'):>12} {'PT':>6} {expected_vendor_short():>6} {'Err(FS)':>11}"
     )
     print("-" * 144)
 
@@ -2665,7 +2686,7 @@ def run_coo_tile_branch_coverage(warmup=WARMUP, iters=ITERS, run_cusparse=True):
         )
     print("-" * 144)
     if note:
-        print(f"cuSPARSE note: {note}")
+        print(f"{expected_vendor_label()} note: {note}")
     print()
     return failed
 
@@ -2674,7 +2695,7 @@ def _print_synthetic_compare_results(compare_rows):
     if not compare_rows:
         return
 
-    print("Compare details (PT-COO / CU-COO / native parity)")
+    print(f"Compare details (PT-COO / {expected_vendor_short()}-COO / native parity)")
     print("Row/PT is the main default-route diagnostic; Atomic/PT is debug-only.")
     print("-" * 168)
     print(
@@ -2724,7 +2745,7 @@ def run_comprehensive_synthetic(
         f"BLOCK_N: {_fmt_launch_value(block_n)}  BLOCK_NNZ: {_fmt_launch_value(block_nnz)}  Route: {route}  Ops: {','.join(op_names)}  Layouts: {','.join(layout_names)}"
     )
     print(
-        f"Formats: FlagSparse={_route_label(route)}, cuSPARSE=COO dense-mm (when supported), PyTorch=COO."
+        f"Formats: FlagSparse={_route_label(route)}, {expected_vendor_label()}=COO dense-mm (when supported), PyTorch=COO."
     )
     print(
         "Timing: FS(ms)=process_cpu_ms+FS_GPU(ms); --timing adds process_gpu_ms/compute_ms split."
@@ -2736,7 +2757,7 @@ def run_comprehensive_synthetic(
         "Atomic has no current execution-plan preprocessing; host launch config and input normalization are excluded."
     )
     print(
-        "For float32, PT checks the float64-based correctness reference while CU reflects native cuSPARSE float32 consistency."
+        f"For float32, PT checks the float64-based correctness reference while {expected_vendor_short()} reflects native vendor sparse float32 consistency."
     )
     if route == "compare":
         print(
@@ -2759,7 +2780,7 @@ def run_comprehensive_synthetic(
             print(
                 f"{'Op':>5} {'Lay':>4} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} {'BN':>4} {'BNNZ':>6} {'Runs':>5} {'Tiles':>5} "
                 f"{'FS(ms)':>9} {'FS_GPU':>9} {'CPUProc':>9} {split_header}"
-                f"{'PyTorch':>9} {'cuSPARSE':>9} {'FS/PT':>8} {'FS/CU':>8} {'PT':>6} {'CU':>6} {'Err(FS)':>11} {'Err(CU)':>12}"
+                f"{'PyTorch':>9} {expected_vendor_short():>9} {'FS/PT':>8} {('FS/' + expected_vendor_short()):>8} {'PT':>6} {expected_vendor_short():>6} {'Err(FS)':>11} {('Err(' + expected_vendor_short() + ')'):>12}"
             )
             print("-" * width)
             combo_reason = None
@@ -2862,7 +2883,7 @@ def run_comprehensive_synthetic(
                             )
             print("-" * width)
             if combo_reason:
-                print(f"  cuSPARSE: {combo_reason}")
+                print(f"  {expected_vendor_label()}: {combo_reason}")
             print()
             if route == "compare":
                 _print_synthetic_compare_results(compare_rows)
@@ -3082,6 +3103,17 @@ def main():
         print(
             f"dtypes: {args.dtypes}  |  index_dtypes: {args.index_dtypes}  |  ops: {args.op}  |  layouts: {args.layout}"
         )
+        first_backend, first_reason = ast_ops._spmm_coo_sparse_ref_backend(
+            csv_value_dtypes[0], csv_index_dtypes[0]
+        )
+        print_backend_summary(
+            op_name="SpMM COO",
+            native_format=_route_label(args.route),
+            correctness_ref="PyTorch COO sparse.mm",
+            vendor_backend=first_backend,
+            vendor_reason=first_reason,
+            run_vendor=not args.no_cusparse,
+        )
         run_all_dtypes_export_csv(
             paths,
             csv_path,
@@ -3106,6 +3138,17 @@ def main():
     print("FLAGSPARSE COO SpMM - SuiteSparse .mtx batch (error + performance)")
     print("=" * 140)
     print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}")
+    selected_backend, selected_reason = ast_ops._spmm_coo_sparse_ref_backend(
+        dtype_map[args.dtype], index_map[args.index_dtype]
+    )
+    print_backend_summary(
+        op_name="SpMM COO",
+        native_format=_route_label(args.route),
+        correctness_ref="PyTorch COO sparse.mm",
+        vendor_backend=selected_backend,
+        vendor_reason=selected_reason,
+        run_vendor=not args.no_cusparse,
+    )
     print(
         f"dtype: {args.dtype}  index_dtype: {args.index_dtype}  dense_cols: {args.dense_cols}  "
         f"op: {args.op}  layout: {args.layout}  warmup: {args.warmup}  iters: {args.iters}  block_n: {_fmt_launch_value(args.block_n)}  "

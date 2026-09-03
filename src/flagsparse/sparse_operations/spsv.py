@@ -716,8 +716,10 @@ def _prepare_spsv_csr_ref_hipsparse(
         stream_warning = _try_set_hipsparse_current_stream(handle)
         ptr_type = type(handle)
 
+        spmat = ptr_type()
         rhs_desc = ptr_type()
         sol_desc = ptr_type()
+        spmat_ref = spmat.createRef()
         rhs_desc_ref = rhs_desc.createRef()
         sol_desc_ref = sol_desc.createRef()
 
@@ -731,7 +733,8 @@ def _prepare_spsv_csr_ref_hipsparse(
             "hipsparseIndexBase_t",
             ("HIPSPARSE_INDEX_BASE_ZERO",),
         )
-        spmat = _hipsparse_create_csr_descriptor(
+        _hipsparse_create_csr_descriptor(
+            spmat_ref,
             n_rows,
             n_cols,
             int(data.numel()),
