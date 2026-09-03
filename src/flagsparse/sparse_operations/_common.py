@@ -825,39 +825,6 @@ def _hipsparse_create_csr_descriptor(
         "hipsparseCreateCsr",
     )
 
-    # hip-python has shipped both wrapper conventions.  Newer generators omit
-    # the C output slot and return the descriptor as the result payload, while
-    # older/current DTK bindings retain an explicit leading spMatDescr argument.
-    # Keep the payload form first so existing environments and CUDA-only imports
-    # are unchanged, then retry only a Python signature mismatch with createRef().
-    try:
-        return _hip_check_result(
-            hipsparse.hipsparseCreateCsr(*descriptor_args),
-            "hipsparseCreateCsr",
-        )
-    except TypeError as payload_error:
-        descriptor = type(row_ptr)()
-        if not hasattr(descriptor, "createRef"):
-            raise RuntimeError(
-                "hipsparseCreateCsr requires an explicit descriptor output, "
-                "but the installed hip-python pointer type has no createRef()"
-            ) from payload_error
-        try:
-            payload = _hip_check_result(
-                hipsparse.hipsparseCreateCsr(
-                    descriptor.createRef(), *descriptor_args
-                ),
-                "hipsparseCreateCsr",
-            )
-        except TypeError as explicit_error:
-            raise RuntimeError(
-                "hipsparseCreateCsr wrapper matches neither the 10-argument "
-                "payload form nor the 11-argument explicit-output form: "
-                f"payload={payload_error}; explicit={explicit_error}"
-            ) from explicit_error
-        return descriptor if payload is None else payload
-
-
 def _hipsparse_spmm_order(order_name, context):
     mapping = {
         "row": ("HIPSPARSE_ORDER_ROW",),

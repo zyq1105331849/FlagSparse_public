@@ -77,7 +77,9 @@ class _MockHipPointer:
 
 
 def _call_mock_csr_descriptor(helper):
-    return helper(
+    descriptor = _MockHipPointer()
+    result = helper(
+        descriptor.createRef(),
         2,
         2,
         2,
@@ -89,42 +91,25 @@ def _call_mock_csr_descriptor(helper):
         "zero",
         "float32",
     )
+    return descriptor, result
 
 
-def test_hipsparse_csr_descriptor_keeps_payload_wrapper_compatibility():
-    class PayloadWrapper:
-        calls = []
-
-        @classmethod
-        def hipsparseCreateCsr(cls, *args):
-            cls.calls.append(args)
-            assert len(args) == 10
-            return (0, "payload_descriptor")
-
-    helper = _load_csr_descriptor_helper(PayloadWrapper)
-    assert _call_mock_csr_descriptor(helper) == "payload_descriptor"
-    assert len(PayloadWrapper.calls) == 1
-
-
-def test_hipsparse_csr_descriptor_supports_explicit_output_wrapper():
+def test_hipsparse_csr_descriptor_uses_explicit_output_wrapper():
     class ExplicitOutputWrapper:
         calls = []
 
         @classmethod
         def hipsparseCreateCsr(cls, *args):
             cls.calls.append(args)
-            if len(args) == 10:
-                raise TypeError(
-                    "hipsparseCreateCsr() takes exactly 11 positional arguments (10 given)"
-                )
             assert len(args) == 11
             assert args[0][0] == "descriptor_ref"
             return (0,)
 
     helper = _load_csr_descriptor_helper(ExplicitOutputWrapper)
-    descriptor = _call_mock_csr_descriptor(helper)
+    descriptor, result = _call_mock_csr_descriptor(helper)
     assert isinstance(descriptor, _MockHipPointer)
-    assert [len(args) for args in ExplicitOutputWrapper.calls] == [10, 11]
+    assert result is None
+    assert [len(args) for args in ExplicitOutputWrapper.calls] == [11]
 
 
 def _benchmark_function_source(name):
