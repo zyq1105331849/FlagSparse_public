@@ -71,6 +71,7 @@ MAIN_CSR_SPMM_ALGORITHMS = {
     "spmm_csr_alg2_accuracy",
     "spmm_csr_alg2_accuracy_hp",
 }
+TLE_CSR_SPMM_ALGORITHMS = {"alpha_alg1_tle_opt", "alpha_alg1_tle_opt2"}
 
 PERF_FIELDS = [
     "matrix",
@@ -276,7 +277,7 @@ def _parse_algs(value):
     return names
 
 
-def _expand_algs(alg_names, op, dtype):
+def _expand_algs(alg_names, op, dtype, exclude_tle=False):
     expanded = []
     for alg in alg_names:
         if alg == "all":
@@ -285,6 +286,14 @@ def _expand_algs(alg_names, op, dtype):
             expanded.append("auto")
         else:
             expanded.append(alg)
+    if exclude_tle:
+        expanded = [
+            alg
+            for alg in expanded
+            if alg not in TLE_CSR_SPMM_ALGORITHMS
+            and fs.resolve_spmm_csr_algorithm(alg, op, dtype).name
+            not in TLE_CSR_SPMM_ALGORITHMS
+        ]
     deduped = []
     for alg in expanded:
         if alg not in deduped:
@@ -465,21 +474,17 @@ def _time_vendor_sparse_ref(
     data, indices, indptr, shape, B, op, warmup, iters, layout="row"
 ):
     if spmm_ops._is_rocm_runtime():
-        if op != "non":
-            return (
-                None,
-                None,
-                f"hipSPARSE CSR SpMM baseline only supports op=non in this runner, got op={op}",
-            )
-        if layout != "row" or not B.is_contiguous():
-            return (
-                None,
-                None,
-                "hipSPARSE CSR SpMM baseline requires row-major contiguous dense RHS",
-            )
         try:
             sparse_ref = spmm_ops._benchmark_spmm_csr_sparse_ref(
-                data, indices, indptr, B, shape, warmup=warmup, iters=iters
+                data,
+                indices,
+                indptr,
+                B,
+                shape,
+                warmup=warmup,
+                iters=iters,
+                op=op,
+                dense_layout=layout,
             )
         except Exception as exc:
             return None, None, str(exc)
@@ -489,6 +494,18 @@ def _time_vendor_sparse_ref(
 
     if data.dtype not in CUSPARSE_DTYPES:
         return None, None, "dtype not supported by CuPy/cuSPARSE reference"
+    if op != "non":
+        return (
+            None,
+            None,
+            f"CuPy/cuSPARSE CSR SpMM baseline supports op=non only in this runner; op={op} is unsupported",
+        )
+    if layout != "row":
+        return (
+            None,
+            None,
+            f"CuPy/cuSPARSE CSR SpMM baseline supports row-major dense RHS only in this runner; layout={layout} is unsupported",
+        )
     try:
         import cupy as cp
         import cupyx.scipy.sparse as cpx_sparse
@@ -502,17 +519,7 @@ def _time_vendor_sparse_ref(
         indptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
         B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
         A = cpx_sparse.csr_matrix((data_cp, indices_cp, indptr_cp), shape=shape)
-        if op == "trans":
-            A = A.transpose().tocsr()
-        elif op == "conj":
-            A = A.transpose().conj().tocsr()
-        try:
-            out_cp, ms = _cupy_event_benchmark(lambda: A @ B_cp, warmup, iters)
-        except Exception:
-            if layout != "col":
-                raise
-            B_cp = cp.asfortranarray(B_cp)
-            out_cp, ms = _cupy_event_benchmark(lambda: A @ B_cp, warmup, iters)
+        out_cp, ms = _cupy_event_benchmark(lambda: A @ B_cp, warmup, iters)
         out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
         return out, ms, None
     except Exception as exc:
@@ -533,6 +540,7 @@ def run_one_case(
     run_cusparse,
     timing,
     diagnose,
+    exclude_tle=False,
 ):
     device = torch.device("cuda")
     data, indices, indptr, shape = load_mtx_to_csr_torch(
@@ -564,7 +572,7 @@ def run_one_case(
     prepared = fs.prepare_spmm_csr_route(
         data, indices, indptr, shape, op=op, alg="auto"
     )
-    for alg in _expand_algs(alg_names, op, dtype):
+    for alg in _expand_algs(alg_names, op, dtype, exclude_tle=exclude_tle):
         try:
             resolved = fs.resolve_spmm_csr_algorithm(alg, op, dtype)
             if layout == "col" and resolved.name not in MAIN_CSR_SPMM_ALGORITHMS:
@@ -598,7 +606,7 @@ def run_one_case(
                 diagnose=diagnose,
                 layout=layout,
             )
-        except (fs.SpmmCsrAlgorithmUnavailable, ValueError, TypeError) as exc:
+        except (fs.SpmmCsrAlgorithmUnavailable, ValueError, TypeError, RuntimeError) as exc:
             rows.append(
                 _skip_row(
                     path,
@@ -613,7 +621,7 @@ def run_one_case(
                     b_stride,
                     torch_ms,
                     cusparse_ms,
-                    str(exc),
+                    f"{type(exc).__name__}: {exc}",
                     timing,
                     cusparse_reason=cusparse_reason,
                 )
@@ -760,6 +768,11 @@ def main():
         "--timing", action="store_true", help="Add process_gpu_ms/compute_ms columns"
     )
     parser.add_argument(
+        "--exclude-tle",
+        action="store_true",
+        help="Exclude alpha_alg1_tle_opt and alpha_alg1_tle_opt2 from --alg sweeps",
+    )
+    parser.add_argument(
         "--diagnose", action="store_true", help="Write separate diagnose metadata CSV"
     )
     args = parser.parse_args()
@@ -794,7 +807,10 @@ def main():
     fields = PERF_FIELDS + (TIMING_FIELDS if args.timing else [])
     rows = []
     diag_rows = []
-    _print_tle_availability(alg_names)
+    if args.exclude_tle:
+        print("TLE runtime availability: skipped by --exclude-tle")
+    else:
+        _print_tle_availability(alg_names)
     vendor_label = _vendor_label()
     vendor_column = _vendor_column_label()
     first_dtype = DTYPE_MAP[dtype_names[0]]
@@ -840,6 +856,7 @@ def main():
                                 not args.no_cusparse,
                                 args.timing,
                                 args.diagnose,
+                                exclude_tle=args.exclude_tle,
                             )
                             rows.extend(case_rows)
                             diag_rows.extend(case_diag)

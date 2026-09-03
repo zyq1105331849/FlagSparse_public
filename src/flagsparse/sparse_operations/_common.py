@@ -105,6 +105,7 @@ __all__ = (
     "_hipsparse_scalar",
     "_hipsparse_index_type",
     "_hipsparse_spmv_operation",
+    "_hipsparse_spmm_operation",
     "_hipsparse_spmm_order",
     "_hipsparse_spmm_algorithm",
     "_hipsparse_create_coo_descriptor",
@@ -936,6 +937,18 @@ def _hipsparse_index_type(index_dtype, context):
 
 def _hipsparse_spmv_operation(op, context):
     op_name = _normalize_spmv_reference_op(op)
+    mapping = {
+        "non": ("HIPSPARSE_OPERATION_NON_TRANSPOSE",),
+        "trans": ("HIPSPARSE_OPERATION_TRANSPOSE",),
+        "conj": ("HIPSPARSE_OPERATION_CONJUGATE_TRANSPOSE",),
+    }
+    if op_name not in mapping:
+        raise RuntimeError(f"{context} does not support op={op_name}")
+    return _hipsparse_lookup("hipsparseOperation_t", mapping[op_name])
+
+
+def _hipsparse_spmm_operation(op, context):
+    op_name = _normalize_sparse_reference_op(op)
     mapping = {
         "non": ("HIPSPARSE_OPERATION_NON_TRANSPOSE",),
         "trans": ("HIPSPARSE_OPERATION_TRANSPOSE",),

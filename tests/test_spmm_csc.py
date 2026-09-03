@@ -426,15 +426,21 @@ def _is_rocm_runtime_for_tests():
     return getattr(torch.version, "hip", None) is not None
 
 
-def _time_cusparse_csc(data, indices, indptr, B, shape, op, warmup, iters):
+def _time_cusparse_csc(data, indices, indptr, B, shape, op, layout, warmup, iters):
     backend, backend_reason = spmm_ops._spmm_csc_sparse_ref_backend(
         data.dtype, indices.dtype, indptr.dtype
     )
     if backend == "hipsparse":
-        if op != "non":
-            return None, "hipSPARSE CSC baseline supports op='non' only in this runner", None
         ref = spmm_ops._benchmark_spmm_csc_sparse_ref(
-            data, indices, indptr, B, shape, warmup, iters
+            data,
+            indices,
+            indptr,
+            B,
+            shape,
+            warmup,
+            iters,
+            op=op,
+            dense_layout=layout,
         )
         if ref["values"] is None:
             return None, ref["reason"] or "hipSPARSE CSC SpMM reference skipped", None
@@ -444,19 +450,24 @@ def _time_cusparse_csc(data, indices, indptr, B, shape, op, warmup, iters):
     reason = _cupy_csc_unavailable_reason()
     if reason:
         return None, reason, None
+    if op != "non":
+        return (
+            None,
+            f"CuPy/cuSPARSE CSC SpMM baseline supports op=non only in this runner; op={op} is unsupported",
+            None,
+        )
+    if layout != "row":
+        return (
+            None,
+            f"CuPy/cuSPARSE CSC SpMM baseline supports row-major dense RHS only in this runner; layout={layout} is unsupported",
+            None,
+        )
     data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
     ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices))
     ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
     B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
     A = cpx_sparse.csc_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
-    if op == "non":
-        fn = lambda: A @ B_cp
-    elif op == "trans":
-        fn = lambda: A.T @ B_cp
-    elif op == "conj":
-        fn = lambda: A.conj().T @ B_cp
-    else:
-        raise ValueError(f"unsupported op: {op}")
+    fn = lambda: A @ B_cp
     for _ in range(max(0, int(warmup))):
         out_cp = fn()
     cp.cuda.runtime.deviceSynchronize()
@@ -546,7 +557,7 @@ def _run_case(
     if row["status"] != "ERROR" and run_cusparse:
         try:
             cu_ms, cu_reason, cu_out = _time_cusparse_csc(
-                data, indices, indptr, B, shape, op, warmup, iters
+                data, indices, indptr, B, shape, op, layout, warmup, iters
             )
             row["cusparse_ms"] = cu_ms
             row["cusparse_reason"] = cu_reason or ""
@@ -588,11 +599,19 @@ def _print_notes(run_cusparse):
     print("PyTorch CSC SpMM baseline: unavailable; torch.sparse.mm documents CSC @ Dense as unsupported, so no PyTorch CSC fallback is used.")
     if run_cusparse:
         if _is_rocm_runtime_for_tests():
-            print("hipSPARSE CSC baseline: HS(ms) uses hipSPARSE CSC SpMM for op=non when supported; trans/conj report HS=N/A with reason.")
+            print(
+                "hipSPARSE CSC baseline: HS(ms) uses hipSPARSE CSC SpMM when the "
+                "installed backend supports the requested op/layout; unsupported "
+                "combinations report HS=N/A with reason."
+            )
         elif (reason := _cupy_csc_unavailable_reason()):
             print(f"{expected_vendor_label()} CSC baseline: unavailable ({reason}); {expected_vendor_short()}(ms)=N/A.")
         else:
-            print(f"{expected_vendor_label()} CSC baseline: {expected_vendor_short()}(ms) uses cupyx.scipy.sparse.csc_matrix op @ dense with construction outside timing.")
+            print(
+                f"{expected_vendor_label()} CSC baseline: {expected_vendor_short()}(ms) "
+                "uses cupyx.scipy.sparse.csc_matrix @ dense for op=non,row; "
+                "other op/layout combinations report N/A with reason."
+            )
     else:
         print("Vendor CSC baseline disabled by --no-cusparse; vendor ms=N/A.")
     print("Timing policy: ms = process_cpu_ms + gpu_ms; CSC SpMM v1 has no process phase.")
