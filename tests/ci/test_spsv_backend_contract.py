@@ -213,7 +213,7 @@ def test_rocm_alg3_directly_reuses_cuda_alg8_nnz_balance_kernel():
 
     launch_config = _function_source("_spsv_nnz_balance_launch_config")
     assert "if not is_rocm:" in launch_config
-    assert "return False, 1, int(nnz), 1" in launch_config
+    assert "return False, 256, triton.cdiv(int(nnz), 256), 8" in launch_config
     assert "block_nnz = SPSV_ROCM_ALG3_BLOCK_NNZ" in launch_config
     assert "multi_processor_count" in launch_config
     assert "worker_cap = cu_count * SPSV_ROCM_ALG3_WORKGROUPS_PER_CU" in launch_config

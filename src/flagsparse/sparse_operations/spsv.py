@@ -6024,7 +6024,8 @@ def _spsv_nnz_balance_launch_config(nnz, device):
 
     is_rocm = _is_rocm_runtime()
     if not is_rocm:
-        return False, 1, int(nnz), 1
+        # Match allinone CUDA: 256 threads per block, one NNZ per lane.
+        return False, 256, triton.cdiv(int(nnz), 256), 8
 
     block_nnz = SPSV_ROCM_ALG3_BLOCK_NNZ
     cu_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
@@ -6061,7 +6062,7 @@ def _triton_spsv_csr_n_lo_nnz_balance_vector(
     )
     use_fp64_acc = acc_dtype == torch.float64
     nnz = int(data.numel())
-    # CUDA keeps the original one-NNZ-per-program launch. DCU uses a bounded
+    # CUDA assigns 256 NNZs to each 8-warp program. DCU uses a bounded
     # persistent grid; the measured default uses four workgroups per CU, while the
     # environment-controlled multiplier enables occupancy experiments without
     # changing the kernel or the CUDA route.
