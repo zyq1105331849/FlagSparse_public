@@ -44,6 +44,10 @@ DEFAULT_INDEX_DTYPES = "int32,int64"
 WARMUP = 20
 ITERS = 200
 KERNEL_GRAPH_BATCH = 100
+_IS_ROCM_RUNTIME = getattr(torch.version, "hip", None) is not None
+_VENDOR_BACKEND_NAME = "hipSPARSE" if _IS_ROCM_RUNTIME else "cuSPARSE"
+_VENDOR_FIELD_PREFIX = "hipsparse" if _IS_ROCM_RUNTIME else "cusparse"
+_VENDOR_SHORT_NAME = "HS" if _IS_ROCM_RUNTIME else "CS"
 
 
 def _fmt_ms(value):
@@ -195,28 +199,34 @@ def _status_from_result(verification):
 
 
 def _print_header():
+    vendor = _VENDOR_SHORT_NAME
     print("-" * 196)
     print(
         f"{'ValueReq':>14} {'ValueEff':>18} {'Index':>6} {'Dense':>10} {'NNZ':>10} "
-        f"{'IFB':>4} {'FS(ms)':>10} {'PT(ms)':>10} {'CS(ms)':>10} "
-        f"{'FS/PT':>8} {'FS/CS':>8} {'Status':>6} {'Err(FS)':>12} {'Err(CS)':>12}"
+        f"{'IFB':>4} {'FS(ms)':>10} {'PT(ms)':>10} {f'{vendor}(ms)':>10} "
+        f"{'FS/PT':>8} {f'FS/{vendor}':>8} {'Status':>6} "
+        f"{'Err(FS)':>12} {f'Err({vendor})':>12}"
     )
     print("-" * 196)
 
 
 def _print_row(row):
+    vendor = _VENDOR_FIELD_PREFIX
     print(
         f"{row['value_dtype_req']:>14} {row['value_dtype_compute']:>18} {row['index_dtype']:>6} "
         f"{row['dense_size']:>10,d} {row['nnz']:>10,d} {str(row['index_fallback_applied']):>4} "
-        f"{_fmt_ms(row['triton_ms']):>10} {_fmt_ms(row['pytorch_ms']):>10} {_fmt_ms(row['cusparse_ms']):>10} "
-        f"{_fmt_speedup(row['triton_speedup_vs_pytorch']):>8} {_fmt_speedup(row['triton_speedup_vs_cusparse']):>8} "
-        f"{row['status']:>6} {_fmt_err(row['triton_max_error']):>12} {_fmt_err(row['cusparse_max_error']):>12}"
+        f"{_fmt_ms(row['triton_ms']):>10} {_fmt_ms(row['pytorch_ms']):>10} "
+        f"{_fmt_ms(row[f'{vendor}_ms']):>10} "
+        f"{_fmt_speedup(row['triton_speedup_vs_pytorch']):>8} "
+        f"{_fmt_speedup(row[f'triton_speedup_vs_{vendor}']):>8} "
+        f"{row['status']:>6} {_fmt_err(row['triton_max_error']):>12} "
+        f"{_fmt_err(row[f'{vendor}_max_error']):>12}"
     )
 
 
 def run_cli(args):
     if not torch.cuda.is_available():
-        print("CUDA is not available. Please run on a GPU-enabled system.")
+        print("No CUDA/ROCm GPU is available. Please run on a GPU-enabled system.")
         return
 
     value_dtype_tokens = _parse_value_dtypes(args.value_dtypes)
@@ -229,6 +239,7 @@ def run_cli(args):
     print("=" * 180)
     print(f"FlagSparse source: {Path(ast.__file__).resolve()}")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Vendor reference: {_VENDOR_BACKEND_NAME}")
     print(
         f"Warmup: {args.warmup} | Iterations: {args.iters} | "
         f"Kernel graph batch: {KERNEL_GRAPH_BATCH} | "
@@ -241,6 +252,7 @@ def run_cli(args):
     sample_rows = []
     total_cases = 0
     failed_cases = 0
+    vendor = _VENDOR_FIELD_PREFIX
 
     for value_dtype in value_dtype_tokens:
         for index_name, index_dtype in index_dtype_pairs:
@@ -302,20 +314,22 @@ def run_cli(args):
                         "index_fallback_applied": False,
                         "triton_ms": perf.get("triton_ms"),
                         "pytorch_ms": perf.get("pytorch_ms"),
-                        "cusparse_ms": perf.get("cusparse_ms"),
+                        f"{vendor}_ms": perf.get("cusparse_ms"),
                         "triton_speedup_vs_pytorch": perf.get(
                             "triton_speedup_vs_pytorch"
                         ),
-                        "triton_speedup_vs_cusparse": perf.get(
+                        f"triton_speedup_vs_{vendor}": perf.get(
                             "triton_speedup_vs_cusparse"
                         ),
                         "kernel_timing_method": timing_method,
                         "kernel_graph_batch": graph_batch,
                         "triton_match_pytorch": verify.get("triton_match_pytorch"),
-                        "cusparse_match_pytorch": verify.get("cusparse_match_pytorch"),
+                        f"{vendor}_match_pytorch": verify.get(
+                            "cusparse_match_pytorch"
+                        ),
                         "triton_max_error": verify.get("triton_max_error"),
-                        "cusparse_max_error": verify.get("cusparse_max_error"),
-                        "cusparse_unavailable_reason": backend.get(
+                        f"{vendor}_max_error": verify.get("cusparse_max_error"),
+                        f"{vendor}_unavailable_reason": backend.get(
                             "cusparse_unavailable_reason"
                         ),
                         "index_fallback_reason": None,
@@ -350,16 +364,16 @@ def run_cli(args):
                         "index_fallback_applied": False,
                         "triton_ms": None,
                         "pytorch_ms": None,
-                        "cusparse_ms": None,
+                        f"{vendor}_ms": None,
                         "triton_speedup_vs_pytorch": None,
-                        "triton_speedup_vs_cusparse": None,
+                        f"triton_speedup_vs_{vendor}": None,
                         "kernel_timing_method": "cuda_graph_event_amortized_device_estimate",
                         "kernel_graph_batch": KERNEL_GRAPH_BATCH,
                         "triton_match_pytorch": None,
-                        "cusparse_match_pytorch": None,
+                        f"{vendor}_match_pytorch": None,
                         "triton_max_error": None,
-                        "cusparse_max_error": None,
-                        "cusparse_unavailable_reason": error_text,
+                        f"{vendor}_max_error": None,
+                        f"{vendor}_unavailable_reason": error_text,
                         "index_fallback_reason": error_text,
                         "status": "ERROR",
                     }
@@ -385,16 +399,16 @@ def run_cli(args):
             "index_fallback_applied",
             "triton_ms",
             "pytorch_ms",
-            "cusparse_ms",
+            f"{vendor}_ms",
             "triton_speedup_vs_pytorch",
-            "triton_speedup_vs_cusparse",
+            f"triton_speedup_vs_{vendor}",
             "kernel_timing_method",
             "kernel_graph_batch",
             "triton_match_pytorch",
-            "cusparse_match_pytorch",
+            f"{vendor}_match_pytorch",
             "triton_max_error",
-            "cusparse_max_error",
-            "cusparse_unavailable_reason",
+            f"{vendor}_max_error",
+            f"{vendor}_unavailable_reason",
             "index_fallback_reason",
             "status",
         ]

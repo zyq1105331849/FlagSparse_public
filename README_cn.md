@@ -246,8 +246,9 @@ python tests/test_spgemm.py <目录/> --csv results.csv    # 可选：--dtype fl
 
 **test_spsv_sell.py** - 下三角、UNIT/NON_UNIT、实数/复数、原生列主序 SELL SpSV，
 支持 NON/TRANS/CONJ 操作模式。CSV 和终端字段
-遵循 CSR SpSV 输出；`FlagSparse_ms` 和 `cuSPARSE_ms` 都覆盖每次调用的准备/
-分析加求解，静态 descriptor 与 SELL 转换不计时。直接
+遵循 CSR SpSV 输出；`FlagSparse_ms` 和 `cuSPARSE_ms` 遵循 allinone 总时间定义：
+一次 buffer-size 查询、一次分析，加多次求解的过滤平均值。FlagSparse 在分析内
+计算 workspace 布局；静态 descriptor、workspace 分配与 SELL 转换不计时。直接
 `flagsparse_spsv_sell` API 默认使用 ALG1；使用 `--alg_num 2` 或显式
 `flagsparse_spsv_analysis_sell` + `flagsparse_spsv_solve_sell` 生命周期可启用
 slice-cooperative ALG2 路径。TRANS/CONJ 使用专用反向依赖 kernel，且不接受

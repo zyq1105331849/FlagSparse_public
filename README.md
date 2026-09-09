@@ -248,8 +248,10 @@ python tests/test_spgemm.py <dir/> --csv results.csv     # optional: --dtype flo
 **test_spsv_sell.py** - lower, UNIT/NON_UNIT, real/complex, native column-major
 SELL SpSV with NON/TRANS/CONJ operation modes. Its CSV and
 terminal fields follow the CSR SpSV output. `FlagSparse_ms` and `cuSPARSE_ms`
-both cover every per-call preparation/analysis plus solve; static descriptors
-and SELL conversion are outside the timed interval. The direct
+follow the allinone total: one buffer-size query plus one analysis plus the
+filtered average of repeated solves. FlagSparse computes its workspace layout
+inside analysis; static descriptors, workspace allocation, and SELL conversion
+are outside the timed interval. The direct
 `flagsparse_spsv_sell` API defaults to ALG1; use `--alg_num 2` or the explicit
 `flagsparse_spsv_analysis_sell` + `flagsparse_spsv_solve_sell` lifecycle for
 the slice-cooperative ALG2 path. TRANS/CONJ use a dedicated reverse-dependency

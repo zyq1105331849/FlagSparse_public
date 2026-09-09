@@ -286,6 +286,7 @@ SpSV 现在按与 SpMM/SpMV 相同的原则组织：尽量复用算法和 kernel
 | ALG2 | 逐 level 的标量 row kernel | 原 level-scheduled kernel |
 | ALG3 | `csr_nnz_balance`：复用 CUDA ALG8 的数学 kernel，DCU 使用不超过 CU 数的常驻 workgroup | 原 32-lane ROC kernel |
 | ALG4 | 不提供（显式请求会报 CUDA-only） | 原 `csr_smblk` |
+| ALG5 | 不提供 | 不提供 |
 | ALG8 | 不提供；其算法已作为 DCU ALG3 | 原 `csr_nnz_balance` |
 
 `SERIAL_EXECUTION` 是 launch-time constexpr：DCU 路径按三角顺序逐行执行，kernel 编译时
@@ -294,11 +295,11 @@ SpSV 现在按与 SpMM/SpMV 相同的原则组织：尽量复用算法和 kernel
 
 DCU ALG3 的 analysis 与 CUDA ALG8 一样生成 `csr_row_idx` 和 `in_degree`，但预处理按
 DCU 的 64-lane wavefront 配置（CUDA 保持 32）。solve 复用同一套 ALG8 数学 kernel；
-CUDA 仍编译为一-NNZ-一-program、`num_warps=1`。DCU 则把 grid 限制为不超过 CU 数，
-每个常驻 workgroup 默认用 256 个 NNZ lane，并按递增 NNZ 块继续取任务；依赖通过
-GPU-scope acquire/release 发布。这既避免海量等待 program 把生产者堵在调度队列中，
-又恢复上一版的向量吞吐。`FLAGSPARSE_SPSV_ROCM_ALG3_BLOCK_NNZ=1|64|128|256`
-可用于实机 A/B，默认 256；复验通过前仍不应把“无 hang”标记为已验收。
+CUDA 每个 8-warp program 处理 256 个 NNZ。DCU 使用 CU 封顶的 persistent grid，每个
+常驻 workgroup 固定处理 64 个 NNZ lane，对应一个 wavefront，再按递增 NNZ 块继续取
+任务。这样既避免海量等待 program 把生产者堵在调度队列中，也避免 256-lane Triton
+program 中四个 wavefront 被同一个循环退出归约耦合；复验通过前仍不应把“无 hang”
+标记为已验收。
 
 当前性能版还保持生产者/消费者对 `x` 的 GPU-scope 原子发布协议，但不再把
 float32/complex64 的 `tmp_sum` 提升到双精度；此前双精度也出现过相同的大误差，说明
@@ -312,8 +313,6 @@ wavefront 因无关依赖互相等待。CU 数量封顶保持不变，因此不�
 自旋等待的旧调度方式。
 
 可用 `FLAGSPARSE_SPSV_ROCM_ENABLE_ADVANCED_AUTO=0` 强制 AUTO 使用 ALG1。
-但 0.8 加速比必须以 gfx936 和正式矩阵集的 CSV 为准，静态检查不能代替性能验收。
-
 ---
 
 ## 5. 正确性套件
@@ -362,9 +361,13 @@ python tests/test_scatter.py  --value-dtypes float32 --warmup 3 --iters 10
 
 SpSV 先逐算法跑 CSR/COO，既能定位 hang，也能比较 allinone 风格的多路径：
 
+DCU 上 `tests/test_spsv.py` 的 CSR/COO 默认使用 ALG3；需要测试其他算法时再显式传入
+`--alg-num`。CUDA 省略该参数时仍保持原 AUTO 路由。
+
 ```bash
 mkdir -p results
-for ALG in 1 2 3 4 8; do
+# DCU: 1 2 3 4；CUDA: 1 2 3 4 8
+for ALG in 1 2 3 4; do
   python tests/test_spsv.py "$M" --csv-csr "results/spsv_csr_alg${ALG}.csv" \
     --ops NON --value-dtypes float --index-dtypes int32 --alg-num "$ALG" \
     --warmup 2 --iters 10
@@ -375,10 +378,11 @@ done
 ```
 
 先看 `FlagSparse_ms` 是否稳定且程序能退出，再看
-`FlagSparse_vs_vendor_speedup`；二者都按每轮完整的 analysis/preparation+solve 统计，
-不会只摊销 FlagSparse 的 analysis。`vendor_backend` 在 DCU 上为 `hipSPARSE`，在 CUDA
-上为 `cuSPARSE`。正式验收时应使用老师规定的迭代数和矩阵集，不能只用
-`trdheim.mtx` 推断全量是否达到 0.8。
+`FlagSparse_vs_vendor_speedup`。DCU 上 FlagSparse 与 hipSPARSE 参考 allinone 的分阶段
+计时口径，并对 analysis 与 solve 都先预热、再重复计时并取过滤平均值，总时间为
+`bufferSize + average analysis + average solve`；workspace 分配不计时。
+`vendor_backend` 在 DCU 上为 `hipSPARSE`，在 CUDA 上为 `cuSPARSE`。
+正式验收时应使用老师规定的迭代数和矩阵集，不能只用 `trdheim.mtx` 推断全量是否达到 0.8。
 
 **怎么看结果**：SpSV 会按运行时自动显示 `HIP.ms` 或 `CU.ms`；CSV 分别写入
 `hipSPARSE_ms` 或 `cuSPARSE_ms`，不再用固定的 CUDA 名称表示 DCU 基线。

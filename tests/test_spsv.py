@@ -93,6 +93,10 @@ def _active_spsv_alg_num_to_solve_kind():
     return CUDA_SPSV_ALG_NUM_TO_SOLVE_KIND
 
 
+def _default_spsv_alg_num():
+    return 3 if fs_spsv_impl._is_rocm_runtime() else None
+
+
 def _parse_csv_tokens(raw):
     return [tok.strip() for tok in str(raw).split(",") if tok.strip()]
 
@@ -210,11 +214,24 @@ def _backend_error_key():
     return "err_hip" if fs_spsv_impl._is_rocm_runtime() else "err_cu"
 
 
+def _vendor_all_speedup_key():
+    backend_name = _vendor_backend_name()
+    if fs_spsv_impl._is_rocm_runtime():
+        return f"FlagSparse_vs_{backend_name}_all_speedup"
+    return f"FlagSparse_vs_{backend_name}_speedup"
+
+
+def _pytorch_all_speedup_key():
+    if fs_spsv_impl._is_rocm_runtime():
+        return "FlagSparse_vs_PyTorch_all_speedup"
+    return "FlagSparse_vs_PyTorch_speedup"
+
+
 def _spsv_csv_fieldnames():
     """Return one CSV schema named for the active sparse-library backend."""
 
     backend_name = _vendor_backend_name()
-    return [
+    fields = [
         "matrix",
         "value_dtype",
         "index_dtype",
@@ -222,19 +239,43 @@ def _spsv_csv_fieldnames():
         "n_rows",
         "n_cols",
         "nnz",
-        "FlagSparse_ms",
-        f"{backend_name}_route",
-        f"{backend_name}_ms",
-        "PyTorch_ms",
-        f"FlagSparse_vs_{backend_name}_speedup",
-        "FlagSparse_vs_PyTorch_speedup",
+    ]
+    if fs_spsv_impl._is_rocm_runtime():
+        fields.extend(
+            [
+                "FlagSparse_analysis_ms",
+                "FlagSparse_solve_ms",
+                "FlagSparse_ms",
+                f"{backend_name}_route",
+                "hipSPARSE_analysis_ms",
+                "hipSPARSE_solve_ms",
+                "hipSPARSE_ms",
+                "PyTorch_ms",
+                "FlagSparse_vs_hipSPARSE_solve_speedup",
+                "FlagSparse_vs_hipSPARSE_all_speedup",
+                "FlagSparse_vs_PyTorch_all_speedup",
+            ]
+        )
+    else:
+        fields.extend(
+            [
+                "FlagSparse_ms",
+                f"{backend_name}_route",
+                f"{backend_name}_ms",
+                "PyTorch_ms",
+                f"FlagSparse_vs_{backend_name}_speedup",
+                "FlagSparse_vs_PyTorch_speedup",
+            ]
+        )
+    fields.extend([
         "status",
         "err_pt",
         _backend_error_key(),
         f"{backend_name}_reason",
         "pytorch_reason",
         "error",
-    ]
+    ])
+    return fields
 
 
 def _vendor_reference_route():
@@ -609,7 +650,7 @@ def _benchmark_flagsparse_spsv_full_rounds(
     warmup,
     iters,
 ):
-    """Measure one fresh FlagSparse analysis plus one solve per round."""
+    """Preserve the CUDA full-round analysis-plus-solve benchmark."""
 
     warmup = max(0, int(warmup))
     iters = max(1, int(iters))
@@ -642,9 +683,76 @@ def _benchmark_flagsparse_spsv_full_rounds(
     return (
         x,
         state,
+        None,
         _allinone_filtered_avg_ms(analysis_times),
         _allinone_filtered_avg_ms(solve_times),
         _allinone_filtered_avg_ms(total_times),
+    )
+
+
+def _benchmark_flagsparse_spsv_stages(
+    reset_call,
+    buffer_size_call,
+    analyze_call,
+    solve_call,
+    *,
+    warmup,
+    iters,
+    fmt,
+):
+    """Benchmark stable DCU bufferSize, analysis, and solve stage averages."""
+
+    warmup = max(0, int(warmup))
+    iters = max(1, int(iters))
+
+    torch.cuda.synchronize()
+    start_event = torch.cuda.Event(enable_timing=True)
+    stop_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    buffer_size_call()
+    stop_event.record()
+    torch.cuda.synchronize()
+    buffer_size_ms = start_event.elapsed_time(stop_event)
+
+    state = None
+    for _ in range(warmup):
+        reset_call()
+        state = analyze_call()
+    analysis_times = []
+    for _ in range(iters):
+        reset_call()
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        stop_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        state = analyze_call()
+        stop_event.record()
+        torch.cuda.synchronize()
+        analysis_times.append(start_event.elapsed_time(stop_event))
+
+    x = None
+    for _ in range(warmup):
+        x = solve_call(state)
+    solve_times = []
+    for _ in range(iters):
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        stop_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        x = solve_call(state)
+        stop_event.record()
+        torch.cuda.synchronize()
+        solve_times.append(start_event.elapsed_time(stop_event))
+
+    analysis_ms = _allinone_filtered_avg_ms(analysis_times, fmt=fmt)
+    solve_ms = _allinone_filtered_avg_ms(solve_times, fmt=fmt)
+    return (
+        x,
+        state,
+        buffer_size_ms,
+        analysis_ms,
+        solve_ms,
+        buffer_size_ms + analysis_ms + solve_ms,
     )
 
 
@@ -692,19 +800,39 @@ def _benchmark_flagsparse_spsv_csr_split(
             transpose=transpose,
             solve_kind=solve_kind,
         )
-        x, _state, analysis_ms, solve_ms, total_ms = (
-            _benchmark_flagsparse_spsv_full_rounds(
-                fs_spsv_impl._clear_spsv_csr_preprocess_cache,
-                analyze_call,
-                solve_call,
-                warmup=warmup,
-                iters=iters,
+        if fs_spsv_impl._is_rocm_runtime():
+            x, _state, buffer_ms, analysis_ms, solve_ms, total_ms = (
+                _benchmark_flagsparse_spsv_stages(
+                    fs_spsv_impl._clear_spsv_csr_preprocess_cache,
+                    lambda: fs_spsv_impl.flagsparse_spsv_buffer_size(
+                        shape,
+                        data.dtype,
+                        format="csr",
+                        transpose=transpose,
+                        solve_kind=solve_kind,
+                    ),
+                    analyze_call,
+                    solve_call,
+                    warmup=warmup,
+                    iters=iters,
+                    fmt="CSR",
+                )
             )
-        )
-        return x, analysis_ms, solve_ms, total_ms, "transpose_cw"
+        else:
+            x, _state, buffer_ms, analysis_ms, solve_ms, total_ms = (
+                _benchmark_flagsparse_spsv_full_rounds(
+                    fs_spsv_impl._clear_spsv_csr_preprocess_cache,
+                    analyze_call,
+                    solve_call,
+                    warmup=warmup,
+                    iters=iters,
+                )
+            )
+        return x, buffer_ms, analysis_ms, solve_ms, total_ms, "transpose_cw"
 
-    def analyze_call():
-        descr = fs_spsv_impl.flagsparse_spsv_analysis_csr(
+    rocm_runtime = fs_spsv_impl._is_rocm_runtime()
+    if rocm_runtime:
+        workspace_descr = fs_spsv_impl.flagsparse_spsv_analysis_csr(
             data_tri,
             indices_tri,
             indptr_tri,
@@ -714,12 +842,37 @@ def _benchmark_flagsparse_spsv_csr_split(
             solve_kind=solve_kind,
             clear_cache=False,
         )
-        workspace = fs_spsv_impl.flagsparse_spsv_create_workspace(descr)
-        if descr.solve_kind == "transpose_cw":
-            fs_spsv_impl.flagsparse_spsv_preprocess_csr(
-                descr, workspace=workspace
+        rocm_workspace = fs_spsv_impl.flagsparse_spsv_create_workspace(
+            workspace_descr
+        )
+
+        def analyze_call():
+            descr = fs_spsv_impl.flagsparse_spsv_analysis_csr(
+                data_tri,
+                indices_tri,
+                indptr_tri,
+                shape,
+                lower=lower,
+                transpose=transpose,
+                solve_kind=solve_kind,
+                workspace=rocm_workspace,
+                clear_cache=False,
             )
-        return descr, workspace
+            return descr, rocm_workspace
+    else:
+        def analyze_call():
+            descr = fs_spsv_impl.flagsparse_spsv_analysis_csr(
+                data_tri,
+                indices_tri,
+                indptr_tri,
+                shape,
+                lower=lower,
+                transpose=transpose,
+                solve_kind=solve_kind,
+                clear_cache=False,
+            )
+            workspace = fs_spsv_impl.flagsparse_spsv_create_workspace(descr)
+            return descr, workspace
 
     def solve_call(state):
         descr, workspace = state
@@ -729,17 +882,36 @@ def _benchmark_flagsparse_spsv_csr_split(
             workspace=workspace,
         )
 
-    x, state, analysis_ms, solve_ms, total_ms = (
-        _benchmark_flagsparse_spsv_full_rounds(
-            fs_spsv_impl._clear_spsv_csr_preprocess_cache,
-            analyze_call,
-            solve_call,
-            warmup=warmup,
-            iters=iters,
+    if rocm_runtime:
+        x, state, buffer_ms, analysis_ms, solve_ms, total_ms = (
+            _benchmark_flagsparse_spsv_stages(
+                fs_spsv_impl._clear_spsv_csr_preprocess_cache,
+                lambda: fs_spsv_impl.flagsparse_spsv_buffer_size(
+                    shape,
+                    data.dtype,
+                    format="csr",
+                    transpose=transpose,
+                    solve_kind=solve_kind,
+                ),
+                analyze_call,
+                solve_call,
+                warmup=warmup,
+                iters=iters,
+                fmt="CSR",
+            )
         )
-    )
+    else:
+        x, state, buffer_ms, analysis_ms, solve_ms, total_ms = (
+            _benchmark_flagsparse_spsv_full_rounds(
+                fs_spsv_impl._clear_spsv_csr_preprocess_cache,
+                analyze_call,
+                solve_call,
+                warmup=warmup,
+                iters=iters,
+            )
+        )
     descr, _workspace = state
-    return x, analysis_ms, solve_ms, total_ms, descr.route_name
+    return x, buffer_ms, analysis_ms, solve_ms, total_ms, descr.route_name
 
 
 def _benchmark_flagsparse_spsv_coo_split(
@@ -798,19 +970,39 @@ def _benchmark_flagsparse_spsv_coo_split(
             transpose=transpose,
             solve_kind=solve_kind,
         )
-        x, _state, analysis_ms, solve_ms, total_ms = (
-            _benchmark_flagsparse_spsv_full_rounds(
-                fs_spsv_impl._clear_spsv_csr_preprocess_cache,
-                analyze_call,
-                solve_call,
-                warmup=warmup,
-                iters=iters,
+        if fs_spsv_impl._is_rocm_runtime():
+            x, _state, buffer_ms, analysis_ms, solve_ms, total_ms = (
+                _benchmark_flagsparse_spsv_stages(
+                    fs_spsv_impl._clear_spsv_csr_preprocess_cache,
+                    lambda: fs_spsv_impl.flagsparse_spsv_buffer_size(
+                        (n_rows, n_cols),
+                        data.dtype,
+                        format="coo",
+                        transpose=transpose,
+                        solve_kind=solve_kind,
+                    ),
+                    analyze_call,
+                    solve_call,
+                    warmup=warmup,
+                    iters=iters,
+                    fmt="COO",
+                )
             )
-        )
-        return x, analysis_ms, solve_ms, total_ms, "transpose_cw"
+        else:
+            x, _state, buffer_ms, analysis_ms, solve_ms, total_ms = (
+                _benchmark_flagsparse_spsv_full_rounds(
+                    fs_spsv_impl._clear_spsv_csr_preprocess_cache,
+                    analyze_call,
+                    solve_call,
+                    warmup=warmup,
+                    iters=iters,
+                )
+            )
+        return x, buffer_ms, analysis_ms, solve_ms, total_ms, "transpose_cw"
 
-    def analyze_call():
-        descr = fs_spsv_impl.flagsparse_spsv_analysis_csr(
+    rocm_runtime = fs_spsv_impl._is_rocm_runtime()
+    if rocm_runtime:
+        workspace_descr = fs_spsv_impl.flagsparse_spsv_analysis_csr(
             data_tri,
             indices_tri,
             indptr_tri,
@@ -820,8 +1012,37 @@ def _benchmark_flagsparse_spsv_coo_split(
             solve_kind=solve_kind,
             clear_cache=False,
         )
-        workspace = fs_spsv_impl.flagsparse_spsv_create_workspace(descr)
-        return descr, workspace
+        rocm_workspace = fs_spsv_impl.flagsparse_spsv_create_workspace(
+            workspace_descr
+        )
+
+        def analyze_call():
+            descr = fs_spsv_impl.flagsparse_spsv_analysis_csr(
+                data_tri,
+                indices_tri,
+                indptr_tri,
+                (n_rows, n_cols),
+                lower=lower,
+                transpose=transpose,
+                solve_kind=solve_kind,
+                workspace=rocm_workspace,
+                clear_cache=False,
+            )
+            return descr, rocm_workspace
+    else:
+        def analyze_call():
+            descr = fs_spsv_impl.flagsparse_spsv_analysis_csr(
+                data_tri,
+                indices_tri,
+                indptr_tri,
+                (n_rows, n_cols),
+                lower=lower,
+                transpose=transpose,
+                solve_kind=solve_kind,
+                clear_cache=False,
+            )
+            workspace = fs_spsv_impl.flagsparse_spsv_create_workspace(descr)
+            return descr, workspace
 
     def solve_call(state):
         descr, workspace = state
@@ -831,17 +1052,36 @@ def _benchmark_flagsparse_spsv_coo_split(
             workspace=workspace,
         )
 
-    x, state, analysis_ms, solve_ms, total_ms = (
-        _benchmark_flagsparse_spsv_full_rounds(
-            fs_spsv_impl._clear_spsv_csr_preprocess_cache,
-            analyze_call,
-            solve_call,
-            warmup=warmup,
-            iters=iters,
+    if rocm_runtime:
+        x, state, buffer_ms, analysis_ms, solve_ms, total_ms = (
+            _benchmark_flagsparse_spsv_stages(
+                fs_spsv_impl._clear_spsv_csr_preprocess_cache,
+                lambda: fs_spsv_impl.flagsparse_spsv_buffer_size(
+                    (n_rows, n_cols),
+                    data.dtype,
+                    format="coo",
+                    transpose=transpose,
+                    solve_kind=solve_kind,
+                ),
+                analyze_call,
+                solve_call,
+                warmup=warmup,
+                iters=iters,
+                fmt="COO",
+            )
         )
-    )
+    else:
+        x, state, buffer_ms, analysis_ms, solve_ms, total_ms = (
+            _benchmark_flagsparse_spsv_full_rounds(
+                fs_spsv_impl._clear_spsv_csr_preprocess_cache,
+                analyze_call,
+                solve_call,
+                warmup=warmup,
+                iters=iters,
+            )
+        )
     descr, _workspace = state
-    return x, analysis_ms, solve_ms, total_ms, descr.route_name
+    return x, buffer_ms, analysis_ms, solve_ms, total_ms, descr.route_name
 
 
 def _cupy_spsolve_lower_csr_or_coo(
@@ -860,15 +1100,15 @@ def _cupy_spsolve_lower_csr_or_coo(
         data.dtype, indices.dtype, indptr.dtype, op="non"
     )
     if vendor_backend is None:
-        return None, None, vendor_reason, None
+        return None, None, vendor_reason, None, None, None, None
     if vendor_backend == "hipsparse":
         # The DCU vendor reference is hipSPARSE CSR SpSV.  COO cases use the
         # same mathematically equivalent CSR reference after input conversion.
         return _cupy_spsolve_csr_with_op(
-            data, indices, indptr, shape, b, "NON", lower
+            data, indices, indptr, shape, b, "NON", lower, timing_fmt=fmt
         )
     if cp is None or cpx_sparse is None or cpx_spsolve_triangular is None:
-        return None, None, "CuPy spsolve_triangular is unavailable", None
+        return None, None, "CuPy spsolve_triangular is unavailable", None, None, None, None
     try:
         data_eff, indices_eff, indptr_eff = _effective_csr_for_op(
             data, indices, indptr, shape, lower=lower, op_mode="NON"
@@ -908,12 +1148,14 @@ def _cupy_spsolve_lower_csr_or_coo(
         cupy_ms = _allinone_filtered_avg_ms(times, fmt=fmt)
         x_cu_t = torch.utils.dlpack.from_dlpack(x_cu.toDlpack())
         x_cu_t = x_cu_t.to(b.dtype)
-        return cupy_ms, x_cu_t, None, "cuSPARSE via CuPy spsolve_triangular"
+        return cupy_ms, x_cu_t, None, "cuSPARSE via CuPy spsolve_triangular", None, None, None
     except Exception as exc:
-        return None, None, str(exc), None
+        return None, None, str(exc), None, None, None, None
 
 
-def _cupy_spsolve_csr_with_op(data, indices, indptr, shape, b, op_mode, lower):
+def _cupy_spsolve_csr_with_op(
+    data, indices, indptr, shape, b, op_mode, lower, *, timing_fmt="CSR"
+):
     # Vendor triangular-solve baseline, dispatched per backend: hipSPARSE SpSV on
     # DCU/ROCm, CuPy's spsolve_triangular (cuSPARSE-backed) on CUDA.
     vendor_backend, selector_reason = fs_spsv_impl._spsv_csr_sparse_ref_backend(
@@ -923,7 +1165,7 @@ def _cupy_spsolve_csr_with_op(data, indices, indptr, shape, b, op_mode, lower):
         op=str(op_mode).lower(),
     )
     if vendor_backend is None:
-        return None, None, selector_reason, None
+        return None, None, selector_reason, None, None, None, None
     if vendor_backend == "hipsparse":
         warmup, iters = _spsv_benchmark_schedule(
             int(data.numel()), op_mode, data.dtype, fmt="CSR"
@@ -939,10 +1181,7 @@ def _cupy_spsolve_csr_with_op(data, indices, indptr, shape, b, op_mode, lower):
             op=str(op_mode).lower(),
             warmup=warmup,
             iters=iters,
-            # Match the CUDA reference scope below: every measured vendor call
-            # includes triangular-solve analysis plus solve. Caller-visible
-            # sparse-input construction remains outside the timed loop.
-            fresh_each_iter=True,
+            fmt=timing_fmt,
         )
         if sparse_ref.get("backend") != "hipsparse":
             reason = sparse_ref.get("reason") or "backend selector returned no reason"
@@ -951,17 +1190,23 @@ def _cupy_spsolve_csr_with_op(data, indices, indptr, shape, b, op_mode, lower):
                 None,
                 f"ROCm/DCU vendor dispatch did not select hipSPARSE: {reason}",
                 None,
+                None,
+                None,
+                None,
             )
         return (
             sparse_ref["ms"],
             sparse_ref["values"],
             sparse_ref.get("reason"),
             "hipSPARSE direct API",
+            sparse_ref["buffer_size_ms"],
+            sparse_ref["analysis_ms"],
+            sparse_ref["solve_ms"],
         )
     if vendor_backend != "cupy_cusparse":
-        return None, None, f"unsupported vendor backend: {vendor_backend}", None
+        return None, None, f"unsupported vendor backend: {vendor_backend}", None, None, None, None
     if cp is None or cpx_sparse is None or cpx_spsolve_triangular is None:
-        return None, None, "CuPy spsolve_triangular is unavailable", None
+        return None, None, "CuPy spsolve_triangular is unavailable", None, None, None, None
     try:
         warmup, iters = _spsv_benchmark_schedule(
             int(data.numel()), op_mode, data.dtype, fmt="CSR"
@@ -1005,9 +1250,9 @@ def _cupy_spsolve_csr_with_op(data, indices, indptr, shape, b, op_mode, lower):
             times.append((time.perf_counter() - t0) * 1000.0)
         ms = _allinone_filtered_avg_ms(times, fmt="CSR")
         x_t = torch.utils.dlpack.from_dlpack(x_cp.toDlpack()).to(b.dtype)
-        return ms, x_t, None, "cuSPARSE via CuPy spsolve_triangular"
+        return ms, x_t, None, "cuSPARSE via CuPy spsolve_triangular", None, None, None
     except Exception as exc:
-        return None, None, str(exc), None
+        return None, None, str(exc), None, None, None, None
 
 
 def run_spsv_synthetic_all(lower=True, alg_num=None):
@@ -1020,26 +1265,31 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
     print("FLAGSPARSE SpSV BENCHMARK (synthetic triangular systems, CSR + COO)")
     print(sep)
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(
-        f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
-        "(each timed round is one fresh analysis plus one solve; override with --warmup/--iters)"
-    )
+    print(f"Benchmark schedule: warmup={WARMUP}, iter={ITERS}")
     print(f"Triangle: {'LOWER' if lower else 'UPPER'}")
     print(f"Algorithm: {_alg_label(alg_num)}")
     print(f"FlagSparse route: {_solve_kind_from_alg_num(alg_num) or 'AUTO'}")
     _print_rocm_alg3_launch_config(alg_num)
     vendor_name = _vendor_backend_name()
     vendor_short = _vendor_short_name()
-    print(
-        f"FS.ms and {vendor_name}.ms are average complete "
-        "analysis/preparation + solve rounds; speedup = vendor_ms / FS.ms."
-    )
+    if fs_spsv_impl._is_rocm_runtime():
+        print("DCU timing: total=bufferSize+average analysis+average solve.")
+    else:
+        print(
+            f"FS.ms and {vendor_name}.ms are average complete "
+            "analysis/preparation + solve rounds; speedup = vendor_ms / FS.ms."
+        )
     print()
 
+    terminal_vendor_speedup_label = (
+        f"{vendor_short}.S.spd"
+        if fs_spsv_impl._is_rocm_runtime()
+        else f"{vendor_short}.spdT"
+    )
     hdr = (
         f"{'Fmt':>5} {'opA':>5} {'N':>6} {'FS.ms':>10} "
         f"{(vendor_short + '.ms'):>10} {'PT.ms':>10} "
-        f"{(vendor_short + '.spdT'):>10} {'PT.spdT':>10} "
+        f"{terminal_vendor_speedup_label:>10} {'PT.spdT':>10} "
         f"{'Status':>8} {'Err(PT)':>12} {('Err(' + vendor_short + ')'):>12}"
     )
 
@@ -1089,7 +1339,7 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
 
                         torch.cuda.synchronize()
                         if fmt == "CSR":
-                            x, analysis_ms, t_ms, flagsparse_ms, _route_name = (
+                            x, buffer_ms, analysis_ms, t_ms, flagsparse_ms, _route_name = (
                                 _benchmark_flagsparse_spsv_csr_split(
                                     data,
                                     indices,
@@ -1105,7 +1355,7 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                             dc, rr, cc = _csr_to_coo(
                                 data, indices, indptr, shape, index_dtype=index_dtype
                             )
-                            x, analysis_ms, t_ms, flagsparse_ms, _route_name = (
+                            x, buffer_ms, analysis_ms, t_ms, flagsparse_ms, _route_name = (
                                 _benchmark_flagsparse_spsv_coo_split(
                                     dc,
                                     rr,
@@ -1142,7 +1392,15 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                         vendor_reason = None
                         vendor_route = None
                         if fmt == "CSR":
-                            cupy_ms, x_cu_t, vendor_reason, vendor_route = (
+                            (
+                                cupy_ms,
+                                x_cu_t,
+                                vendor_reason,
+                                vendor_route,
+                                _vendor_buffer_ms,
+                                _vendor_analysis_ms,
+                                _vendor_solve_ms,
+                            ) = (
                                 _cupy_spsolve_csr_with_op(
                                     data, indices, indptr, shape, b, op_mode, lower
                                 )
@@ -1153,7 +1411,15 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                             torch.complex64,
                             torch.complex128,
                         ):
-                            cupy_ms, x_cu_t, vendor_reason, vendor_route = (
+                            (
+                                cupy_ms,
+                                x_cu_t,
+                                vendor_reason,
+                                vendor_route,
+                                _vendor_buffer_ms,
+                                _vendor_analysis_ms,
+                                _vendor_solve_ms,
+                            ) = (
                                 _cupy_spsolve_lower_csr_or_coo(
                                     fmt,
                                     data,
@@ -1188,9 +1454,14 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
 
                         pt_vs_total = _safe_ratio(pytorch_ms, flagsparse_ms)
                         cu_vs_total = _safe_ratio(cupy_ms, flagsparse_ms)
+                        vendor_speedup_display = (
+                            _safe_ratio(_vendor_solve_ms, t_ms)
+                            if fs_spsv_impl._is_rocm_runtime()
+                            else cu_vs_total
+                        )
                         print(
                             f"{fmt:>5} {op_mode:>5} {n:>6} {_fmt_ms(flagsparse_ms):>10} {_fmt_ms(cupy_ms):>10} "
-                            f"{_fmt_ms(pytorch_ms):>10} {_fmt_ratio(cu_vs_total):>10} {_fmt_ratio(pt_vs_total):>10} "
+                            f"{_fmt_ms(pytorch_ms):>10} {_fmt_ratio(vendor_speedup_display):>10} {_fmt_ratio(pt_vs_total):>10} "
                             f"{status:>8} {_fmt_err(err_pt):>12} {_fmt_err(err_cu):>12}"
                         )
                         if vendor_reason:
@@ -1236,7 +1507,7 @@ def _run_one_csv_row_coo(
     data_tri, _indices_tri, _indptr_tri = _extract_triangular_csr(
         data, indices, indptr, shape, lower=lower
     )
-    x, analysis_ms, t_ms, flagsparse_ms, _route_name = (
+    x, buffer_ms, analysis_ms, t_ms, flagsparse_ms, _route_name = (
         _benchmark_flagsparse_spsv_coo_split(
             d_in,
             r_in,
@@ -1258,6 +1529,7 @@ def _run_one_csv_row_coo(
         indptr,
         shape,
         x,
+        buffer_ms,
         analysis_ms,
         t_ms,
         flagsparse_ms,
@@ -1279,6 +1551,7 @@ def _finalize_csv_row(
     indptr,
     shape,
     x,
+    buffer_ms,
     analysis_ms,
     t_ms,
     flagsparse_ms,
@@ -1318,7 +1591,15 @@ def _finalize_csv_row(
     err_vendor = None
     ok_vendor = False
     x_vendor = None
-    vendor_ms, x_vendor, vendor_reason, vendor_route = (
+    (
+        vendor_ms,
+        x_vendor,
+        vendor_reason,
+        vendor_route,
+        vendor_buffer_ms,
+        vendor_analysis_ms,
+        vendor_solve_ms,
+    ) = (
         _cupy_spsolve_csr_with_op(
             data, indices, indptr, shape, b, op_mode, lower
         )
@@ -1348,13 +1629,25 @@ def _finalize_csv_row(
         "n_cols": n_cols,
         "nnz": int(nnz_effective),
         "FlagSparse_ms": flagsparse_ms,
+        "FlagSparse_bufferSize_ms": buffer_ms,
+        "FlagSparse_analysis_ms": analysis_ms,
+        "FlagSparse_solve_ms": t_ms,
         f"{vendor_backend}_route": vendor_route,
         f"{vendor_backend}_ms": vendor_ms,
+        f"{vendor_backend}_bufferSize_ms": vendor_buffer_ms,
+        f"{vendor_backend}_analysis_ms": vendor_analysis_ms,
+        f"{vendor_backend}_solve_ms": vendor_solve_ms,
         "PyTorch_ms": pytorch_ms,
-        f"FlagSparse_vs_{vendor_backend}_speedup": _safe_ratio(
+        _vendor_all_speedup_key(): _safe_ratio(
             vendor_ms, flagsparse_ms
         ),
-        "FlagSparse_vs_PyTorch_speedup": _safe_ratio(
+        f"FlagSparse_vs_{vendor_backend}_analysis_speedup": _safe_ratio(
+            vendor_analysis_ms, analysis_ms
+        ),
+        f"FlagSparse_vs_{vendor_backend}_solve_speedup": _safe_ratio(
+            vendor_solve_ms, t_ms
+        ),
+        _pytorch_all_speedup_key(): _safe_ratio(
             pytorch_ms, flagsparse_ms
         ),
         "status": status,
@@ -1394,7 +1687,7 @@ def _run_one_csv_row_csr_full(
     data_tri, _indices_tri, _indptr_tri = _extract_triangular_csr(
         data, indices, indptr, shape, lower=lower
     )
-    x, analysis_ms, t_ms, flagsparse_ms, _route_name = (
+    x, buffer_ms, analysis_ms, t_ms, flagsparse_ms, _route_name = (
         _benchmark_flagsparse_spsv_csr_split(
             data,
             indices,
@@ -1416,6 +1709,7 @@ def _run_one_csv_row_csr_full(
         indptr,
         shape,
         x,
+        buffer_ms,
         analysis_ms,
         t_ms,
         flagsparse_ms,
@@ -1437,6 +1731,7 @@ def _finalize_csv_row_csr_full(
     indptr,
     shape,
     x,
+    buffer_ms,
     analysis_ms,
     t_ms,
     flagsparse_ms,
@@ -1476,7 +1771,15 @@ def _finalize_csv_row_csr_full(
     err_vendor = None
     ok_vendor = False
     x_vendor = None
-    vendor_ms, x_vendor, vendor_reason, vendor_route = (
+    (
+        vendor_ms,
+        x_vendor,
+        vendor_reason,
+        vendor_route,
+        vendor_buffer_ms,
+        vendor_analysis_ms,
+        vendor_solve_ms,
+    ) = (
         _cupy_spsolve_csr_with_op(
             data, indices, indptr, shape, b, op_mode, lower
         )
@@ -1506,13 +1809,25 @@ def _finalize_csv_row_csr_full(
         "n_cols": n_cols,
         "nnz": int(nnz_effective),
         "FlagSparse_ms": flagsparse_ms,
+        "FlagSparse_bufferSize_ms": buffer_ms,
+        "FlagSparse_analysis_ms": analysis_ms,
+        "FlagSparse_solve_ms": t_ms,
         f"{vendor_backend}_route": vendor_route,
         f"{vendor_backend}_ms": vendor_ms,
+        f"{vendor_backend}_bufferSize_ms": vendor_buffer_ms,
+        f"{vendor_backend}_analysis_ms": vendor_analysis_ms,
+        f"{vendor_backend}_solve_ms": vendor_solve_ms,
         "PyTorch_ms": pytorch_ms,
-        f"FlagSparse_vs_{vendor_backend}_speedup": _safe_ratio(
+        _vendor_all_speedup_key(): _safe_ratio(
             vendor_ms, flagsparse_ms
         ),
-        "FlagSparse_vs_PyTorch_speedup": _safe_ratio(
+        f"FlagSparse_vs_{vendor_backend}_analysis_speedup": _safe_ratio(
+            vendor_analysis_ms, analysis_ms
+        ),
+        f"FlagSparse_vs_{vendor_backend}_solve_speedup": _safe_ratio(
+            vendor_solve_ms, t_ms
+        ),
+        _pytorch_all_speedup_key(): _safe_ratio(
             pytorch_ms, flagsparse_ms
         ),
         "status": status,
@@ -1543,7 +1858,9 @@ def run_all_supported_spsv_csr_csv(
     vendor_name = _vendor_backend_name()
     vendor_short = _vendor_short_name()
     vendor_route_key = f"{vendor_name}_route"
-    vendor_speedup_key = f"FlagSparse_vs_{vendor_name}_speedup"
+    vendor_all_speedup_key = _vendor_all_speedup_key()
+    vendor_solve_speedup_key = f"FlagSparse_vs_{vendor_name}_solve_speedup"
+    pytorch_all_speedup_key = _pytorch_all_speedup_key()
     backend_error_key = _backend_error_key()
     vendor_reason_key = f"{vendor_name}_reason"
     selected_value_dtypes = value_dtypes or CSR_FULL_VALUE_DTYPES
@@ -1576,21 +1893,26 @@ def run_all_supported_spsv_csr_csv(
                     "PT=official sparse solve reference"
                 )
                 print(f"{vendor_name} route: {_vendor_reference_route()}")
-                print(
-                    f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
-                    "(each timed round is one fresh analysis plus one solve; override with --warmup/--iters)"
-                )
-                print(
-                    f"FS.ms and {vendor_short}.ms are average complete "
-                    "analysis/preparation + solve rounds; "
-                    f"{vendor_short}.spdT={vendor_name}_ms/FS.ms. "
-                    f"Ept=|FS-PT|, E{vendor_short}=|FS-{vendor_name}|."
-                )
+                print(f"Benchmark schedule: warmup={WARMUP}, iter={ITERS}")
+                if fs_spsv_impl._is_rocm_runtime():
+                    print("DCU timing: total=bufferSize+average analysis+average solve.")
+                else:
+                    print(
+                        f"FS.ms and {vendor_short}.ms are average complete "
+                        "analysis/preparation + solve rounds; "
+                        f"{vendor_short}.spdT={vendor_name}_ms/FS.ms. "
+                        f"Ept=|FS-PT|, E{vendor_short}=|FS-{vendor_name}|."
+                    )
                 print("-" * 126)
+                terminal_vendor_speedup_label = (
+                    f"{vendor_short}.S.spd"
+                    if fs_spsv_impl._is_rocm_runtime()
+                    else f"{vendor_short}.spdT"
+                )
                 print(
                     f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
                     f"{'FS.ms':>10} {(vendor_short + '.ms'):>10} {'PT.ms':>10} "
-                    f"{(vendor_short + '.spdT'):>10} {'PT.spdT':>10} "
+                    f"{terminal_vendor_speedup_label:>10} {'PT.spdT':>10} "
                     f"{'Status':>8} {'Ept':>10} {('E' + vendor_short):>10}"
                 )
                 print("-" * 126)
@@ -1620,8 +1942,8 @@ def run_all_supported_spsv_csr_csv(
                         print(
                             f"{name:<28} {n_rows:>7} {n_cols:>7} {nnz:>10} "
                             f"{_fmt_ms(flagsparse_ms):>10} {_fmt_ms(vendor_ms):>10} {_fmt_ms(pytorch_ms):>10} "
-                            f"{_fmt_ratio(record[vendor_speedup_key]):>10} "
-                            f"{_fmt_ratio(record['FlagSparse_vs_PyTorch_speedup']):>10} "
+                            f"{_fmt_ratio(record[vendor_solve_speedup_key] if fs_spsv_impl._is_rocm_runtime() else record[vendor_all_speedup_key]):>10} "
+                            f"{_fmt_ratio(record[pytorch_all_speedup_key]):>10} "
                             f"{status:>8} {_fmt_err(err_pt):>10} "
                             f"{_fmt_err(err_backend):>10}"
                         )
@@ -1661,8 +1983,8 @@ def run_all_supported_spsv_csr_csv(
                                 vendor_route_key: None,
                                 f"{vendor_name}_ms": None,
                                 "PyTorch_ms": None,
-                                vendor_speedup_key: None,
-                                "FlagSparse_vs_PyTorch_speedup": None,
+                                vendor_all_speedup_key: None,
+                                pytorch_all_speedup_key: None,
                                 "status": status,
                                 "err_pt": None,
                                 backend_error_key: None,
@@ -1710,7 +2032,9 @@ def run_all_dtypes_spsv_coo_csv(
     vendor_name = _vendor_backend_name()
     vendor_short = _vendor_short_name()
     vendor_route_key = f"{vendor_name}_route"
-    vendor_speedup_key = f"FlagSparse_vs_{vendor_name}_speedup"
+    vendor_all_speedup_key = _vendor_all_speedup_key()
+    vendor_solve_speedup_key = f"FlagSparse_vs_{vendor_name}_solve_speedup"
+    pytorch_all_speedup_key = _pytorch_all_speedup_key()
     backend_error_key = _backend_error_key()
     vendor_reason_key = f"{vendor_name}_reason"
     selected_value_dtypes = value_dtypes or VALUE_DTYPES
@@ -1743,15 +2067,15 @@ def run_all_dtypes_spsv_coo_csv(
                     "reference, PT=official sparse solve reference."
                 )
                 print(f"{vendor_name} route: {_vendor_reference_route()}")
-                print(
-                    f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
-                    "(each timed round is one fresh analysis plus one solve; override with --warmup/--iters)"
-                )
-                print(
-                    f"FS.ms and {vendor_short}.ms are average complete "
-                    "analysis/preparation + solve rounds; "
-                    f"{vendor_short}.spdT={vendor_name}_ms/FS.ms."
-                )
+                print(f"Benchmark schedule: warmup={WARMUP}, iter={ITERS}")
+                if fs_spsv_impl._is_rocm_runtime():
+                    print("DCU timing: total=bufferSize+average analysis+average solve.")
+                else:
+                    print(
+                        f"FS.ms and {vendor_short}.ms are average complete "
+                        "analysis/preparation + solve rounds; "
+                        f"{vendor_short}.spdT={vendor_name}_ms/FS.ms."
+                    )
                 print(
                     "Matrix metadata reuse the canonical triangular matrix, matching CSR CSV output."
                 )
@@ -1759,10 +2083,15 @@ def run_all_dtypes_spsv_coo_csv(
                     f"Ept=|FS-PT|, E{vendor_short}=|FS-{vendor_name}|."
                 )
                 print("-" * 126)
+                terminal_vendor_speedup_label = (
+                    f"{vendor_short}.S.spd"
+                    if fs_spsv_impl._is_rocm_runtime()
+                    else f"{vendor_short}.spdT"
+                )
                 print(
                     f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
                     f"{'FS.ms':>10} {(vendor_short + '.ms'):>10} {'PT.ms':>10} "
-                    f"{(vendor_short + '.spdT'):>10} {'PT.spdT':>10} "
+                    f"{terminal_vendor_speedup_label:>10} {'PT.spdT':>10} "
                     f"{'Status':>8} {'Ept':>10} {('E' + vendor_short):>10}"
                 )
                 print("-" * 126)
@@ -1792,8 +2121,8 @@ def run_all_dtypes_spsv_coo_csv(
                         print(
                             f"{name:<28} {n_rows:>7} {n_cols:>7} {nnz:>10} "
                             f"{_fmt_ms(flagsparse_ms):>10} {_fmt_ms(vendor_ms):>10} {_fmt_ms(pytorch_ms):>10} "
-                            f"{_fmt_ratio(record[vendor_speedup_key]):>10} "
-                            f"{_fmt_ratio(record['FlagSparse_vs_PyTorch_speedup']):>10} "
+                            f"{_fmt_ratio(record[vendor_solve_speedup_key] if fs_spsv_impl._is_rocm_runtime() else record[vendor_all_speedup_key]):>10} "
+                            f"{_fmt_ratio(record[pytorch_all_speedup_key]):>10} "
                             f"{status:>8} {_fmt_err(err_pt):>10} "
                             f"{_fmt_err(err_backend):>10}"
                         )
@@ -1833,8 +2162,8 @@ def run_all_dtypes_spsv_coo_csv(
                                 vendor_route_key: None,
                                 f"{vendor_name}_ms": None,
                                 "PyTorch_ms": None,
-                                vendor_speedup_key: None,
-                                "FlagSparse_vs_PyTorch_speedup": None,
+                                vendor_all_speedup_key: None,
+                                pytorch_all_speedup_key: None,
                                 "status": status,
                                 "err_pt": None,
                                 backend_error_key: None,
@@ -2114,14 +2443,15 @@ def main():
         "--alg_num",
         dest="alg_num",
         type=_parse_alg_num,
-        default=None,
+        default=_default_spsv_alg_num(),
         help=(
             "Algorithm selection compatible with allinone style. "
             "DCU: 1=ALG1(csr_cw), 2=ALG2(csr_cw_levelschd), "
-            "3=ALG3(csr_nnz_balance). CUDA remains: 1=csr_cw, "
+            "3=ALG3(csr_nnz_balance; default). "
+            "CUDA: 1=csr_cw, "
             "2=csr_cw_levelschd, 3=csr_roc, 4=csr_smblk, "
             "8=csr_nnz_balance. "
-            "Omit to use AUTO routing."
+            "CUDA keeps AUTO routing when omitted."
         ),
     )
     parser.add_argument(

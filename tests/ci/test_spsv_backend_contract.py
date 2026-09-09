@@ -133,11 +133,20 @@ def _spsm_benchmark_function_source(name):
     raise AssertionError(f"SpSM benchmark function {name!r} not found")
 
 
-def test_shared_cw_kernels_use_launch_time_serial_policy():
+def test_nontrans_cw_kernels_are_persistent_only():
     for name in ("_spsv_csr_cw_kernel", "_spsv_csr_cw_kernel_complex"):
         source = _function_source(name)
-        assert "SERIAL_EXECUTION" in source
+        assert "SERIAL_EXECUTION" not in source
         assert "_is_rocm_runtime" not in source
+
+
+def test_spsv_kernels_have_no_numeric_fallbacks():
+    assert "_spsv_diag_eps_for_dtype" not in SPSV_SOURCE
+    assert "DIAG_EPS" not in SPSV_SOURCE
+    assert "diag_safe" not in SPSV_SOURCE
+    assert "den_safe" not in SPSV_SOURCE
+    for value_name in ("x_row", "out", "out_re", "out_im"):
+        assert f"{value_name} == {value_name}" not in SPSV_SOURCE
 
 
 def test_shared_transpose_kernels_use_launch_time_serial_policy():
@@ -156,10 +165,8 @@ def test_rocm_nontrans_cw_uses_cu_capped_persistent_workers():
         "_triton_spsv_csr_cw_vector_complex",
     ):
         source = _function_source(name)
-        assert "persistent_parallel = is_rocm and SPSV_ROCM_ENABLE_PERSISTENT_PARALLEL" in source
-        assert "_spsv_alg4_worker_count(n_rows, b_vec.device, True)" in source
-        assert "serial_execution = is_rocm and not persistent_parallel" in source
-        assert "SERIAL_EXECUTION=serial_execution" in source
+        assert "_spsv_cu_capped_worker_count(n_rows, b_vec.device, True)" in source
+        assert "SERIAL_EXECUTION" not in source
 
     # TRANS/CONJ was not part of the CSR-NON performance change.
     for name in (
@@ -241,10 +248,29 @@ def test_rocm_alg3_directly_reuses_cuda_alg8_nnz_balance_kernel():
 
     real_kernel = _function_source("_spsv_csr_nnz_balance_kernel")
     complex_kernel = _function_source("_spsv_csr_nnz_balance_kernel_complex")
+    assert "dep_x = tl.atomic_add(" in real_kernel
+    assert "dep_x_re = tl.atomic_add(" in complex_kernel
+    assert "dep_x_im = tl.atomic_add(" in complex_kernel
+    assert 'sem="relaxed"' not in real_kernel
+    assert 'sem="relaxed"' not in complex_kernel
+    assert "x_ptr + col,\n                0.0,\n                mask=contribute,\n                sem=\"acquire\"" in real_kernel
+    assert "tmp_sum_ptr + row,\n                dep_x * a,\n                mask=contribute,\n                sem=\"release\"" in real_kernel
+    assert "tmp_sum_ptr + row,\n                    0.0,\n                    mask=finish,\n                    sem=\"acquire\"" in real_kernel
+    assert "indegree_ptr + row,\n                -1,\n                mask=contribute,\n                sem=\"release\"" in real_kernel
+    assert "x_ptr + row,\n                out,\n                mask=finish,\n                sem=\"release\"" in real_kernel
+    assert "x_ri_ptr + col * 2,\n                0.0,\n                mask=contribute,\n                sem=\"acquire\"" in complex_kernel
+    assert "x_ri_ptr + col * 2 + 1,\n                0.0,\n                mask=contribute,\n                sem=\"acquire\"" in complex_kernel
+    assert "tmp_sum_ri_ptr + row * 2,\n                prod_re,\n                mask=contribute,\n                sem=\"release\"" in complex_kernel
+    assert "tmp_sum_ri_ptr + row * 2 + 1,\n                prod_im,\n                mask=contribute,\n                sem=\"release\"" in complex_kernel
+    assert "tmp_sum_ri_ptr + row * 2,\n                0.0,\n                mask=finish,\n                sem=\"acquire\"" in complex_kernel
+    assert "tmp_sum_ri_ptr + row * 2 + 1,\n                0.0,\n                mask=finish,\n                sem=\"acquire\"" in complex_kernel
+    assert "indegree_ptr + row,\n                -1,\n                mask=contribute,\n                sem=\"release\"" in complex_kernel
+    assert "x_ri_ptr + row * 2,\n                out_re,\n                mask=finish,\n                sem=\"release\"" in complex_kernel
+    assert "x_ri_ptr + row * 2 + 1,\n                out_im,\n                mask=finish,\n                sem=\"release\"" in complex_kernel
     assert "tl.store(x_ptr + row" not in real_kernel
     assert "tl.store(x_ri_ptr + row" not in complex_kernel
-
-    assert '"FLAGSPARSE_SPSV_ROCM_ALG3_BLOCK_NNZ", "256"' in SPSV_SOURCE
+    assert "SPSV_ROCM_ALG3_BLOCK_NNZ = 256" in SPSV_SOURCE
+    assert "FLAGSPARSE_SPSV_ROCM_ALG3_BLOCK_NNZ" not in SPSV_SOURCE
     assert '"FLAGSPARSE_SPSV_ROCM_ALG3_WORKGROUPS_PER_CU", "4"' in SPSV_SOURCE
     assert "1 <= SPSV_ROCM_ALG3_WORKGROUPS_PER_CU <= 8" in SPSV_SOURCE
 
@@ -333,10 +359,8 @@ def test_rocm_topology_analysis_uses_cu_capped_persistent_grid():
 
     assert "if _is_rocm_runtime():" in dispatcher
     assert "_build_spsv_level_schedule_metadata_rocm_gpu(" in dispatcher
-    assert "if SPSV_ROCM_ENABLE_PERSISTENT_PARALLEL:" in builder
-    assert "_spsv_alg4_worker_count(n_blocks, device, True)" in builder
+    assert "_spsv_cu_capped_worker_count(n_blocks, device, True)" in builder
     assert "_spsv_levelschd_analysis_persistent_kernel[(worker_count,)]" in builder
-    assert "_spsv_levelschd_analysis_serial_kernel[(1,)]" in builder
     assert "torch.argsort" in builder
     assert "block_counter_ptr" in kernel
     assert 'sem="acquire"' in kernel
@@ -367,8 +391,36 @@ def test_backend_specific_alg_numbers_remove_old_dcu_alg3_alg4_alg8():
 
     normalize = _function_source("_normalize_requested_spsv_route")
     assert '"alg3": "csr_nnz_balance" if is_rocm else "csr_roc"' in normalize
-    for token in ('"csr_roc"', '"roc"', '"csr_smblk"', '"smblk"', '"alg4"', '"alg8"'):
+    for token in (
+        '"csr_roc"',
+        '"roc"',
+        '"csr_smblk"',
+        '"smblk"',
+        '"alg4"',
+        '"alg8"',
+    ):
         assert token in normalize.split("aliases =", 1)[0]
+
+
+def test_dcu_coo_routes_canonicalize_to_csr_kernels():
+    analysis = _function_source("flagsparse_spsv_analysis_coo")
+    direct = _function_source("flagsparse_spsv_coo")
+    solve = _function_source("flagsparse_spsv_solve_coo")
+    support = _benchmark_function_source("_alg_num_supports_case")
+
+    assert "_coo2csr_for_spsv(" in analysis
+    assert "_analyze_spsv_csr_descriptor(" in analysis
+    assert 'format_name="coo"' in analysis
+    assert "_coo2csr_for_spsv(" in direct
+    assert "return flagsparse_spsv_csr(" in direct
+    assert "return flagsparse_spsv_solve_csr(" in solve
+    assert 'fmt in ("CSR", "COO")' in support
+
+    rocm_map = SPSV_BENCHMARK_SOURCE.split(
+        "ROCM_SPSV_ALG_NUM_TO_SOLVE_KIND = {", 1
+    )[1].split("}", 1)[0]
+    for alg_num in (1, 2, 3):
+        assert f"{alg_num}:" in rocm_map
 
 
 def test_cuda_level_analysis_does_not_copy_level_bounds_to_host():
@@ -398,20 +450,42 @@ def test_rocm_auto_can_use_safe_advanced_route_by_default():
     assert '"FLAGSPARSE_SPSV_ROCM_ENABLE_ADVANCED_AUTO", "1"' in SPSV_SOURCE
 
 
-def test_rocm_vendor_reference_includes_analysis_and_solve_per_round():
+def test_rocm_benchmark_defaults_to_alg3_without_changing_cuda_auto():
+    default_alg = _benchmark_function_source("_default_spsv_alg_num")
+    assert "return 3 if fs_spsv_impl._is_rocm_runtime() else None" in default_alg
+    main = _benchmark_function_source("main")
+    assert "default=_default_spsv_alg_num()" in main
+    assert "3=ALG3(csr_nnz_balance; default)" in main
+    assert "CUDA keeps AUTO routing when omitted" in main
+
+
+def test_rocm_vendor_reference_uses_stable_split_stage_timing():
     source = _benchmark_function_source("_cupy_spsolve_csr_with_op")
     assert 'fs_spsv_impl._spsv_csr_sparse_ref_backend(' in source
     assert 'if vendor_backend == "hipsparse":' in source
-    assert "fresh_each_iter=True" in source
-    assert "time.perf_counter()" in source
-    assert "deviceSynchronize()" in source
+    assert 'sparse_ref["buffer_size_ms"]' in source
+    assert 'sparse_ref["analysis_ms"]' in source
+    assert 'sparse_ref["solve_ms"]' in source
+    assert "fmt=timing_fmt" in source
+
+    coo_dispatch = _benchmark_function_source("_cupy_spsolve_lower_csr_or_coo")
+    assert "timing_fmt=fmt" in coo_dispatch
 
     vendor_source = _function_source("_benchmark_spsv_csr_sparse_ref")
-    timed_loop = vendor_source.split("for _ in range(iters):", 1)[1]
-    assert "state = _prepare_spsv_csr_ref_hipsparse(" in timed_loop
-    assert "values = _run_spsv_csr_ref_hipsparse_prepared(state)" in timed_loop
-    assert "_destroy_spsv_csr_ref_hipsparse_prepared(state)" in timed_loop
-    assert "_reanalyze_spsv_csr_ref_hipsparse_prepared(state)" not in timed_loop
+    assert "run_analysis=False" in vendor_source
+    assert "measure_buffer_size=True" in vendor_source
+    assert vendor_source.count("_benchmark_spsv_hipsparse_stage") == 2
+    assert "_time_spsv_hipsparse_once" not in SPSV_SOURCE
+    assert "_benchmark_spsv_hipsparse_solve" not in SPSV_SOURCE
+    assert "_run_spsv_csr_ref_hipsparse_analysis_prepared" in vendor_source
+    assert "_run_spsv_csr_ref_hipsparse_prepared" in vendor_source
+    assert "fmt=fmt" in vendor_source
+    assert "buffer_size_ms + analysis_ms + solve_ms" in vendor_source
+
+    stage_timer = _function_source("_benchmark_spsv_hipsparse_stage")
+    assert 'str(fmt).upper() == "COO"' in stage_timer
+    assert "value < 2.0 * avg" in stage_timer
+    assert "median * 0.9 <= value <= median * 1.1" in stage_timer
 
 
 def test_rocm_vendor_dispatch_matches_spmv_spmm_without_cross_backend_fallback():
@@ -428,7 +502,7 @@ def test_rocm_vendor_dispatch_matches_spmv_spmm_without_cross_backend_fallback()
     assert '"cuSPARSE via CuPy spsolve_triangular"' in cuda_cupy_path
 
 
-def test_spsv_output_uses_runtime_vendor_name_and_total_time_only():
+def test_spsv_output_uses_runtime_vendor_name_and_dcu_split_times():
     for name in (
         "run_spsv_synthetic_all",
         "run_all_supported_spsv_csr_csv",
@@ -437,9 +511,9 @@ def test_spsv_output_uses_runtime_vendor_name_and_total_time_only():
         source = _benchmark_function_source(name)
         assert "_vendor_backend_name()" in source
         assert "_vendor_short_name()" in source
-        assert "FS.an" not in source
-        assert "FS.sol" not in source
-        assert "spdS" not in source
+        assert 'f"{vendor_short}.S.spd"' in source
+        assert "'PT.spdT'" in source
+        assert '"  split: "' not in source
     selector = _function_source("_spsv_csr_sparse_ref_backend")
     assert "if _is_rocm_runtime():" in selector
     assert 'return "hipsparse", None' in selector
@@ -450,6 +524,22 @@ def test_spsv_output_uses_runtime_vendor_name_and_total_time_only():
     assert 'f"{backend_name}_ms"' in csv_fields
     assert 'f"{backend_name}_route"' in csv_fields
     assert 'f"FlagSparse_vs_{backend_name}_speedup"' in csv_fields
+    for field in (
+        '"FlagSparse_analysis_ms"',
+        '"FlagSparse_solve_ms"',
+        '"FlagSparse_ms"',
+        '"hipSPARSE_analysis_ms"',
+        '"hipSPARSE_solve_ms"',
+        '"hipSPARSE_ms"',
+        '"PyTorch_ms"',
+        '"FlagSparse_vs_hipSPARSE_solve_speedup"',
+        '"FlagSparse_vs_hipSPARSE_all_speedup"',
+        '"FlagSparse_vs_PyTorch_all_speedup"',
+    ):
+        assert field in csv_fields
+    assert '"FlagSparse_bufferSize_ms"' not in csv_fields
+    assert '"hipSPARSE_bufferSize_ms"' not in csv_fields
+    assert '"FlagSparse_vs_hipSPARSE_analysis_speedup"' not in csv_fields
     assert "_backend_error_key()" in csv_fields
     assert '"err_ref"' not in csv_fields
     assert '"err_res"' not in csv_fields
@@ -467,12 +557,13 @@ def test_spsv_output_uses_runtime_vendor_name_and_total_time_only():
     ):
         assert generic_name not in csv_fields
     assert '"cuSPARSE_ms"' not in csv_fields
-    assert '"hipSPARSE_ms"' not in csv_fields
     for name in ("_finalize_csv_row", "_finalize_csv_row_csr_full"):
         source = _benchmark_function_source(name)
         assert 'f"{vendor_backend}_ms"' in source
         assert 'f"{vendor_backend}_route"' in source
-        assert 'f"FlagSparse_vs_{vendor_backend}_speedup"' in source
+        assert "_vendor_all_speedup_key()" in source
+        assert "_pytorch_all_speedup_key()" in source
+        assert 'f"FlagSparse_vs_{vendor_backend}_solve_speedup"' in source
         assert "backend_error_key = _backend_error_key()" in source
         assert "backend_error_key: err_vendor" in source
         assert '"err_ref"' not in source
@@ -495,7 +586,7 @@ def test_spsv_output_uses_runtime_vendor_name_and_total_time_only():
         assert "fieldnames = _spsv_csv_fieldnames()" in source
 
 
-def test_spsv_csv_error_columns_are_minimal_and_residual_stays_diagnostic():
+def test_spsv_csv_error_columns_are_minimal():
     csv_fields_node = next(
         node
         for node in SPSV_SELL_BENCHMARK_TREE.body
@@ -511,7 +602,6 @@ def test_spsv_csv_error_columns_are_minimal_and_residual_stays_diagnostic():
         "err_cu",
     ]
     assert not any(field.startswith("rel_") for field in sell_fields)
-    assert '"_err_res": err_res' in SPSV_SELL_BENCHMARK_SOURCE
 
 
 def test_spsm_vendor_dispatch_matches_spmv_spmm_selector_shape():
@@ -541,12 +631,25 @@ def test_spsm_output_uses_runtime_vendor_name():
     assert '"cusparse_reason"' not in source
 
 
-def test_flagsparse_and_vendor_use_full_spsv_rounds_for_total_speedup():
-    rounds = _benchmark_function_source("_benchmark_flagsparse_spsv_full_rounds")
-    assert "reset_call()" in rounds
-    assert "state = analyze_call()" in rounds
-    assert "x = solve_call(state)" in rounds
-    assert "total_times.append" in rounds
+def test_rocm_flagsparse_uses_stable_split_stage_timing():
+    cuda_rounds = _benchmark_function_source(
+        "_benchmark_flagsparse_spsv_full_rounds"
+    )
+    assert "_is_rocm_runtime" not in cuda_rounds
+    assert "buffer_size_call" not in cuda_rounds
+    assert "prepare_solve_call" not in cuda_rounds
+    assert "total_times.append" in cuda_rounds
+
+    stages = _benchmark_function_source("_benchmark_flagsparse_spsv_stages")
+    assert stages.count("state = analyze_call()") == 2
+    assert "analysis_times" in stages
+    assert "analysis_times.append(start_event.elapsed_time(stop_event))" in stages
+    assert "buffer_size_call()" in stages
+    assert "buffer_size_ms + analysis_ms + solve_ms" in stages
+    assert "_allinone_filtered_avg_ms(analysis_times, fmt=fmt)" in stages
+    assert "_allinone_filtered_avg_ms(solve_times, fmt=fmt)" in stages
+    assert 'fmt="CSR"' in SPSV_BENCHMARK_SOURCE
+    assert 'fmt="COO"' in SPSV_BENCHMARK_SOURCE
 
     for name in (
         "_benchmark_flagsparse_spsv_csr_split",
@@ -554,8 +657,18 @@ def test_flagsparse_and_vendor_use_full_spsv_rounds_for_total_speedup():
     ):
         source = _benchmark_function_source(name)
         assert "_benchmark_flagsparse_spsv_full_rounds(" in source
+        assert "_benchmark_flagsparse_spsv_stages(" in source
+        assert "if rocm_runtime:" in source
+        assert "rocm_workspace = fs_spsv_impl.flagsparse_spsv_create_workspace(" in source
+        assert "workspace=rocm_workspace" in source
+        assert "return descr, rocm_workspace" in source
 
     assert "_amortized_total_ms" not in SPSV_BENCHMARK_SOURCE
+
+    fields = _benchmark_function_source("_spsv_csv_fieldnames")
+    assert '"FlagSparse_analysis_ms"' in fields
+    assert '"hipSPARSE_analysis_ms"' in fields
+    assert '"FlagSparse_vs_hipSPARSE_solve_speedup"' in fields
 
 
 def test_spsv_default_rounds_match_spsm():

@@ -150,23 +150,26 @@ def benchmark_gather_case(
     gather_ref_backend, _gather_ref_reason = _gather_scatter_sparse_ref_backend(
         value_dtype, index_dtype, "gather"
     )
-    if run_cusparse and gather_ref_backend == "hipsparse":
+    if run_cusparse and _is_rocm_runtime():
         # DCU/ROCm: hipSPARSE exposes a native SpVec gather, so the baseline is a
         # direct gather rather than the CUDA-side selector-matrix SpMV.
-        try:
-            cusparse_values, cusparse_ms = benchmark_hipsparse_gather(
-                dense_vector, indices, warmup=warmup, iters=iters
-            )
-            cusparse_match = torch.allclose(
-                cusparse_values, expected, atol=atol, rtol=rtol
-            )
-            cusparse_max_error = (
-                float(torch.max(torch.abs(cusparse_values - expected)).item())
-                if nnz > 0
-                else 0.0
-            )
-        except Exception as exc:
-            cusparse_reason = str(exc)
+        if gather_ref_backend is None:
+            cusparse_reason = _gather_ref_reason
+        else:
+            try:
+                cusparse_values, cusparse_ms = benchmark_hipsparse_gather(
+                    dense_vector, indices, warmup=warmup, iters=iters
+                )
+                cusparse_match = torch.allclose(
+                    cusparse_values, expected, atol=atol, rtol=rtol
+                )
+                cusparse_max_error = (
+                    float(torch.max(torch.abs(cusparse_values - expected)).item())
+                    if nnz > 0
+                    else 0.0
+                )
+            except Exception as exc:
+                cusparse_reason = str(exc)
     elif run_cusparse:
         skip_reason = _cusparse_native_gather_skip_reason(value_dtype)
         if skip_reason:

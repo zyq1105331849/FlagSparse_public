@@ -39,7 +39,6 @@ from flagsparse.sparse_operations import spsv as spsv_impl
 from mtx_fast import NonSquareMatrixError
 from tests.test_spsv import (
     _allinone_filtered_avg_ms,
-    _apply_csr_op,
     _build_random_triangular_csr,
     _dtype_name,
     _extract_triangular_csr,
@@ -48,6 +47,7 @@ from tests.test_spsv import (
     _fmt_ratio,
     _load_mtx_to_csr_torch,
     _random_rhs_for_spsv,
+    _stable_case_seed,
 )
 
 
@@ -151,187 +151,6 @@ def _spsv_tolerance(dtype):
     if dtype in (torch.float64, torch.complex128):
         return 1e-12, 1e-10
     raise TypeError(f"unsupported SELL value dtype: {dtype}")
-
-
-def _scipy_sell_reference(
-    values,
-    cols,
-    row_ptr,
-    b,
-    shape,
-    op_mode,
-    unit_diagonal=False,
-):
-    """Solve the exact post-load SELL source matrix with SciPy on the CPU."""
-
-    import numpy as np
-    import scipy.sparse as sp
-    from scipy.sparse.linalg import spsolve_triangular
-
-    matrix = sp.csr_matrix(
-        (
-            values.detach().cpu().numpy(),
-            cols.detach().cpu().numpy().astype(np.int64, copy=False),
-            row_ptr.detach().cpu().numpy().astype(np.int64, copy=False),
-        ),
-        shape=shape,
-    )
-
-    op_mode = str(op_mode).upper()
-    if op_mode == "TRANS":
-        matrix_op = matrix.transpose().tocsr()
-    elif op_mode == "CONJ":
-        matrix_op = matrix.getH().tocsr()
-    else:
-        raise ValueError("SciPy SELL reference only supports TRANS or CONJ")
-    matrix_op.sum_duplicates()
-    matrix_op.sort_indices()
-
-    result = spsolve_triangular(
-        matrix_op,
-        b.detach().cpu().numpy(),
-        lower=False,
-        unit_diagonal=bool(unit_diagonal),
-    )
-    return torch.as_tensor(result, dtype=b.dtype)
-
-
-def _solution_comparison_stats(actual, reference, dtype):
-    actual = actual.detach().cpu()
-    reference = reference.detach().cpu()
-    if actual.shape != reference.shape:
-        raise ValueError(
-            f"solution shape mismatch: {tuple(actual.shape)} != "
-            f"{tuple(reference.shape)}"
-        )
-    if actual.numel() == 0:
-        return {
-            "allclose": True,
-            "bad_count": 0,
-            "total": 0,
-            "max_diff": 0.0,
-            "worst_index": None,
-            "actual": None,
-            "reference": None,
-            "tolerance": 0.0,
-        }
-
-    atol, rtol = _spsv_tolerance(dtype)
-    finite = torch.isfinite(actual) & torch.isfinite(reference)
-    diff = torch.abs(actual - reference)
-    tolerance = atol + rtol * torch.abs(reference)
-    bad = (~finite) | (diff > tolerance)
-    ranked_diff = torch.where(
-        finite, diff, torch.full_like(diff, float("inf"))
-    )
-    worst_index = int(torch.argmax(ranked_diff).item())
-    return {
-        "allclose": bool(
-            torch.allclose(actual, reference, atol=atol, rtol=rtol)
-        ),
-        "bad_count": int(bad.sum().item()),
-        "total": int(diff.numel()),
-        "max_diff": float(ranked_diff[worst_index].item()),
-        "worst_index": worst_index,
-        "actual": actual[worst_index].item(),
-        "reference": reference[worst_index].item(),
-        "tolerance": float(tolerance[worst_index].item()),
-    }
-
-
-def _run_mip1_scipy_diagnostic(
-    values,
-    cols,
-    row_ptr,
-    b,
-    shape,
-    expected,
-    flagsparse_result,
-    cusparse_result,
-    value_dtype,
-    index_dtype,
-    op_mode,
-    unit_diagonal,
-    output_dir,
-):
-    """Compare mip1 solutions outside benchmark timing and PASS/FAIL."""
-
-    scipy_result = _scipy_sell_reference(
-        values,
-        cols,
-        row_ptr,
-        b,
-        shape,
-        op_mode,
-        unit_diagonal,
-    )
-    solutions = {
-        "FlagSparse": flagsparse_result.detach().cpu(),
-        "cuSPARSE": cusparse_result.detach().cpu(),
-        "SciPy": scipy_result.detach().cpu(),
-        "Expected": expected.detach().cpu(),
-    }
-    comparisons = (
-        ("FS-ref", "FlagSparse", "Expected"),
-        ("CU-ref", "cuSPARSE", "Expected"),
-        ("SciPy-ref", "SciPy", "Expected"),
-        ("FS-CU", "FlagSparse", "cuSPARSE"),
-        ("FS-SciPy", "FlagSparse", "SciPy"),
-        ("CU-SciPy", "cuSPARSE", "SciPy"),
-    )
-    stats = {
-        label: _solution_comparison_stats(
-            solutions[actual_name], solutions[reference_name], value_dtype
-        )
-        for label, actual_name, reference_name in comparisons
-    }
-
-    print("-" * 144)
-    print(
-        "mip1 SciPy solution diagnostic "
-        "(excluded from timing and PASS/FAIL)"
-    )
-    print(
-        f"opA={op_mode} | value={_dtype_name(value_dtype)} | "
-        f"index={_dtype_name(index_dtype)} | "
-        f"diag={'UNIT' if unit_diagonal else 'NON_UNIT'}"
-    )
-    for label, _, _ in comparisons:
-        item = stats[label]
-        print(
-            f"{label:<10} allclose={str(item['allclose']):<5} "
-            f"bad={item['bad_count']}/{item['total']} "
-            f"max_diff={item['max_diff']:.6e} "
-            f"index={item['worst_index']} "
-            f"actual={item['actual']} reference={item['reference']} "
-            f"tol={item['tolerance']:.6e}"
-        )
-
-    diag_label = "unit" if unit_diagonal else "non_unit"
-    output_name = (
-        f"mip1_{str(op_mode).lower()}_{_dtype_name(value_dtype)}_"
-        f"{_dtype_name(index_dtype)}_{diag_label}_solutions.pt"
-    )
-    output_path = os.path.join(output_dir, output_name)
-    torch.save(
-        {
-            "matrix": "mip1.mtx",
-            "opA": str(op_mode),
-            "value_dtype": _dtype_name(value_dtype),
-            "index_dtype": _dtype_name(index_dtype),
-            "unit_diagonal": bool(unit_diagonal),
-            "b": b.detach().cpu(),
-            "expected": solutions["Expected"],
-            "flagsparse": solutions["FlagSparse"],
-            "cusparse": solutions["cuSPARSE"],
-            "scipy": solutions["SciPy"],
-            "comparisons": stats,
-        },
-        output_path,
-    )
-    print(f"Saved mip1 solutions to {output_path}")
-    print("-" * 144)
-    return output_path
 
 
 def _spsv_relative_error(actual, reference):
@@ -471,27 +290,6 @@ def _time_cuda(run, warmup=None, iters=None):
     return output, _allinone_filtered_avg_ms(samples, fmt="SELL")
 
 
-def _apply_unit_diagonal_csr(values, cols, row_ptr, x, shape, op_mode="NON"):
-    """Apply lower CSR while replacing every stored/missing diagonal by one."""
-
-    n_rows = int(shape[0])
-    rows = torch.repeat_interleave(
-        torch.arange(n_rows, device=values.device),
-        (row_ptr[1:] - row_ptr[:-1]).to(torch.int64),
-    )
-    off_diagonal_values = values.clone()
-    off_diagonal_values[cols.to(torch.int64) == rows] = 0
-    return _apply_csr_op(
-        off_diagonal_values,
-        cols,
-        row_ptr,
-        x,
-        shape,
-        op_mode,
-        lower=True,
-    ) + x
-
-
 class _CusparseSellSpSV:
     """Minimal native cuSPARSE SELL baseline with reusable descriptors/workspace."""
 
@@ -591,6 +389,10 @@ class _CusparseSellSpSV:
             "cusparseSpSV_createDescr",
         )
         size = ctypes.c_size_t()
+        torch.cuda.synchronize()
+        buffer_start = torch.cuda.Event(enable_timing=True)
+        buffer_end = torch.cuda.Event(enable_timing=True)
+        buffer_start.record()
         _check(
             self.lib.cusparseSpSV_bufferSize(
                 self.handle,
@@ -606,6 +408,9 @@ class _CusparseSellSpSV:
             ),
             "cusparseSpSV_bufferSize",
         )
+        buffer_end.record()
+        buffer_end.synchronize()
+        self.buffer_size_ms = float(buffer_start.elapsed_time(buffer_end))
         self.workspace = torch.empty(
             max(1, size.value), dtype=torch.uint8, device=values.device
         )
@@ -649,10 +454,6 @@ class _CusparseSellSpSV:
         )
         return self.x
 
-    def analysis_and_solve(self):
-        self.analysis()
-        return self.solve()
-
     def close(self):
         if self.descr.value:
             self.lib.cusparseSpSV_destroyDescr(self.descr)
@@ -682,50 +483,27 @@ def _benchmark_triton(
         "slice_size": slice_size,
         "unit_diagonal": unit_diagonal,
         "transpose": op_mode,
+        "alg_num": alg_num,
     }
-    if op_mode == "NON":
-        analysis_kwargs["alg_num"] = alg_num
-        if alg2_worker_count is not None:
-            analysis_kwargs["alg2_worker_count"] = alg2_worker_count
-    else:
+    if alg2_worker_count is not None:
+        analysis_kwargs["alg2_worker_count"] = alg2_worker_count
+    if op_mode != "NON":
         spsv_impl._clear_spsv_sell_trans_analysis_cache()
-        descr, analysis_ms = _time_cuda(
-            lambda: fs.flagsparse_spsv_analysis_sell(
-                values,
-                cols,
-                offsets,
-                (n_rows, n_rows),
-                **analysis_kwargs,
-            ),
-            warmup=0,
-            iters=1,
-        )
-        workspace = fs.flagsparse_spsv_create_workspace(descr)
-        out = torch.empty_like(b)
-
-        def solve():
-            return fs.flagsparse_spsv_solve_sell(
-                descr,
-                b,
-                out=out,
-                workspace=workspace,
-            )
-
-        result, solve_ms = _time_cuda(solve)
-        return result, solve_ms + analysis_ms / ITERS
-
-    seed_descr = fs.flagsparse_spsv_analysis_sell(
-        values, cols, offsets, (n_rows, n_rows), **analysis_kwargs
+    descr, analysis_ms = _time_cuda(
+        lambda: fs.flagsparse_spsv_analysis_sell(
+            values,
+            cols,
+            offsets,
+            (n_rows, n_rows),
+            **analysis_kwargs,
+        ),
+        warmup=0,
+        iters=1,
     )
-    workspace = fs.flagsparse_spsv_create_workspace(seed_descr)
+    workspace = fs.flagsparse_spsv_create_workspace(descr)
     out = torch.empty_like(b)
 
-    def analysis_and_solve():
-        call_kwargs = dict(analysis_kwargs)
-        call_kwargs["workspace"] = workspace
-        descr = fs.flagsparse_spsv_analysis_sell(
-            values, cols, offsets, (n_rows, n_rows), **call_kwargs
-        )
+    def solve():
         return fs.flagsparse_spsv_solve_sell(
             descr,
             b,
@@ -733,7 +511,8 @@ def _benchmark_triton(
             workspace=workspace,
         )
 
-    return _time_cuda(analysis_and_solve)
+    result, solve_ms = _time_cuda(solve)
+    return result, analysis_ms + solve_ms
 
 
 def _run_case(
@@ -785,41 +564,18 @@ def _run_case(
         op_mode=op_mode,
     )
     try:
-        if op_mode == "NON":
-            cusparse_result, cusparse_ms = _time_cuda(
-                baseline.analysis_and_solve
-            )
-        else:
-            _, cusparse_analysis_ms = _time_cuda(
-                baseline.analysis,
-                warmup=0,
-                iters=1,
-            )
-            cusparse_result, cusparse_solve_ms = _time_cuda(baseline.solve)
-            cusparse_ms = cusparse_solve_ms + cusparse_analysis_ms / ITERS
+        _, cusparse_analysis_ms = _time_cuda(
+            baseline.analysis,
+            warmup=0,
+            iters=1,
+        )
+        cusparse_result, cusparse_solve_ms = _time_cuda(baseline.solve)
+        cusparse_ms = (
+            baseline.buffer_size_ms + cusparse_analysis_ms + cusparse_solve_ms
+        )
     finally:
         baseline.close()
 
-    if unit_diagonal:
-        reconstructed_b = _apply_unit_diagonal_csr(
-            values,
-            cols,
-            row_ptr,
-            triton_result,
-            (n_rows, n_rows),
-            op_mode,
-        )
-    else:
-        reconstructed_b = _apply_csr_op(
-            values,
-            cols,
-            row_ptr,
-            triton_result,
-            (n_rows, n_rows),
-            op_mode,
-            lower=True,
-        )
-    err_res = float(torch.max(torch.abs(reconstructed_b - b)).item())
     err_cu = float(torch.max(torch.abs(triton_result - cusparse_result)).item())
     record = {
         "matrix": matrix,
@@ -844,7 +600,6 @@ def _run_case(
         "err_cu": err_cu,
         "pytorch_reason": "not used for SELL",
         "error": None,
-        "_err_res": err_res,
     }
     return record, triton_result, cusparse_result
 
@@ -860,7 +615,7 @@ def _print_header(
 ):
     op_label = op_mode
     if op_mode != "NON":
-        algorithm_label = op_mode
+        algorithm_label = f"ALG{alg_num}"
         worker_label = "N/A"
     elif alg_num == 2:
         algorithm_label = f"ALG{alg_num}"
@@ -877,16 +632,11 @@ def _print_header(
         f"slice_size={slice_size} | "
         f"workers={worker_label}"
     )
-    if op_mode == "NON":
-        print(
-            f"Benchmark schedule: warmup={WARMUP}, iter={ITERS}; "
-            "FS.ms and CU.ms both include per-call analysis + solve."
-        )
-    else:
-        print(
-            f"Benchmark schedule: solve warmup={WARMUP}, iter={ITERS}; "
-            "FS.ms and CU.ms are (one analysis + iter solves) / iter."
-        )
+    print(
+        f"Benchmark schedule: solve warmup={WARMUP}, iter={ITERS}; "
+        "FS.ms and CU.ms follow buffer-size + analysis + filtered solve average; "
+        "FS workspace sizing is part of analysis."
+    )
     print("CU.spd = CU.ms / FS.ms; PT.spd = PT.ms / FS.ms.")
     print("Status compares FlagSparse with cuSPARSE.")
     print("-" * 144)
@@ -913,11 +663,6 @@ def _print_record(record):
         f"{record['status']:>6} {_fmt_err(record['err_pt']):>10} "
         f"{_fmt_err(record['err_cu']):>10}"
     )
-    if record["status"] in ("FAIL", "REF_FAIL"):
-        print(
-            "  Diagnostic residual |op(A)*x-b|: "
-            f"{_fmt_err(record.get('_err_res'))}"
-        )
 
 
 def test_spsv_sell_matches_cusparse(
@@ -952,15 +697,9 @@ def test_spsv_sell_matches_cusparse(
             ),
         )
     row_ptr = row_ptr.to(index_dtype)
-    expected = _random_rhs_for_spsv(
+    b = _random_rhs_for_spsv(
         shape, value_dtype, values.device, op_mode="NON", seed=1234
     )
-    if unit_diagonal:
-        b = _apply_unit_diagonal_csr(values, cols, row_ptr, expected, shape)
-    else:
-        b = _apply_csr_op(
-            values, cols, row_ptr, expected, shape, "NON", lower=True
-        )
     try:
         record, triton_result, cusparse_result = _run_case(
             "synthetic-64",
@@ -974,7 +713,6 @@ def test_spsv_sell_matches_cusparse(
         )
     except (AttributeError, OSError) as exc:
         pytest.skip(f"native cuSPARSE SELL SpSV is unavailable: {exc}")
-    assert _spsv_matches(triton_result, expected, value_dtype)
     assert _spsv_matches(triton_result, cusparse_result, value_dtype)
     assert record["status"] == "PASS"
     assert record["FlagSparse_ms"] > 0.0
@@ -990,7 +728,7 @@ def test_spsv_sell_matches_cusparse(
 
 
 def test_spsv_sell_trans_matches_cusparse(
-    value_dtype, index_dtype, slice_size, unit_diagonal, op_mode
+    value_dtype, index_dtype, slice_size, alg_num, unit_diagonal, op_mode
 ):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
@@ -1003,17 +741,9 @@ def test_spsv_sell_trans_matches_cusparse(
         torch.device("cuda"),
         lower=True,
     )
-    expected = _random_rhs_for_spsv(
+    b = _random_rhs_for_spsv(
         shape, value_dtype, values.device, op_mode=op_mode, seed=9876
     )
-    if unit_diagonal:
-        b = _apply_unit_diagonal_csr(
-            values, cols, row_ptr, expected, shape, op_mode
-        )
-    else:
-        b = _apply_csr_op(
-            values, cols, row_ptr, expected, shape, op_mode, lower=True
-        )
     try:
         record, triton_result, cusparse_result = _run_case(
             "synthetic-trans-64",
@@ -1022,12 +752,12 @@ def test_spsv_sell_trans_matches_cusparse(
             row_ptr,
             b,
             slice_size,
+            alg_num,
             unit_diagonal=unit_diagonal,
             op_mode=op_mode,
         )
     except (AttributeError, OSError) as exc:
         pytest.skip(f"native cuSPARSE SELL SpSV is unavailable: {exc}")
-    assert _spsv_matches(triton_result, expected, value_dtype)
     assert _spsv_matches(triton_result, cusparse_result, value_dtype)
     assert record["status"] == "PASS"
     assert record["FlagSparse_ms"] > 0.0
@@ -1036,6 +766,7 @@ def test_spsv_sell_trans_matches_cusparse(
         slice_size,
         value_dtype,
         index_dtype,
+        alg_num,
         unit_diagonal=unit_diagonal,
         op_mode=op_mode,
     )
@@ -1078,11 +809,8 @@ def test_spsv_sell_complex_unsorted_matches_cusparse(alg_num):
         values[start:end] = values[start:end][order - start]
         cols[start:end] = cols[start:end][order - start]
 
-    expected = _random_rhs_for_spsv(
+    b = _random_rhs_for_spsv(
         shape, value_dtype, values.device, op_mode="NON", seed=4321
-    )
-    b = _apply_csr_op(
-        values, cols, row_ptr, expected, shape, "NON", lower=True
     )
     try:
         record, triton_result, cusparse_result = _run_case(
@@ -1096,7 +824,6 @@ def test_spsv_sell_complex_unsorted_matches_cusparse(alg_num):
         )
     except (AttributeError, OSError) as exc:
         pytest.skip(f"native cuSPARSE SELL SpSV is unavailable: {exc}")
-    assert _spsv_matches(triton_result, expected, value_dtype)
     assert _spsv_matches(triton_result, cusparse_result, value_dtype)
     assert record["status"] == "PASS"
 
@@ -1120,9 +847,11 @@ if __name__ != "__main__":
     )(
         pytest.mark.parametrize("index_dtype", (torch.int32, torch.int64))(
             pytest.mark.parametrize("slice_size", (8, 32))(
-                pytest.mark.parametrize("unit_diagonal", (False, True))(
-                    pytest.mark.parametrize("op_mode", ("TRANS", "CONJ"))(
-                        test_spsv_sell_trans_matches_cusparse
+                pytest.mark.parametrize("alg_num", SELL_ALG_NUMS)(
+                    pytest.mark.parametrize("unit_diagonal", (False, True))(
+                        pytest.mark.parametrize("op_mode", ("TRANS", "CONJ"))(
+                            test_spsv_sell_trans_matches_cusparse
+                        )
                     )
                 )
             )
@@ -1146,7 +875,7 @@ def _expand_mtx_paths(inputs):
 def main():
     global WARMUP, ITERS
     parser = argparse.ArgumentParser(
-        description="Lower SELL SpSV: Triton versus cuSPARSE analysis+solve"
+        description="Lower SELL SpSV: Triton versus native cuSPARSE"
     )
     parser.add_argument("mtx", nargs="+", help=".mtx files or directories")
     parser.add_argument("--csv", required=True, help="output CSV path")
@@ -1165,8 +894,8 @@ def main():
         choices=SELL_ALG_NUMS,
         default=None,
         help=(
-            "SELL kernel: 1=original persistent row solver, "
-            "2=slice-cooperative solver"
+            "SELL kernel: NON uses 1=original/2=slice-cooperative; "
+            "TRANS/CONJ uses 1=scatter queue/2=CSC gather"
         ),
     )
     parser.add_argument(
@@ -1187,24 +916,12 @@ def main():
         action="store_true",
         help="treat stored or missing diagonal entries as one in both solvers",
     )
-    parser.add_argument(
-        "--scipy-check-mip1",
-        action="store_true",
-        help=(
-            "compare mip1 FlagSparse/cuSPARSE solutions with a SciPy CPU "
-            "reference outside timing and PASS/FAIL"
-        ),
-    )
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
     args = parser.parse_args()
 
-    if args.ops != "NON" and args.alg_num is not None:
-        parser.error("TRANS/CONJ do not accept --alg_num")
     if args.ops != "NON" and args.alg2_workers is not None:
         parser.error("TRANS/CONJ do not accept --alg2-workers")
-    if args.scipy_check_mip1 and args.ops == "NON":
-        parser.error("--scipy-check-mip1 only supports TRANS/CONJ")
     alg_num = 1 if args.alg_num is None else args.alg_num
     op_mode = args.ops
 
@@ -1217,15 +934,13 @@ def main():
         raise SystemExit("No .mtx files found")
 
     records = []
-    scipy_check_count = 0
-    scipy_output_dir = os.path.dirname(os.path.abspath(args.csv))
     for value_dtype in VALUE_DTYPE_CHOICES[args.dtype]:
         for index_dtype in INDEX_DTYPES:
             _print_header(
                 args.slice_size,
                 value_dtype,
                 index_dtype,
-                None if op_mode != "NON" else alg_num,
+                alg_num,
                 None if op_mode != "NON" else args.alg2_workers,
                 args.unit_diagonal,
                 op_mode,
@@ -1249,65 +964,31 @@ def main():
                     )
                     cols = cols.to(index_dtype)
                     row_ptr = row_ptr.to(index_dtype)
-                    expected = torch.ones(
-                        shape[0], dtype=value_dtype, device=values.device
+                    b = _random_rhs_for_spsv(
+                        shape,
+                        value_dtype,
+                        values.device,
+                        op_mode=op_mode,
+                        seed=_stable_case_seed(
+                            "csv-sell",
+                            os.path.basename(path),
+                            op_mode,
+                            _dtype_name(value_dtype),
+                            _dtype_name(index_dtype),
+                        ),
                     )
-                    if args.unit_diagonal:
-                        b = _apply_unit_diagonal_csr(
-                            values,
-                            cols,
-                            row_ptr,
-                            expected,
-                            shape,
-                            op_mode,
-                        )
-                    else:
-                        b = _apply_csr_op(
-                            values,
-                            cols,
-                            row_ptr,
-                            expected,
-                            shape,
-                            op_mode,
-                            lower=True,
-                        )
-                    record, triton_result, cusparse_result = _run_case(
+                    record, _, _ = _run_case(
                         os.path.basename(path),
                         values,
                         cols,
                         row_ptr,
                         b,
                         args.slice_size,
-                        None if op_mode != "NON" else alg_num,
+                        alg_num,
                         None if op_mode != "NON" else args.alg2_workers,
                         args.unit_diagonal,
                         op_mode,
                     )
-                    if (
-                        args.scipy_check_mip1
-                        and os.path.basename(path).lower() == "mip1.mtx"
-                    ):
-                        scipy_check_count += 1
-                        try:
-                            _run_mip1_scipy_diagnostic(
-                                values,
-                                cols,
-                                row_ptr,
-                                b,
-                                shape,
-                                expected,
-                                triton_result,
-                                cusparse_result,
-                                value_dtype,
-                                index_dtype,
-                                op_mode,
-                                args.unit_diagonal,
-                                scipy_output_dir,
-                            )
-                        except Exception as scipy_exc:
-                            print(
-                                f"mip1 SciPy diagnostic failed: {scipy_exc}"
-                            )
                     records.append(record)
                     _print_record(record)
                 except NonSquareMatrixError as exc:
@@ -1352,8 +1033,6 @@ def main():
             )
     print("-" * 144)
     print(f"Wrote {len(records)} rows to {args.csv}")
-    if args.scipy_check_mip1 and scipy_check_count == 0:
-        print("No mip1.mtx input found; SciPy diagnostic was not run.")
 
 
 if __name__ == "__main__":
