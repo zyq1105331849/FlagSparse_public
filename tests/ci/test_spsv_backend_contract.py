@@ -2,6 +2,7 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
+
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -16,6 +17,7 @@
 
 import ast
 from pathlib import Path
+
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -515,7 +517,8 @@ def test_spsv_output_uses_runtime_vendor_name_and_dcu_split_times():
         assert "'PT.spdT'" in source
         assert '"  split: "' not in source
     selector = _function_source("_spsv_csr_sparse_ref_backend")
-    assert "if _is_rocm_runtime():" in selector
+    assert "_vendor_sparse_library()" in selector
+    assert 'vendor == "hipsparse"' in selector
     assert 'return "hipsparse", None' in selector
     assert 'return "cupy_cusparse", None' in selector
 
@@ -545,9 +548,9 @@ def test_spsv_output_uses_runtime_vendor_name_and_dcu_split_times():
     assert '"err_res"' not in csv_fields
     assert 'f"{backend_name}_reason"' in csv_fields
     backend_error_key = _benchmark_function_source("_backend_error_key")
-    assert 'return "err_hip" if' in backend_error_key
-    assert 'else "err_cu"' in backend_error_key
-    assert '"err_vendor"' not in backend_error_key
+    assert "_expected_vendor_sparse_backend()" in backend_error_key
+    assert '"hipsparse": "err_hip"' in backend_error_key
+    assert '"cupy_cusparse": "err_cu"' in backend_error_key
     for generic_name in (
         '"vendor_backend"',
         '"vendor_route"',
@@ -606,7 +609,9 @@ def test_spsv_csv_error_columns_are_minimal():
 
 def test_spsm_vendor_dispatch_matches_spmv_spmm_selector_shape():
     selector = _spsm_function_source("_spsm_csr_sparse_ref_backend")
-    assert "if _is_rocm_runtime():" in selector
+    assert "_vendor_sparse_library()" in selector
+    assert 'vendor == "hipsparse"' in selector
+    assert "_backend_name()" in selector
     assert 'return "hipsparse", None' in selector
     assert 'return "native_cusparse", None' in selector
 
@@ -685,6 +690,44 @@ def test_spsv_default_rounds_match_spsm():
 
 def test_spsv_float32_tolerances_are_consistent():
     assert "return 1e-6, 1e-5" in SPSV_BENCHMARK_SOURCE
+
+
+def test_spsv_spsm_keep_multi_backend_accelerator_abstraction():
+    for source in (SPSV_SOURCE, SPSM_SOURCE):
+        assert "torch.cuda.synchronize()" not in source
+        assert "torch.cuda.Event" not in source
+        assert ".is_cuda" not in source
+        assert "_ACCEL.synchronize()" in source
+
+    active_algs = _benchmark_function_source(
+        "_active_spsv_alg_num_to_solve_kind"
+    )
+    assert "_is_mthreads_runtime()" in active_algs
+    assert "_is_ascend_runtime()" in active_algs
+
+
+def test_spsv_preserves_non_rocm_profiles_and_public_sell_api():
+    assert "_MACA_SPSV_PROFILES" in SPSV_SOURCE
+    assert "_maca_spsv_knob" in SPSV_SOURCE
+    assert "def flagsparse_spsv_sell(" in SPSV_SOURCE
+
+    for relative_path in (
+        "src/flagsparse/__init__.py",
+        "src/flagsparse/sparse_operations/__init__.py",
+        "conf/operators.yaml",
+    ):
+        source = (PROJECT_ROOT / relative_path).read_text(encoding="utf-8")
+        assert "flagsparse_spsv_sell" in source
+
+
+def test_spsv_benchmark_uses_common_vendor_policy():
+    for name in ("_vendor_backend_name", "_vendor_short_name"):
+        source = _benchmark_function_source(name)
+        assert "fs_common._expected_vendor_sparse_" in source
+
+    selector = _function_source("_spsv_csr_sparse_ref_backend")
+    assert "_vendor_sparse_library()" in selector
+    assert "_backend_name()" in selector
     assert "return 1e-6, 1e-5" in SPSV_SELL_BENCHMARK_SOURCE
     # Accuracy tests unpack (rtol, atol), unlike the benchmark helpers.
     assert "return 1e-5, 1e-6" in SPSV_ACCURACY_SOURCE

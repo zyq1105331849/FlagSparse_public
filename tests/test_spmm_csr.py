@@ -34,6 +34,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
+from flagsparse.sparse_operations import _common as fs_common
 import flagsparse.sparse_operations.spmm_csr as spmm_ops
 from baseline_backend import print_backend_summary
 
@@ -61,6 +62,7 @@ DEFAULT_RUN_DTYPE_NAMES = ("float32", "float64")
 DEFAULT_INDEX_DTYPE_NAMES = ("int32", "int64")
 DEFAULT_OP_NAMES = tuple(spmm_ops.SPMM_OP_NAMES.values())
 CUSPARSE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
+TLE_CSR_SPMM_ALGORITHMS = {"alpha_alg1_tle_opt", "alpha_alg1_tle_opt2"}
 MAIN_CSR_SPMM_ALGORITHMS = {
     "csr_base",
     "csr_base_accuracy",
@@ -332,10 +334,10 @@ def _print_tle_availability(alg_names):
     print("TLE runtime availability:")
     for name in selected:
         available_fn, reason_fn = checks[name]
-        if available_fn():
-            print(f"  {name}: available")
-        else:
-            print(f"  {name}: unavailable ({reason_fn()})")
+        available = bool(available_fn())
+        print(f"{name}: {'available' if available else 'unavailable'}")
+        if not available:
+            print(f"  reason: {reason_fn()}")
 
 
 def _cuda_event_benchmark(op, warmup, iters):
@@ -463,17 +465,18 @@ def _skip_row(
 
 
 def _vendor_label():
-    return "hipSPARSE" if spmm_ops._is_rocm_runtime() else "cuSPARSE"
+    return fs_common._expected_vendor_sparse_label()
 
 
 def _vendor_column_label():
-    return "hs" if spmm_ops._is_rocm_runtime() else "cu"
+    return fs_common._expected_vendor_sparse_short().lower()
 
 
 def _time_vendor_sparse_ref(
     data, indices, indptr, shape, B, op, warmup, iters, layout="row"
 ):
-    if spmm_ops._is_rocm_runtime():
+    vendor = fs_common._expected_vendor_sparse_backend()
+    if vendor == "hipsparse":
         try:
             sparse_ref = spmm_ops._benchmark_spmm_csr_sparse_ref(
                 data,
@@ -491,6 +494,12 @@ def _time_vendor_sparse_ref(
         if sparse_ref["backend"] is None:
             return None, None, sparse_ref["reason"]
         return sparse_ref["values"], sparse_ref["ms"], None
+    if vendor != "cupy_cusparse":
+        return (
+            None,
+            None,
+            f"{fs_common._sparse_backend_label(vendor)} CSR SpMM baseline is not wired for this runner",
+        )
 
     if data.dtype not in CUSPARSE_DTYPES:
         return None, None, "dtype not supported by CuPy/cuSPARSE reference"
@@ -778,7 +787,7 @@ def main():
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
-        print("CUDA is not available.")
+        print("A CUDA/ROCm PyTorch device is not available.")
         return
     paths = _resolve_input_paths(args.input)
     if not paths:
@@ -818,14 +827,15 @@ def main():
     vendor_backend, vendor_reason = spmm_ops._spmm_csr_sparse_ref_backend(
         first_dtype, first_index_dtype, first_index_dtype
     )
-    print_backend_summary(
+    for line in fs_common._backend_summary_lines(
         op_name="SpMM CSR",
         native_format="CSR",
         correctness_ref="PyTorch CSR/COO",
         vendor_backend=vendor_backend,
         vendor_reason=vendor_reason,
         run_vendor=not args.no_cusparse,
-    )
+    ):
+        print(line)
     print(
         f"Vendor sparse baseline: {vendor_label}; unsupported combinations are reported as N/A with reason."
     )

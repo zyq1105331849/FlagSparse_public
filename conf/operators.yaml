@@ -375,6 +375,7 @@ ops:
     for:
       - flagsparse_spsv_analysis_sell
       - flagsparse_spsv_solve_sell
+      - flagsparse_spsv_sell
     labels:
       - flagsparse
       - sparse

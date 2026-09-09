@@ -432,7 +432,7 @@ def _prepare_spmm_bsr_matrix(data, indices, indptr, shape, block_dim):
         raise TypeError("BSR SpMM supports float32, float64, complex64, and complex128")
     if indices.dtype not in SUPPORTED_INDEX_DTYPES or indptr.dtype not in SUPPORTED_INDEX_DTYPES:
         raise TypeError("indices and indptr dtype must be torch.int32 or torch.int64")
-    if not data.is_cuda or not indices.is_cuda or not indptr.is_cuda:
+    if not _is_accel_tensor(data) or not _is_accel_tensor(indices) or not _is_accel_tensor(indptr):
         raise ValueError("data, indices, and indptr must be CUDA tensors")
     if indices.device != data.device or indptr.device != data.device:
         raise ValueError("indices and indptr must be on the same CUDA device as data")
@@ -547,7 +547,7 @@ def _validate_spmm_bsr_B(B, prepared, op_code):
         raise TypeError("B must be a torch.Tensor")
     if B.ndim != 2:
         raise ValueError("B must be a 2D dense tensor")
-    if not B.is_cuda:
+    if not _is_accel_tensor(B):
         raise ValueError("B must be a CUDA tensor")
     if B.device != prepared.data.device:
         raise ValueError("B must be on the same CUDA device as sparse matrix data")
@@ -714,14 +714,14 @@ def _run_spmm_bsr_base_route(prepared, B, *, timing=False, diagnostics=False):
     block_n = _select_block_n(int(B.shape[1]), prepared.data.dtype, prepared.data.device)
     backend_info = _get_device_backend_info(prepared.data.device)
     if timing:
-        torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        _ACCEL.synchronize()
+        start = _ACCEL.Event(enable_timing=True)
+        end = _ACCEL.Event(enable_timing=True)
         start.record()
     C = _triton_spmm_bsr_base_kernel(prepared, B, _normalize_spmm_bsr_op(prepared.op))
     if timing:
         end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         compute_ms = start.elapsed_time(end)
     return C, {
         "process_cpu_ms": 0.0,
@@ -857,9 +857,9 @@ def flagsparse_spmm_bsr_run(
     B = _validate_spmm_bsr_B(B, prepared, _normalize_spmm_bsr_op(op_name))
     collect_timing = bool(return_time or return_meta)
     if collect_timing:
-        torch.cuda.synchronize()
-        event_start = torch.cuda.Event(enable_timing=True)
-        event_end = torch.cuda.Event(enable_timing=True)
+        _ACCEL.synchronize()
+        event_start = _ACCEL.Event(enable_timing=True)
+        event_end = _ACCEL.Event(enable_timing=True)
         event_start.record()
     C, route_meta = _run_spmm_bsr_prepared_with_fallback(
         prepared,
@@ -869,7 +869,7 @@ def flagsparse_spmm_bsr_run(
     )
     if collect_timing:
         event_end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         gpu_ms = event_start.elapsed_time(event_end)
     else:
         gpu_ms = None
@@ -991,7 +991,7 @@ def flagsparse_spmm_bsr(
     if out is None:
         return C
     result = C[0] if return_time or return_meta else C
-    if not out.is_cuda:
+    if not _is_accel_tensor(out):
         raise ValueError("out must be a CUDA tensor")
     if out.device != result.device:
         raise ValueError("out must be on the same CUDA device as the result")
@@ -1072,11 +1072,17 @@ def _hipsparse_spmm_bsr_skip_reason(value_dtype, index_dtype, op="non"):
 
 def _spmm_bsr_sparse_ref_backend(value_dtype, index_dtype, op="non"):
     """Pick the vendor sparse library for a BSR SpMM reference, per backend."""
-    if _is_rocm_runtime():
+    vendor = _vendor_sparse_library()
+    if vendor == "hipsparse":
         reason = _hipsparse_spmm_bsr_skip_reason(value_dtype, index_dtype, op=op)
         if reason is None:
             return "hipsparse", None
         return None, reason
+    if vendor != "cupy_cusparse":
+        return (
+            None,
+            f"{_sparse_backend_label(vendor)} BSR SpMM baseline is not wired for this runner",
+        )
     if cp is None or cpx_sparse is None:
         return None, "CuPy/cuSPARSE is not available"
     if not hasattr(cpx_sparse, "bsr_matrix"):
@@ -1092,7 +1098,7 @@ def _prepare_spmm_bsr_ref_hipsparse(
         raise RuntimeError(skip_reason)
     if indptr.dtype != torch.int32:
         raise RuntimeError("hipSPARSE BSR SpMM requires int32 block indices/offsets")
-    if not all(t.is_cuda for t in (data, indices, indptr, B)):
+    if not all(_is_accel_tensor(t) for t in (data, indices, indptr, B)):
         raise ValueError("data, indices, indptr, B must all be CUDA tensors")
     if B.ndim != 2:
         raise ValueError("hipSPARSE BSR SpMM reference expects a 2D dense RHS")

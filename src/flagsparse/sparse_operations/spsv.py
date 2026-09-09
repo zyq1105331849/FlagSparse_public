@@ -108,6 +108,7 @@ SPSV_PROMOTE_TRANSPOSE_FP32_TO_FP64 = _spsv_env_flag(
 SPSV_PROMOTE_TRANSPOSE_COMPLEX64_TO_COMPLEX128 = _spsv_env_flag(
     "FLAGSPARSE_SPSV_PROMOTE_TRANSPOSE_COMPLEX64_TO_COMPLEX128", "0"
 )
+
 # DCU AUTO selects the optimized NON route unless explicitly disabled.
 SPSV_ROCM_ENABLE_ADVANCED_AUTO = _spsv_env_flag(
     "FLAGSPARSE_SPSV_ROCM_ENABLE_ADVANCED_AUTO", "1"
@@ -134,7 +135,8 @@ def _spsv_cu_capped_worker_count(n_rows, device, is_rocm):
         return 0
     if not is_rocm:
         return n_rows
-    cu_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
+
+    cu_count = int(_ACCEL.get_device_properties(device).multi_processor_count)
     # One persistent program per CU keeps the complete worker grid resident on
     # gfx936 while exposing enough independent rows to hide ready-flag latency.
     return min(n_rows, max(1, cu_count))
@@ -147,7 +149,7 @@ def _try_set_hipsparse_current_stream(handle):
 
     stream_ptr = _torch_current_stream_ptr()
     if stream_ptr is None:
-        return "could not resolve torch current CUDA/HIP stream pointer"
+        return "could not resolve torch current accelerator stream pointer"
 
     stream_args = []
     if HipPointer is not None:
@@ -374,9 +376,11 @@ def _hipsparse_spsv_skip_reason(
 
 
 def _spsv_csr_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None, op="non"):
-    """Pick hipSPARSE on ROCm/DCU or CuPy/cuSPARSE on CUDA."""
+
+    """Select the same-format vendor SpSV baseline for the active backend."""
     indptr_dtype = index_dtype if indptr_dtype is None else indptr_dtype
-    if _is_rocm_runtime():
+    vendor = _vendor_sparse_library()
+    if vendor == "hipsparse":
         reason = _hipsparse_spsv_skip_reason(
             value_dtype,
             index_dtype,
@@ -386,6 +390,11 @@ def _spsv_csr_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None, op
         if reason is None:
             return "hipsparse", None
         return None, reason
+
+    if vendor != "cupy_cusparse":
+        if vendor is None:
+            return None, f"no vendor sparse SpSV baseline is configured for {_backend_name()}"
+        return None, f"{vendor} SpSV baseline is not implemented"
     if cp is None or cpx_sparse is None:
         return None, "CuPy/cuSPARSE is not available"
     if value_dtype not in SUPPORTED_SPSV_VALUE_DTYPES:
@@ -635,8 +644,8 @@ def _prepare_spsv_csr_ref_hipsparse(
         raise RuntimeError(skip_reason)
     if not all(torch.is_tensor(t) for t in (data, indices, indptr, rhs)):
         raise TypeError("data, indices, indptr, rhs must all be torch.Tensor")
-    if not all(t.is_cuda for t in (data, indices, indptr, rhs)):
-        raise ValueError("data, indices, indptr, rhs must all be CUDA tensors")
+    if not all(_is_accel_tensor(t) for t in (data, indices, indptr, rhs)):
+        raise ValueError("data, indices, indptr, rhs must all be accelerator tensors")
     if not all(t.device == data.device for t in (indices, indptr, rhs)):
         raise ValueError("data, indices, indptr, rhs must be on the same CUDA device")
     if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1 or rhs.ndim != 1:
@@ -676,7 +685,7 @@ def _prepare_spsv_csr_ref_hipsparse(
     else:
         if not torch.is_tensor(solution):
             raise TypeError("out must be a torch.Tensor")
-        if not solution.is_cuda or solution.device != data.device:
+        if not _is_accel_tensor(solution) or solution.device != data.device:
             raise ValueError("out must be a CUDA tensor on the same device as data")
         if solution.dtype != data.dtype or solution.shape != rhs.shape:
             raise ValueError("out must match the solution shape and dtype")
@@ -755,9 +764,9 @@ def _prepare_spsv_csr_ref_hipsparse(
         buffer_start = None
         buffer_stop = None
         if measure_buffer_size:
-            torch.cuda.synchronize()
-            buffer_start = torch.cuda.Event(enable_timing=True)
-            buffer_stop = torch.cuda.Event(enable_timing=True)
+            _ACCEL.synchronize()
+            buffer_start = _ACCEL.Event(enable_timing=True)
+            buffer_stop = _ACCEL.Event(enable_timing=True)
             buffer_start.record()
         _hip_check_result(
             buffer_size_fn(
@@ -776,7 +785,7 @@ def _prepare_spsv_csr_ref_hipsparse(
         )
         if measure_buffer_size:
             buffer_stop.record()
-            torch.cuda.synchronize()
+            _ACCEL.synchronize()
             buffer_size_ms = buffer_start.elapsed_time(buffer_stop)
         else:
             buffer_size_ms = None
@@ -952,19 +961,20 @@ def _destroy_spsv_csr_ref_hipsparse_prepared(state):
             pass
 
 
+
 def _benchmark_spsv_hipsparse_stage(state, run_fn, warmup, iters, fmt):
     output = None
     for _ in range(max(0, int(warmup))):
         output = run_fn(state)
     times = []
     for _ in range(max(1, int(iters))):
-        torch.cuda.synchronize()
-        start_event = torch.cuda.Event(enable_timing=True)
-        stop_event = torch.cuda.Event(enable_timing=True)
+        _ACCEL.synchronize()
+        start_event = _ACCEL.Event(enable_timing=True)
+        stop_event = _ACCEL.Event(enable_timing=True)
         start_event.record()
         output = run_fn(state)
         stop_event.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         times.append(start_event.elapsed_time(stop_event))
     if str(fmt).upper() == "COO":
         avg = sum(times) / len(times)
@@ -1018,6 +1028,7 @@ def _benchmark_spsv_csr_sparse_ref(
         )
         return result
     try:
+
         state = _prepare_spsv_csr_ref_hipsparse(
             data,
             indices,
@@ -1066,8 +1077,8 @@ def _prepare_spsv_inputs(data, indices, indptr, b, shape):
     """Validate and normalize inputs for sparse solve A x = b with CSR A."""
     if not all(torch.is_tensor(t) for t in (data, indices, indptr, b)):
         raise TypeError("data, indices, indptr, b must all be torch.Tensor")
-    if not all(t.is_cuda for t in (data, indices, indptr, b)):
-        raise ValueError("data, indices, indptr, b must all be CUDA tensors")
+    if not all(_is_accel_tensor(t) for t in (data, indices, indptr, b)):
+        raise ValueError("data, indices, indptr, b must all be accelerator tensors")
     if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1:
         raise ValueError("data, indices, indptr must be 1D")
     if b.ndim != 1:
@@ -1138,8 +1149,8 @@ def _prepare_spsv_sell_matrix_inputs(
     tensors = (values, col_indices, slice_offsets)
     if not all(torch.is_tensor(t) for t in tensors):
         raise TypeError("SELL SpSV matrix inputs must be torch.Tensor")
-    if any(not t.is_cuda or t.ndim != 1 for t in tensors):
-        raise ValueError("SELL SpSV matrix inputs must be 1D CUDA tensors")
+    if any(not _is_accel_tensor(t) or t.ndim != 1 for t in tensors):
+        raise ValueError("SELL SpSV matrix inputs must be 1D accelerator tensors")
     if len({t.device for t in tensors}) != 1:
         raise ValueError("SELL SpSV matrix inputs must use one CUDA device")
 
@@ -1426,6 +1437,7 @@ def _build_spsv_workspace_layout(n_rows, solve_kind, value_dtype=None):
             _workspace_entry("indegree", n_rows, torch.int32),
             _workspace_entry("ready_queue", n_rows, torch.int32),
             _workspace_entry("queue_state", 2, torch.int32),
+
         )
     if solve_kind == "sell_trans_csc":
         return (
@@ -1887,6 +1899,8 @@ def _choose_spsv_nontrans_auto_route(
     # upper remains on the conservative ALG1 route for now.
     if _is_rocm_runtime() and not SPSV_ROCM_ENABLE_ADVANCED_AUTO:
         return "csr_cw"
+    if _is_maca_runtime() and not _maca_spsv_knob("enable_advanced_auto"):
+        return "csr_cw"
     if bool(unit_diagonal):
         return "csr_cw"
     n_rows = int(n_rows)
@@ -1978,6 +1992,7 @@ def _spsv_levelschd_analysis_kernel(
 
 
 @triton.jit
+
 def _spsv_levelschd_analysis_persistent_kernel(
     indices_ptr,
     indptr_ptr,
@@ -2065,6 +2080,7 @@ def _spsv_levelschd_analysis_persistent_kernel(
 
 
 def _build_spsv_level_schedule_metadata_rocm_gpu(
+
     indices64,
     indptr64,
     n_rows,
@@ -2098,6 +2114,7 @@ def _build_spsv_level_schedule_metadata_rocm_gpu(
     indices32 = indices64.to(torch.int32).contiguous()
     levels32 = torch.zeros(n_rows, dtype=torch.int32, device=device)
     indegree32 = torch.empty(n_rows, dtype=torch.int32, device=device)
+
     block_rows = 32
     n_blocks = triton.cdiv(n_rows, block_rows)
     ready32 = torch.zeros(n_rows, dtype=torch.int32, device=device)
@@ -2412,7 +2429,8 @@ def _build_spsv_level_schedule_metadata(
     if n_rows == 0:
         return empty_meta
 
-    if indices64.is_cuda:
+
+    if _is_accel_tensor(indices64):
         if _is_rocm_runtime():
             return _build_spsv_level_schedule_metadata_rocm_gpu(
                 indices64,
@@ -2681,6 +2699,7 @@ def _prepare_spsv_csr_system(
             if nnz_meta is not None and "kernel_indices32" in nnz_meta
             else indices64.to(torch.int32)
         )
+
         kernel_data = data
         kernel_indptr64 = indptr64
         cw_plan = {
@@ -2688,6 +2707,7 @@ def _prepare_spsv_csr_system(
             "default_solve_kind": default_solve_kind,
             "supported_solve_kinds": tuple(supported_solve_kinds),
             "nontrans_variant": nontrans_variant,
+
             "kernel_data": kernel_data,
             "kernel_indices32": kernel_indices32,
             "kernel_indptr64": kernel_indptr64,
@@ -2696,6 +2716,7 @@ def _prepare_spsv_csr_system(
             "matrix_stats": matrix_stats,
             "route_name": route_name,
         }
+
         if default_solve_kind == "csr_cw":
             cw_plan["cw_worker_count"] = _cw_worker_count(
                 n_rows,
@@ -2936,6 +2957,7 @@ def _spsv_csr_cw_kernel(
     REVERSE_ORDER: tl.constexpr,
     UNIT_DIAG: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
+
 ):
     logical_row = tl.atomic_add(row_counter_ptr, 1)
     while logical_row < n_rows:
@@ -3020,6 +3042,7 @@ def _spsv_csr_cw_kernel_complex(
     REVERSE_ORDER: tl.constexpr,
     UNIT_DIAG: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
+
 ):
     logical_row = tl.atomic_add(row_counter_ptr, 1)
     lane2 = tl.arange(0, 2)
@@ -3246,6 +3269,7 @@ def _spsv_sell_trans_queue_kernel(
             row_in_slice = row - slice_id * SLICE_SIZE
             slice_start = tl.load(slice_offsets_ptr + slice_id)
             row_width = tl.load(row_widths_ptr + row)
+
             rhs_atomic = tl.atomic_add(residual_ptr + row, 0.0)
             if USE_FP64_ACC:
                 rhs = rhs_atomic.to(tl.float64)
@@ -3338,6 +3362,7 @@ def _spsv_sell_trans_queue_complex_kernel(
             row_in_slice = row - slice_id * SLICE_SIZE
             slice_start = tl.load(slice_offsets_ptr + slice_id)
             row_width = tl.load(row_widths_ptr + row)
+
             rhs_re = tl.atomic_add(residual_ri_ptr + row * 2, 0.0)
             rhs_im = tl.atomic_add(residual_ri_ptr + row * 2 + 1, 0.0)
             if USE_FP64_ACC:
@@ -3878,6 +3903,7 @@ def _spsv_csr_transpose_cw_kernel(
     LOWER: tl.constexpr,
     REVERSE_ORDER: tl.constexpr,
     UNIT_DIAG: tl.constexpr,
+
     SERIAL_EXECUTION: tl.constexpr,
 ):
     logical_row = (
@@ -3950,6 +3976,7 @@ def _spsv_csr_transpose_cw_kernel_complex(
     UNIT_DIAG: tl.constexpr,
     CONJ_TRANS: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
+
     SERIAL_EXECUTION: tl.constexpr,
 ):
     logical_row = (
@@ -4139,6 +4166,7 @@ def _spsv_csr_roc_kernel(
     else:
         diag = diag.to(tl.float32)
     diag_val = tl.sum(diag, axis=0)
+
     out = tl.sum(local_sum, axis=0) / diag_val
     if LEVEL_SCHEDULED:
         tl.store(x_ptr + row, out)
@@ -4252,6 +4280,7 @@ def _spsv_csr_roc_kernel_complex(
     sum_re = tl.sum(local_sum_re, axis=0)
     sum_im = tl.sum(local_sum_im, axis=0)
     den = diag_re * diag_re + diag_im * diag_im
+
     out_re = (sum_re * diag_re + sum_im * diag_im) / den
     out_im = (sum_im * diag_re - sum_re * diag_im) / den
     if LEVEL_SCHEDULED:
@@ -4475,6 +4504,7 @@ def _spsv_csr_cw_levelschd_kernel(
                     diag = tl.load(data_ptr + ptr).to(tl.float64)
                 else:
                     diag = tl.load(data_ptr + ptr).to(tl.float32)
+
                 x_row = (rhs - tmp_sum) / diag
                 if LEVEL_SCHEDULED:
                     tl.store(x_ptr + row, x_row)
@@ -4563,6 +4593,7 @@ def _spsv_csr_cw_levelschd_kernel_complex(
                 sum_re = rhs_re - tmp_sum_re
                 sum_im = rhs_im - tmp_sum_im
                 den = diag_re * diag_re + diag_im * diag_im
+
                 out_re = (sum_re * diag_re + sum_im * diag_im) / den
                 out_im = (sum_im * diag_re - sum_re * diag_im) / den
                 if LEVEL_SCHEDULED:
@@ -4616,6 +4647,7 @@ def _spsv_csr_nnz_balance_kernel(
     nnz,
     LOWER: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
+
     PERSISTENT: tl.constexpr,
     NUM_WORKERS: tl.constexpr,
     BLOCK_NNZ: tl.constexpr,
@@ -4650,6 +4682,7 @@ def _spsv_csr_nnz_balance_kernel(
                 scope="gpu",
             )
             contribute = offdiag & (dep_ready == 1)
+
             # Keep the data read itself acquire-qualified.  On current DCU
             # Triton lowering, relying only on the ready flag's acquire can
             # expose stale x values under heavy cross-workgroup contention.
@@ -4711,6 +4744,7 @@ def _spsv_csr_nnz_balance_kernel(
                     sem="acquire",
                     scope="gpu",
                 ).to(tl.float32)
+
             out = (rhs - sum_val) / a
             # x is zeroed before every solve and each row has one diagonal
             # producer, so atomic_add publishes the single-writer result.
@@ -4750,6 +4784,7 @@ def _spsv_csr_nnz_balance_kernel_complex(
     nnz,
     LOWER: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
+
     PERSISTENT: tl.constexpr,
     NUM_WORKERS: tl.constexpr,
     BLOCK_NNZ: tl.constexpr,
@@ -4870,6 +4905,7 @@ def _spsv_csr_nnz_balance_kernel_complex(
             num_re = rhs_re - sum_re
             num_im = rhs_im - sum_im
             den = val_re * val_re + val_im * val_im
+
             out_re = (num_re * val_re + num_im * val_im) / den
             out_im = (num_im * val_re - num_re * val_im) / den
             tl.atomic_add(
@@ -4979,6 +5015,7 @@ def _triton_spsv_csr_cw_vector(
         matrix_stats = matrix_stats or {}
         worker_count = _resolve_cw_worker_count(n_rows, matrix_stats, 1)
     is_rocm = _is_rocm_runtime()
+
     if is_rocm:
         worker_count = _spsv_cu_capped_worker_count(n_rows, b_vec.device, True)
     use_fp64_acc = data.dtype == torch.float64
@@ -4996,6 +5033,7 @@ def _triton_spsv_csr_cw_vector(
         REVERSE_ORDER=not lower,
         UNIT_DIAG=unit_diagonal,
         USE_FP64_ACC=use_fp64_acc,
+
     )
     return x
 
@@ -5037,6 +5075,7 @@ def _triton_spsv_csr_cw_vector_complex(
         matrix_stats = matrix_stats or {}
         worker_count = _resolve_cw_worker_count(n_rows, matrix_stats, 1)
     is_rocm = _is_rocm_runtime()
+
     if is_rocm:
         worker_count = _spsv_cu_capped_worker_count(n_rows, b_vec.device, True)
     grid = (worker_count,)
@@ -5053,6 +5092,7 @@ def _triton_spsv_csr_cw_vector_complex(
         REVERSE_ORDER=not lower,
         UNIT_DIAG=unit_diagonal,
         USE_FP64_ACC=use_fp64,
+
     )
     return x
 
@@ -5210,6 +5250,7 @@ def _build_spsv_sell_trans_queue_metadata(
     }
 
 
+
 def _build_spsv_sell_trans_csc_metadata(
     values,
     col_indices,
@@ -5316,6 +5357,7 @@ def _launch_spsv_sell_trans_queue(
     if int(n_rows) == 0:
         return out
     is_complex = torch.is_complex(values)
+
     use_fp64_acc = residual_in.dtype in (torch.float64, torch.complex128)
     if is_complex:
         if values_ri_in is None:
@@ -5396,6 +5438,7 @@ def _launch_spsv_sell_trans_queue(
             BLOCK_SLOTS=int(block_slots),
             UNIT_DIAG=bool(unit_diagonal),
             USE_FP64_ACC=bool(use_fp64_acc),
+
             num_warps=1,
         )
     return out
@@ -5526,7 +5569,8 @@ def _triton_spsv_csr_n_lo_roc_vector(
         n_rows,
         LOWER=lower,
         USE_FP64_ACC=use_fp64_acc,
-        WARP_SIZE=32,
+
+        WARP_SIZE=_spsv_route_warp_size("alg3"),
         LEVEL_SCHEDULED=False,
         num_warps=1,
     )
@@ -5568,16 +5612,50 @@ def _triton_spsv_csr_n_lo_roc_vector_complex(
         n_rows,
         LOWER=lower,
         USE_FP64_ACC=use_fp64,
-        WARP_SIZE=32,
+
+        WARP_SIZE=_spsv_route_warp_size("alg3"),
         LEVEL_SCHEDULED=False,
         num_warps=1,
     )
     return x
 
 
+
 # Optional CUDA SMBLK (ALG4) persistent-worker variant used only for explicit
 # A/B testing through FLAGSPARSE_SPSV_SMBLK_KERNEL=persistent.  DCU rejects
 # csr_smblk at route normalization and cannot reach this kernel.
+# MetaX/MACA tuning profiles. DCU/ROCm has explicit SPSV_ROCM_* knobs above;
+# other backends keep their own conservative launch choices.
+_MACA_SPSV_PROFILES = {
+    "c550": {
+        "smblk_persistent": False,
+        "enable_advanced_auto": True,
+        "alg3_warp_size": 64,
+        "alg4_warp_size": 64,
+        "cw_serial": False,
+    },
+}
+_MACA_SPSV_DEFAULT_PROFILE = "c550"
+
+
+def _maca_spsv_knob(name):
+    """Read one MetaX SpSV tuning knob for the current model."""
+    model = _maca_device_model() or _MACA_SPSV_DEFAULT_PROFILE
+    profile = _MACA_SPSV_PROFILES.get(
+        model, _MACA_SPSV_PROFILES[_MACA_SPSV_DEFAULT_PROFILE]
+    )
+    return profile[name]
+
+
+def _spsv_route_warp_size(kind):
+    if _is_maca_runtime():
+        return _maca_spsv_knob(f"{kind}_warp_size")
+    return 32
+
+
+# Optional CUDA/MACA SMBLK (ALG4) persistent-worker variant used only for
+# explicit A/B testing through FLAGSPARSE_SPSV_SMBLK_KERNEL=persistent.
+# DCU rejects csr_smblk at route normalization and cannot reach this kernel.
 
 @triton.jit
 def _spsv_csr_smblk_persistent_kernel(
@@ -5762,7 +5840,8 @@ def _spsv_csr_smblk_persistent_kernel_complex(
 
 
 def _spsv_smblk_use_persistent():
-    """Whether CUDA ALG4 uses its optional persistent-worker kernel.
+
+    """Whether ALG4 uses its optional persistent-worker kernel.
 
     Override with FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog|persistent for A/B.
     """
@@ -5774,6 +5853,9 @@ def _spsv_smblk_use_persistent():
             "FLAGSPARSE_SPSV_SMBLK_KERNEL must be 'rowprog' or 'persistent', "
             f"got {override!r}"
         )
+
+    if _is_maca_runtime():
+        return _maca_spsv_knob("smblk_persistent")
     return False
 
 
@@ -5796,6 +5878,7 @@ def _triton_spsv_csr_n_lo_smblk_vector(
         return x
     use_fp64_acc = data.dtype == torch.float64
     if _spsv_smblk_use_persistent():
+
         worker_count = _spsv_cu_capped_worker_count(n_rows, b_vec.device, False)
         _spsv_csr_smblk_persistent_kernel[(worker_count,)](
             data,
@@ -5808,7 +5891,8 @@ def _triton_spsv_csr_n_lo_smblk_vector(
             LOWER=lower,
             REVERSE_ORDER=not lower,
             USE_FP64_ACC=use_fp64_acc,
-            WARP_SIZE=32,
+
+            WARP_SIZE=_spsv_route_warp_size("alg4"),
             NUM_WORKERS=worker_count,
             SERIAL_EXECUTION=False,
             num_warps=1,
@@ -5825,7 +5909,8 @@ def _triton_spsv_csr_n_lo_smblk_vector(
         LOWER=lower,
         REVERSE_ORDER=not lower,
         USE_FP64_ACC=use_fp64_acc,
-        WARP_SIZE=32,
+
+        WARP_SIZE=_spsv_route_warp_size("alg4"),
         num_warps=1,
     )
     return x
@@ -5855,6 +5940,7 @@ def _triton_spsv_csr_n_lo_smblk_vector_complex(
     component_dtype = _component_dtype_for_complex(data.dtype)
     use_fp64 = component_dtype == torch.float64
     if _spsv_smblk_use_persistent():
+
         worker_count = _spsv_cu_capped_worker_count(n_rows, b_vec.device, False)
         _spsv_csr_smblk_persistent_kernel_complex[(worker_count,)](
             data_ri,
@@ -5867,7 +5953,8 @@ def _triton_spsv_csr_n_lo_smblk_vector_complex(
             LOWER=lower,
             REVERSE_ORDER=not lower,
             USE_FP64_ACC=use_fp64,
-            WARP_SIZE=32,
+
+            WARP_SIZE=_spsv_route_warp_size("alg4"),
             NUM_WORKERS=worker_count,
             SERIAL_EXECUTION=False,
             num_warps=1,
@@ -5884,7 +5971,8 @@ def _triton_spsv_csr_n_lo_smblk_vector_complex(
         LOWER=lower,
         REVERSE_ORDER=not lower,
         USE_FP64_ACC=use_fp64,
-        WARP_SIZE=32,
+
+        WARP_SIZE=_spsv_route_warp_size("alg4"),
         num_warps=1,
     )
     return x
@@ -5898,6 +5986,7 @@ def _triton_spsv_csr_n_lo_cw_levelschd_vector(
     b_vec,
     n_rows,
     *,
+
     ready_in=None,
     level_ptr=None,
     level_ptr_host=None,
@@ -5934,6 +6023,7 @@ def _triton_spsv_csr_n_lo_cw_levelschd_vector(
                 count,
                 LEVEL_SCHEDULED=True,
                 USE_FP64_ACC=use_fp64_acc,
+
                 num_warps=1,
             )
     else:
@@ -5948,6 +6038,7 @@ def _triton_spsv_csr_n_lo_cw_levelschd_vector(
             n_rows,
             LEVEL_SCHEDULED=False,
             USE_FP64_ACC=use_fp64_acc,
+
             num_warps=1,
         )
     return x
@@ -5961,6 +6052,7 @@ def _triton_spsv_csr_n_lo_cw_levelschd_vector_complex(
     b_vec,
     n_rows,
     *,
+
     data_ri_in=None,
     ready_in=None,
     level_ptr=None,
@@ -6004,6 +6096,7 @@ def _triton_spsv_csr_n_lo_cw_levelschd_vector_complex(
                 count,
                 LEVEL_SCHEDULED=True,
                 USE_FP64_ACC=use_fp64,
+
                 num_warps=1,
             )
     else:
@@ -6018,6 +6111,7 @@ def _triton_spsv_csr_n_lo_cw_levelschd_vector_complex(
             n_rows,
             LEVEL_SCHEDULED=False,
             USE_FP64_ACC=use_fp64,
+
             num_warps=1,
         )
     return x
@@ -6051,11 +6145,13 @@ def _spsv_nnz_balance_launch_config(nnz, device):
 
     is_rocm = _is_rocm_runtime()
     if not is_rocm:
+        if _is_maca_runtime():
+            return False, 1, int(nnz), 1
         # Match allinone CUDA: 256 threads per block, one NNZ per lane.
         return False, 256, triton.cdiv(int(nnz), 256), 8
 
     block_nnz = SPSV_ROCM_ALG3_BLOCK_NNZ
-    cu_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    cu_count = int(_ACCEL.get_device_properties(device).multi_processor_count)
     worker_cap = cu_count * SPSV_ROCM_ALG3_WORKGROUPS_PER_CU
     worker_count = min(triton.cdiv(nnz, block_nnz), max(1, worker_cap))
     num_warps = max(1, block_nnz // 64)
@@ -6072,6 +6168,7 @@ def _triton_spsv_csr_n_lo_nnz_balance_vector(
     n_rows,
     *,
     lower=True,
+
     tmp_sum_in,
     ready_in,
     indegree_in,
@@ -6088,6 +6185,7 @@ def _triton_spsv_csr_n_lo_nnz_balance_vector(
     )
     use_fp64_acc = acc_dtype == torch.float64
     nnz = int(data.numel())
+
     # CUDA assigns 256 NNZs to each 8-warp program. DCU uses a bounded
     # persistent grid; the measured default uses four workgroups per CU, while the
     # environment-controlled multiplier enables occupancy experiments without
@@ -6109,6 +6207,7 @@ def _triton_spsv_csr_n_lo_nnz_balance_vector(
         nnz,
         LOWER=lower,
         USE_FP64_ACC=use_fp64_acc,
+
         PERSISTENT=is_rocm,
         NUM_WORKERS=worker_count,
         BLOCK_NNZ=block_nnz,
@@ -6127,6 +6226,7 @@ def _triton_spsv_csr_n_lo_nnz_balance_vector_complex(
     n_rows,
     *,
     lower=True,
+
     data_ri_in,
     tmp_sum_in,
     ready_in,
@@ -6166,6 +6266,7 @@ def _triton_spsv_csr_n_lo_nnz_balance_vector_complex(
         nnz,
         LOWER=lower,
         USE_FP64_ACC=use_fp64,
+
         PERSISTENT=is_rocm,
         NUM_WORKERS=worker_count,
         BLOCK_NNZ=block_nnz,
@@ -6245,6 +6346,7 @@ def _triton_spsv_csr_transpose_cw_vector(
         LOWER=lower,
         REVERSE_ORDER=not lower,
         UNIT_DIAG=unit_diagonal,
+
         SERIAL_EXECUTION=serial_execution,
     )
     return x
@@ -6338,6 +6440,7 @@ def _triton_spsv_csr_transpose_cw_vector_complex(
         UNIT_DIAG=unit_diagonal,
         CONJ_TRANS=conjugate,
         USE_FP64_ACC=use_fp64,
+
         SERIAL_EXECUTION=serial_execution,
     )
     if component_dtype == torch.float16:
@@ -6392,8 +6495,8 @@ def _run_spsv_csc_preprocess(
 def _prepare_spsv_coo_inputs(data, row, col, b, shape):
     if not all(torch.is_tensor(t) for t in (data, row, col, b)):
         raise TypeError("data, row, col, b must all be torch.Tensor")
-    if not all(t.is_cuda for t in (data, row, col, b)):
-        raise ValueError("data, row, col, b must all be CUDA tensors")
+    if not all(_is_accel_tensor(t) for t in (data, row, col, b)):
+        raise ValueError("data, row, col, b must all be accelerator tensors")
     if data.ndim != 1 or row.ndim != 1 or col.ndim != 1:
         raise ValueError("data, row, col must be 1D")
     if row.numel() != data.numel() or col.numel() != data.numel():
@@ -6619,7 +6722,7 @@ def _analyze_spsv_csr(
     if clear_cache:
         _clear_spsv_csr_preprocess_cache()
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t0 = time.perf_counter()
     (
         _data,
@@ -6644,7 +6747,7 @@ def _analyze_spsv_csr(
         solve_plan, trans_mode, requested_solve_kind=solve_kind
     )
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         return (time.perf_counter() - t0) * 1000.0
 
 
@@ -6784,7 +6887,7 @@ def _execute_spsv_csr_plan(
         raise RuntimeError(f"unexpected SpSV solve kind: {solve_kind}")
 
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t0 = time.perf_counter()
     worker_count_use = cw_worker_count
     matrix_stats_use = dict(matrix_stats)
@@ -6799,6 +6902,9 @@ def _execute_spsv_csr_plan(
     # polling entirely. Both NON and TRANS use it on ROCm; CUDA retains its
     # existing multi-worker schedule.
     if solve_kind in ("csr_cw", "transpose_cw") and _is_rocm_runtime():
+
+        worker_count_use = 1
+    if solve_kind == "csr_cw" and _is_maca_runtime() and _maca_spsv_knob("cw_serial"):
         worker_count_use = 1
     complex_kernel_data_ri = None
     if torch.is_complex(data_in):
@@ -6835,7 +6941,7 @@ def _execute_spsv_csr_plan(
             max_segments_use,
         )
         preprocess_stream_ctx = (
-            torch.cuda.stream(solve_stream)
+            _ACCEL.stream(solve_stream)
             if solve_stream is not None
             else nullcontext()
         )
@@ -6855,7 +6961,7 @@ def _execute_spsv_csr_plan(
             workspace.prepared_solve_kind = "transpose_cw"
             workspace.prepared_signature = transpose_sig
     stream_ctx = (
-        torch.cuda.stream(solve_stream)
+        _ACCEL.stream(solve_stream)
         if solve_stream is not None
         else nullcontext()
     )
@@ -6917,6 +7023,7 @@ def _execute_spsv_csr_plan(
                     level_row_map32,
                     b_in,
                     n_rows,
+
                     data_ri_in=complex_kernel_data_ri,
                     ready_in=ready_buf,
                     level_ptr=level_ptr32,
@@ -7000,6 +7107,7 @@ def _execute_spsv_csr_plan(
                 level_row_map32,
                 b_in,
                 n_rows,
+
                 ready_in=ready_buf,
                 level_ptr=level_ptr32,
                 level_ptr_host=level_ptr_host,
@@ -7034,7 +7142,7 @@ def _execute_spsv_csr_plan(
     if x.dtype != target_dtype:
         x = x.to(target_dtype)
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
     if out is not None:
         if out.shape != x.shape or out.dtype != x.dtype:
@@ -7069,7 +7177,7 @@ def flagsparse_spsv_solve_csr(
         raise ValueError("descr must reference a CSR-canonicalized SpSV analysis")
     if not torch.is_tensor(b):
         raise TypeError("b must be a torch.Tensor")
-    if not b.is_cuda:
+    if not _is_accel_tensor(b):
         raise ValueError("b must be a CUDA tensor")
     if b.ndim != 1:
         raise ValueError("b must be a 1D dense vector (DnVec)")
@@ -7450,6 +7558,7 @@ def flagsparse_spsv_analysis_sell(
         if alg2_worker_count is not None:
             raise ValueError("SELL TRANS/CONJ do not accept worker-count tuning")
         if trans_analysis is None:
+
             if trans_alg_num == SPSV_SELL_ALG1:
                 queue_meta = _build_spsv_sell_trans_queue_metadata(
                     cols,
@@ -7481,6 +7590,7 @@ def flagsparse_spsv_analysis_sell(
                     trans_analysis,
                     _SPSV_SELL_TRANS_ANALYSIS_CACHE_SIZE,
                 )
+
         solve_kind = (
             "sell_trans_queue"
             if trans_alg_num == SPSV_SELL_ALG1
@@ -7507,6 +7617,7 @@ def flagsparse_spsv_analysis_sell(
         solve_plan["trans_worker_count"] = int(trans_analysis["worker_count"])
         solve_plan["alg_num"] = int(trans_alg_num)
     else:
+
         solve_plan["trans_csc_data"] = trans_analysis["data"]
         solve_plan["trans_csc_indices"] = trans_analysis["indices"]
         solve_plan["trans_csc_indptr"] = trans_analysis["indptr"]
@@ -7558,7 +7669,7 @@ def flagsparse_spsv_solve_sell(
         raise ValueError("descr must reference a SELL SpSV analysis")
     if not torch.is_tensor(b):
         raise TypeError("b must be a torch.Tensor")
-    if not b.is_cuda or b.ndim != 1:
+    if not _is_accel_tensor(b) or b.ndim != 1:
         raise ValueError("b must be a 1D CUDA tensor")
     if b.device != descr.data.device:
         raise ValueError("b device must match the analyzed SELL matrix")
@@ -7571,7 +7682,7 @@ def flagsparse_spsv_solve_sell(
         out = torch.empty_like(b)
     elif (
         not torch.is_tensor(out)
-        or not out.is_cuda
+        or not _is_accel_tensor(out)
         or out.ndim != 1
         or not out.is_contiguous()
         or out.device != b.device
@@ -7586,6 +7697,7 @@ def flagsparse_spsv_solve_sell(
     )
     plan = descr.solve_plan
     if descr.transpose_mode in ("T", "C"):
+
         if descr.solve_kind == "sell_trans_csc":
             return _launch_spsv_sell_trans_csc(
                 plan["trans_csc_data"],
@@ -7641,6 +7753,38 @@ def flagsparse_spsv_solve_sell(
         values_ri_in=plan.get("kernel_data_ri"),
     )
 
+
+
+def flagsparse_spsv_sell(
+    values,
+    col_indices,
+    slice_offsets,
+    b,
+    shape,
+    *,
+    slice_size,
+    alg_num=None,
+    alg2_worker_count=None,
+    unit_diagonal=False,
+    transpose=False,
+    out=None,
+    workspace=None,
+):
+    """Analyze and solve a lower SELL SpSV problem."""
+
+    descr = flagsparse_spsv_analysis_sell(
+        values,
+        col_indices,
+        slice_offsets,
+        shape,
+        slice_size=slice_size,
+        alg_num=alg_num,
+        alg2_worker_count=alg2_worker_count,
+        unit_diagonal=unit_diagonal,
+        transpose=transpose,
+        workspace=workspace,
+    )
+    return flagsparse_spsv_solve_sell(descr, b, out=out, workspace=workspace)
 
 def flagsparse_spsv_csr(
     data,

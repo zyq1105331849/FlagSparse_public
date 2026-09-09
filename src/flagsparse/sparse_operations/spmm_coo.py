@@ -295,11 +295,17 @@ def _prepare_spmm_coo_canonical_inputs(data, row, col, B, shape, dense_layout="r
 
 
 def _spmm_coo_sparse_ref_backend(value_dtype, index_dtype):
-    if _is_rocm_runtime():
+    vendor = _vendor_sparse_library()
+    if vendor == "hipsparse":
         reason = _hipsparse_spmm_coo_skip_reason(value_dtype, index_dtype)
         if reason is None:
             return "hipsparse", None
         return None, reason
+    if vendor != "cupy_cusparse":
+        return (
+            None,
+            f"{_sparse_backend_label(vendor)} COO SpMM baseline is not wired for this runner",
+        )
     if cp is None or cpx_sparse is None:
         return None, "CuPy/cuSPARSE is not available"
     skip_reason = _cusparse_baseline_skip_reason(value_dtype)
@@ -357,7 +363,7 @@ def _prepare_spmm_coo_ref_hipsparse(
         raise RuntimeError(skip_reason)
     if not all(torch.is_tensor(t) for t in (data, row, col, B)):
         raise TypeError("data, row, col, B must all be torch.Tensor")
-    if not all(t.is_cuda for t in (data, row, col, B)):
+    if not all(_is_accel_tensor(t) for t in (data, row, col, B)):
         raise ValueError("data, row, col, B must all be CUDA tensors")
     if not all(t.device == data.device for t in (row, col, B)):
         raise ValueError("data, row, col, B must be on the same CUDA device")
@@ -410,7 +416,7 @@ def _prepare_spmm_coo_ref_hipsparse(
     else:
         if not torch.is_tensor(C):
             raise TypeError("out must be a torch.Tensor")
-        if not C.is_cuda or C.device != data.device:
+        if not _is_accel_tensor(C) or C.device != data.device:
             raise ValueError("out must be a CUDA tensor on the same device as data")
         if C.dtype != data.dtype or C.shape != (n_rows, n_dense_cols):
             raise ValueError("out must match the result shape and dtype")
@@ -676,8 +682,12 @@ def _benchmark_spmm_coo_sparse_ref(data, row, col, B, shape, warmup, iters):
     col_cp = _cupy_from_torch(col.to(torch.int64))
     B_cp = _cupy_from_torch(B)
     A_coo = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
+    # cupy COO ``@`` calls tocsr() internally on every invocation
+    # (cupyx.scipy.sparse._base.__mul__), so the conversion is hoisted here and the
+    # timed window holds only the SpMM kernel.
+    A_csr = A_coo.tocsr()
     values_cp, ms = _benchmark_cuda_op(
-        lambda: A_coo @ B_cp,
+        lambda: A_csr @ B_cp,
         warmup=warmup,
         iters=iters,
     )
@@ -1077,7 +1087,7 @@ def _prepare_spmm_coo_inputs(data, row, col, B, shape, dense_layout="row"):
     if B.shape[0] != n_cols:
         raise ValueError(f"B.shape[0] must be n_cols={n_cols}, got {B.shape[0]}")
 
-    if not all(t.is_cuda for t in (data, row, col, B)):
+    if not all(_is_accel_tensor(t) for t in (data, row, col, B)):
         raise ValueError("data, row, col, and B must be CUDA tensors")
     if not all(t.device == data.device for t in (row, col, B)):
         raise ValueError("data, row, col, and B must be on the same CUDA device")
@@ -1499,7 +1509,7 @@ def _prepare_spmm_coo_matrix(data, row, col, shape):
         raise ValueError("shape dimensions must be non-negative")
     if data.numel() != row.numel() or data.numel() != col.numel():
         raise ValueError("data, row, and col must have the same length (nnz)")
-    if not all(t.is_cuda for t in (data, row, col)):
+    if not all(_is_accel_tensor(t) for t in (data, row, col)):
         raise ValueError("data, row, and col must be CUDA tensors")
     if not all(t.device == data.device for t in (row, col)):
         raise ValueError("data, row, and col must be on the same CUDA device")
@@ -1551,7 +1561,7 @@ def _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout):
         raise TypeError("B must be a torch.Tensor")
     if B.ndim != 2:
         raise ValueError("B must be a 2D dense tensor")
-    if not B.is_cuda:
+    if not _is_accel_tensor(B):
         raise ValueError("B must be a CUDA tensor")
     if B.device != prepared.data.device:
         raise ValueError("B must be on the same CUDA device as sparse matrix data")
@@ -1579,8 +1589,8 @@ def _run_spmm_coo_rowrun_route(
     )
     compute_ms = None
     if timing:
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = _ACCEL.Event(enable_timing=True)
+        end = _ACCEL.Event(enable_timing=True)
         start.record()
     C = _triton_spmm_coo_rowrun_impl(
         prepared.data,
@@ -1597,7 +1607,7 @@ def _run_spmm_coo_rowrun_route(
     )
     if timing:
         end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         compute_ms = start.elapsed_time(end)
     meta = {
         "alg": "coo_rowrun",
@@ -1645,8 +1655,8 @@ def _run_spmm_coo_atomic_route(
     )
     compute_ms = None
     if timing:
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = _ACCEL.Event(enable_timing=True)
+        end = _ACCEL.Event(enable_timing=True)
         start.record()
     C = _triton_spmm_coo_atomic_impl(
         prepared.data,
@@ -1662,7 +1672,7 @@ def _run_spmm_coo_atomic_route(
     )
     if timing:
         end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         compute_ms = start.elapsed_time(end)
     meta = {
         "alg": "coo_atomic",
@@ -1701,7 +1711,7 @@ def _run_spmm_coo_atomic_route(
 
 
 def _spmm_coo_alg1_build_bucket_descriptors(segs_flat, counts, offsets):
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     t0 = time.perf_counter()
     counts_cpu = counts.detach().cpu().tolist()
     offsets_cpu = offsets.detach().cpu().tolist()
@@ -1741,8 +1751,8 @@ def _run_spmm_coo_alg1_route(
     grid = (triton.cdiv(prepared.n_segs, block_m),)
     process_gpu_ms = None
     if timing:
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = _ACCEL.Event(enable_timing=True)
+        end = _ACCEL.Event(enable_timing=True)
         start.record()
     if prepared.n_segs > 0:
         _spmm_coo_alg1_process_count_kernel[grid](
@@ -1769,10 +1779,10 @@ def _run_spmm_coo_alg1_route(
         )
     if timing:
         end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         process_gpu_ms = start.elapsed_time(end)
     else:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
     buckets, process_cpu_ms = _spmm_coo_alg1_build_bucket_descriptors(
         segs_flat, counts, offsets
     )
@@ -1786,8 +1796,8 @@ def _run_spmm_coo_alg1_route(
     acc_dtype = tl.float64 if prepared.compute_dtype == torch.float64 else tl.float32
     compute_ms = None
     if timing:
-        compute_start = torch.cuda.Event(enable_timing=True)
-        compute_end = torch.cuda.Event(enable_timing=True)
+        compute_start = _ACCEL.Event(enable_timing=True)
+        compute_end = _ACCEL.Event(enable_timing=True)
         compute_start.record()
     for bucket in buckets:
         n_bucket = int(bucket["count"])
@@ -1815,7 +1825,7 @@ def _run_spmm_coo_alg1_route(
         )
     if timing:
         compute_end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         compute_ms = compute_start.elapsed_time(compute_end)
     if prepared.compute_dtype != prepared.output_dtype:
         C = C_compute.to(prepared.output_dtype)
@@ -1985,11 +1995,11 @@ def flagsparse_spmm_coo_run(
     algorithm = resolve_spmm_coo_algorithm(alg_name, prepared.op, prepared.output_dtype)
     dense_layout = _normalize_dense_layout(dense_layout)
     start = (
-        torch.cuda.Event(enable_timing=True) if (return_time or return_meta) else None
+        _ACCEL.Event(enable_timing=True) if (return_time or return_meta) else None
     )
-    end = torch.cuda.Event(enable_timing=True) if (return_time or return_meta) else None
+    end = _ACCEL.Event(enable_timing=True) if (return_time or return_meta) else None
     if start is not None:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         start.record()
     C, route_meta = algorithm.run(
         prepared,
@@ -2000,7 +2010,7 @@ def flagsparse_spmm_coo_run(
     )
     if end is not None:
         end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         gpu_ms = start.elapsed_time(end)
     else:
         gpu_ms = None
@@ -2060,13 +2070,13 @@ def _run_spmm_coo_canonical_route(
     )
 
     if out is not None:
-        if not out.is_cuda:
+        if not _is_accel_tensor(out):
             raise ValueError("out must be a CUDA tensor")
         if out.device != canonical_data.device:
             raise ValueError("out must be on the same CUDA device as the inputs")
         if out.shape != (n_rows, n_dense_cols) or out.dtype != output_dtype:
             raise ValueError("out shape/dtype must match result")
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     t0 = time.perf_counter()
     C = _triton_spmm_coo_impl(
         canonical_data,
@@ -2082,7 +2092,7 @@ def _run_spmm_coo_canonical_route(
         out=out,
         dense_layout=dense_layout,
     )
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
     if return_time:
@@ -2131,11 +2141,11 @@ def _run_spmm_coo_route(
     op_total_ms = None
 
     if do_timing:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t0 = time.perf_counter()
     data, row, col, shape = _materialize_spmm_coo_op(data, row, col, shape, op_code)
     if do_timing:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         symbolic_ms = (
             (time.perf_counter() - t0) * 1000.0
             if _spmm_coo_op_transposes(op_code)
@@ -2329,10 +2339,10 @@ def _benchmark_spmm_coo_canonical_route(
         route=route,
     )
 
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     t0 = time.perf_counter()
     _ = op()
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     first_call_ms = (time.perf_counter() - t0) * 1000.0
     values, steady_ms = _benchmark_cuda_op(op, warmup=warmup, iters=iters)
     return values, steady_ms, first_call_ms
@@ -2367,10 +2377,10 @@ def _benchmark_spmm_coo_route(
         op=op,
         dense_layout=dense_layout,
     )
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     t0 = time.perf_counter()
     _ = run()
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     first_call_ms = (time.perf_counter() - t0) * 1000.0
     values, steady_ms = _benchmark_cuda_op(run, warmup=warmup, iters=iters)
     return values, steady_ms, first_call_ms
@@ -2546,9 +2556,6 @@ def benchmark_spmm_coo_case(
         value_dtype, cusparse_row.dtype
     )
     if run_cusparse and sparse_ref_backend == "hipsparse":
-        # DCU/ROCm: hipSPARSE COO SpMM stands in for the cuSPARSE baseline. The
-        # op has already been materialized into cusparse_row/col/data above, so the
-        # non-transpose hipSPARSE entry point covers every op here.
         try:
             cusparse_values, cusparse_ms = _benchmark_prepared_cuda_op(
                 lambda: _prepare_spmm_coo_ref_hipsparse(
@@ -2565,6 +2572,8 @@ def benchmark_spmm_coo_case(
             cusparse_match = cusparse_summary["match"]
         except Exception as exc:
             cusparse_reason = str(exc)
+    elif run_cusparse and sparse_ref_backend is None:
+        cusparse_reason = sparse_ref_reason or "vendor sparse baseline is unavailable"
     elif run_cusparse:
         if cp is None or cpx_sparse is None:
             cusparse_reason = sparse_ref_reason or "CuPy/cuSPARSE is not available"
@@ -2579,8 +2588,11 @@ def benchmark_spmm_coo_case(
                 A_coo = cpx_sparse.coo_matrix(
                     (data_cp, (row_cp, col_cp)), shape=effective_shape
                 )
+                # cupy COO ``@`` runs tocsr() internally each call; hoist it so only
+                # the SpMM kernel is timed.
+                A_csr = A_coo.tocsr()
                 cusparse_values_cp, cusparse_ms = _benchmark_cuda_op(
-                    lambda: A_coo @ B_cp, warmup=warmup, iters=iters
+                    lambda: A_csr @ B_cp, warmup=warmup, iters=iters
                 )
                 cusparse_values = _torch_from_cupy(cusparse_values_cp)
                 cusparse_summary = _spmm_coo_pairwise_summary(

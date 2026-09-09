@@ -36,6 +36,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
+from flagsparse.sparse_operations import _common as fs_common
 from flagsparse.sparse_operations import spmm_csr as spmm_ops
 from baseline_backend import (
     expected_vendor_label,
@@ -422,10 +423,6 @@ def _cupy_csc_unavailable_reason():
     return None
 
 
-def _is_rocm_runtime_for_tests():
-    return getattr(torch.version, "hip", None) is not None
-
-
 def _time_cusparse_csc(data, indices, indptr, B, shape, op, layout, warmup, iters):
     backend, backend_reason = spmm_ops._spmm_csc_sparse_ref_backend(
         data.dtype, indices.dtype, indptr.dtype
@@ -445,8 +442,20 @@ def _time_cusparse_csc(data, indices, indptr, B, shape, op, layout, warmup, iter
         if ref["values"] is None:
             return None, ref["reason"] or "hipSPARSE CSC SpMM reference skipped", None
         return ref["ms"], None, ref["values"]
-    if backend is None and _is_rocm_runtime_for_tests():
+    if backend is None:
         return None, backend_reason, None
+    if op != "non":
+        return (
+            None,
+            f"CuPy/cuSPARSE CSC SpMM baseline supports op=non only in this runner; op={op} is unsupported",
+            None,
+        )
+    if layout != "row":
+        return (
+            None,
+            f"CuPy/cuSPARSE CSC SpMM baseline supports row-major dense RHS only in this runner; layout={layout} is unsupported",
+            None,
+        )
     reason = _cupy_csc_unavailable_reason()
     if reason:
         return None, reason, None
@@ -580,38 +589,29 @@ def _resolve_input_paths(input_paths):
 
 
 def _print_notes(run_cusparse):
-    vendor_backend = None
-    vendor_reason = None
-    if run_cusparse:
-        vendor_backend, vendor_reason = spmm_ops._spmm_csc_sparse_ref_backend(
-            VALUE_DTYPES[0], INDEX_DTYPES[0], INDEX_DTYPES[0]
-        )
-    print_backend_summary(
+    vendor_backend, vendor_reason = spmm_ops._spmm_csc_sparse_ref_backend(
+        torch.float32, torch.int32, torch.int32
+    )
+    for line in fs_common._backend_summary_lines(
         op_name="SpMM CSC",
         native_format="CSC",
         correctness_ref="Ref=torch_spmm_coo",
         vendor_backend=vendor_backend,
         vendor_reason=vendor_reason,
         run_vendor=run_cusparse,
-    )
+    ):
+        print(line)
     print("FlagSparse CSC SpMM supports native op=non/trans/conj without CSR/COO conversion.")
     print("Accuracy reference: Ref=torch_spmm_coo expands the same CSC arrays to COO and runs torch.sparse.mm; this is correctness-only, not the FlagSparse compute path.")
     print("PyTorch CSC SpMM baseline: unavailable; torch.sparse.mm documents CSC @ Dense as unsupported, so no PyTorch CSC fallback is used.")
     if run_cusparse:
-        if _is_rocm_runtime_for_tests():
-            print(
-                "hipSPARSE CSC baseline: HS(ms) uses hipSPARSE CSC SpMM when the "
-                "installed backend supports the requested op/layout; unsupported "
-                "combinations report HS=N/A with reason."
-            )
+        vendor_short = fs_common._expected_vendor_sparse_short()
+        if vendor_backend == "hipsparse":
+            print(f"hipSPARSE CSC baseline: {vendor_short}(ms) uses direct hipSPARSE CSC SpMM when supported.")
         elif (reason := _cupy_csc_unavailable_reason()):
-            print(f"{expected_vendor_label()} CSC baseline: unavailable ({reason}); {expected_vendor_short()}(ms)=N/A.")
+            print(f"{fs_common._expected_vendor_sparse_label()} CSC baseline: unavailable ({reason}); {vendor_short}(ms)=N/A.")
         else:
-            print(
-                f"{expected_vendor_label()} CSC baseline: {expected_vendor_short()}(ms) "
-                "uses cupyx.scipy.sparse.csc_matrix @ dense for op=non,row; "
-                "other op/layout combinations report N/A with reason."
-            )
+            print(f"CuPy CSC baseline: {vendor_short}(ms) uses cupyx.scipy.sparse.csc_matrix @ dense for op=non/layout=row.")
     else:
         print("Vendor CSC baseline disabled by --no-cusparse; vendor ms=N/A.")
     print("Timing policy: ms = process_cpu_ms + gpu_ms; CSC SpMM v1 has no process phase.")
@@ -646,7 +646,17 @@ def main():
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument("--timing", action="store_true")
-    parser.add_argument("--no-cusparse", action="store_true")
+    parser.add_argument(
+        "--no-cusparse",
+        action="store_true",
+        help="Disable vendor sparse reference (cuSPARSE on CUDA, hipSPARSE on ROCm)",
+    )
+    parser.add_argument(
+        "--no-hipsparse",
+        dest="no_cusparse",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
 
@@ -659,6 +669,7 @@ def main():
     layouts = _layout_names(args.layout)
     run_cusparse = not args.no_cusparse
     _print_notes(run_cusparse)
+    vendor_short = fs_common._expected_vendor_sparse_short()
 
     fields = PERF_FIELDS + (TIMING_FIELDS if args.timing else [])
     rows = []
@@ -676,8 +687,8 @@ def main():
         print(
             f"{'Matrix':<28} {'DType':<10} {'Index':<5} {'Op':<5} {'Lay':<4} {'Alg':<14} "
             f"{'Rows':>7} {'Cols':>7} {'NNZ':>9} {'DCols':>5} "
-            f"{'MS':>9} {'GPU':>9} {'CPUProc':>9} {expected_vendor_short():>9} {('V/Alg'):>8} "
-            f"{'Err':>10} {('Err' + expected_vendor_short()):>10} {'Status':>6}"
+            f"{'MS':>9} {'GPU':>9} {'CPUProc':>9} {vendor_short:>9} {'V/Alg':>8} "
+            f"{'Err':>10} {('Err' + vendor_short):>10} {'Status':>6}"
             + (f" {'GPUProc':>9} {'Compute':>9}" if args.timing else "")
         )
         print("-" * 150)

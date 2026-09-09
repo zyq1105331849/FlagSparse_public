@@ -170,6 +170,7 @@ from .spsv import (
     flagsparse_spsv_solve_coo,
     flagsparse_spsv_solve_csr,
     flagsparse_spsv_solve_sell,
+    flagsparse_spsv_sell,
 )
 
 _BENCHMARK_EXPORTS = {
@@ -283,6 +284,7 @@ __all__ = [
     "flagsparse_spsv_solve_coo",
     "flagsparse_spsv_solve_csr",
     "flagsparse_spsv_solve_sell",
+    "flagsparse_spsv_sell",
     "list_spmm_csr_algorithms",
     "list_spmm_coo_algorithms",
     "list_spmm_bsr_algorithms",

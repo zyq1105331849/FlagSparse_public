@@ -229,6 +229,7 @@ COO_SEP = "-" * 200
 
 
 def _coo_header(timing=False):
+    vendor_short = fs_common._expected_vendor_sparse_short()
     split = (
         f" {'BasePGPU':>9} {'BaseComp':>9} {'OptPGPU':>9} {'OptComp':>9}"
         if timing
@@ -240,8 +241,8 @@ def _coo_header(timing=False):
         f"{'Opt(ms)':>9} {'OptGPU':>9} {'OptCPU':>9}{split}"
     )
     return (
-        base + f" {'PT(ms)':>9} {'CU(ms)':>9}  "
-        f"{'Opt/Base':>8} {'Opt/PT':>8} {'Opt/CU':>8}  "
+        base + f" {'PT(ms)':>9} {(vendor_short + '(ms)'):>9}  "
+        f"{'Opt/Base':>8} {'Opt/PT':>8} {('Opt/' + vendor_short):>8}  "
         f"{'Err(Base)':>10} {'Err(Opt)':>10} {'Status':>6}"
     )
 
@@ -452,7 +453,7 @@ def run_synthetic(
     timing=False,
 ):
     if not torch.cuda.is_available():
-        print("CUDA is not available. Please run on a GPU-enabled system.")
+        print("A CUDA/ROCm PyTorch device is not available. Please run on a GPU-enabled system.")
         return
     device = torch.device("cuda")
     print("=" * 172)
@@ -789,10 +790,11 @@ def _print_coo_result(row, timing=False):
 
 
 TOCSR_SEP = "-" * 200
+_VENDOR_SHORT = fs_common._expected_vendor_sparse_short()
 TOCSR_HEADER = (
     f"{'Matrix':<28} {'Out':>7} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10}  "
-    f"{'Runtime(ms)':>11} {'Prepared(ms)':>12} {'PT(ms)':>9} {'CU(ms)':>9}  "
-    f"{'Prep/Run':>9} {'Prep/PT':>8} {'Prep/CU':>8}  "
+    f"{'Runtime(ms)':>11} {'Prepared(ms)':>12} {'PT(ms)':>9} {(_VENDOR_SHORT + '(ms)'):>9}  "
+    f"{'Prep/Run':>9} {'Prep/PT':>8} {('Prep/' + _VENDOR_SHORT):>8}  "
     f"{'Err(Runtime)':>12} {'Err(Prepared)':>13} {'Status':>6}"
 )
 
@@ -917,7 +919,7 @@ def run_all_dtypes_coo_csv(
     timing=False,
 ):
     if not torch.cuda.is_available():
-        print("CUDA is not available.")
+        print("A CUDA/ROCm PyTorch device is not available.")
         return
     device = torch.device("cuda")
     rows_out = []
@@ -928,7 +930,10 @@ def run_all_dtypes_coo_csv(
     print(
         "Input: MatrixMarket -> COO. FlagSparse: native COO Triton only (seg + atomic), no CSR."
     )
-    print("PyTorch = COO sparse.mm; CuPy = COO matvec (coo_matrix @ x, no tocsr).")
+    print(
+        f"PyTorch = COO sparse.mm; {fs_common._expected_vendor_sparse_label()} = vendor sparse baseline when supported. "
+        "Vendor setup/conversion is hoisted out of the timed window; CUDA CuPy COO may convert through CSR internally."
+    )
     print(
         "Timing policy: Base/Opt ms = process_cpu_ms + GPU event time. "
         "Row-run sort + seg_starts are GPU process; atomic has no process. "
@@ -1035,7 +1040,7 @@ def run_all_dtypes_tocsr_csv(
     iters=ITERS,
 ):
     if not torch.cuda.is_available():
-        print("CUDA is not available.")
+        print("A CUDA/ROCm PyTorch device is not available.")
         return
     device = torch.device("cuda")
     rows_out = []

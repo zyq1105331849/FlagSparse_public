@@ -33,6 +33,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
+from flagsparse.sparse_operations import _common as fs_common
 import flagsparse.sparse_operations.spsm as fs_spsm_impl
 from mtx_fast import NonSquareMatrixError
 
@@ -125,17 +126,21 @@ def _safe_ratio(other_ms, triton_ms):
 
 
 def _vendor_backend_name():
-    return "hipSPARSE" if fs_spsm_impl._is_rocm_runtime() else "cuSPARSE"
+
+    return fs_common._expected_vendor_sparse_label()
 
 
 def _vendor_short_name():
-    return "HIP" if fs_spsm_impl._is_rocm_runtime() else "CU"
+    return fs_common._expected_vendor_sparse_short()
 
 
 def _vendor_reference_route():
-    if fs_spsm_impl._is_rocm_runtime():
+    backend = fs_common._expected_vendor_sparse_backend()
+    if backend == "hipsparse":
         return "hipSPARSE csrsm2 direct API"
-    return "native cuSPARSE SpSM API"
+    if backend in ("cupy_cusparse", "native_cusparse"):
+        return "native cuSPARSE SpSM API"
+    return f"{fs_common._expected_vendor_sparse_label()} route"
 
 
 def _fmt_trace_times(times):
@@ -204,7 +209,7 @@ def _parse_ops_filter(raw):
 
 
 def _build_triangular_case(n=512, n_rhs=1024, value_dtype=torch.float32):
-    device = torch.device("cuda")
+    device = torch.device(fs_spsm_impl._ACCEL_DEVICE_TYPE)
     A = torch.tril(torch.randn((n, n), dtype=value_dtype, device=device) * 0.02)
     diag_base_dtype = torch.float32 if value_dtype == torch.complex64 else torch.float64
     diag = (torch.rand((n,), dtype=diag_base_dtype, device=device) + 2.0).to(
@@ -324,17 +329,17 @@ def _benchmark_pytorch_reference(data, indices, indptr, shape, B):
             size=shape,
             device=data.device,
         )
-        if not A_csr.is_cuda:
+        if not fs_spsm_impl._is_accel_tensor(A_csr):
             raise RuntimeError("torch.sparse.spsolve CUDA path is unavailable")
         cols = []
         for bj in torch.unbind(B, dim=1):
             cols.append(sparse_spsolve(A_csr, bj))
         X_ref = torch.stack(cols, dim=1) if cols else B.new_empty(B.shape)
-        torch.cuda.synchronize()
+        fs_spsm_impl._ACCEL.synchronize()
         return X_ref.to(B.dtype), None
     except Exception as exc:
-        if "out of memory" in str(exc).lower() and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if "out of memory" in str(exc).lower() and fs_spsm_impl._ACCEL.is_available():
+            fs_spsm_impl._ACCEL.empty_cache()
         return None, f"PyTorch sparse solve unavailable ({exc})"
 
 
@@ -518,7 +523,7 @@ def _load_cusparse_spsm_library():
 
 
 def _current_cuda_stream_ptr():
-    stream_ptr = getattr(torch.cuda.current_stream(), "cuda_stream", None)
+    stream_ptr = getattr(fs_spsm_impl._ACCEL.current_stream(), "cuda_stream", None)
     if stream_ptr is None:
         raise RuntimeError("Could not obtain the current CUDA stream pointer")
     return ctypes.c_void_p(int(stream_ptr))
@@ -528,8 +533,8 @@ class _PreparedCusparseNativeSpSM:
     def __init__(self, data, row, col, indptr, B, shape, fmt):
         if fmt not in FORMATS:
             raise ValueError(f"Unsupported native cuSPARSE SpSM format: {fmt}")
-        if not all(t.is_cuda for t in (data, row, col, indptr, B)):
-            raise ValueError("Native cuSPARSE SpSM inputs must be CUDA tensors")
+        if not all(fs_spsm_impl._is_accel_tensor(t) for t in (data, row, col, indptr, B)):
+            raise ValueError("Native cuSPARSE SpSM inputs must be accelerator tensors")
 
         self.data = data.contiguous()
         self.row = row.contiguous()
@@ -821,19 +826,19 @@ def _benchmark_cusparse_reference(data, row, col, indptr, B, shape, fmt, warmup,
         warmup_times = []
         for _ in range(warmup):
             plan.reset_analysis_state()
-            torch.cuda.synchronize()
+            fs_spsm_impl._ACCEL.synchronize()
             start = time.perf_counter()
             X_t = plan.prepare_and_solve()
-            torch.cuda.synchronize()
+            fs_spsm_impl._ACCEL.synchronize()
             if TRACE_CUSPARSE:
                 warmup_times.append((time.perf_counter() - start) * 1000.0)
         times = []
         for _ in range(iters):
             plan.reset_analysis_state()
-            torch.cuda.synchronize()
+            fs_spsm_impl._ACCEL.synchronize()
             start = time.perf_counter()
             X_t = plan.prepare_and_solve()
-            torch.cuda.synchronize()
+            fs_spsm_impl._ACCEL.synchronize()
             times.append((time.perf_counter() - start) * 1000.0)
         total_ms = _allinone_filtered_avg_ms(times)
         _emit_cusparse_trace(
@@ -898,18 +903,18 @@ def _benchmark_flagsparse_full_round(
     X = None
     for _ in range(warmup):
         reset_call()
-        torch.cuda.synchronize()
+        fs_spsm_impl._ACCEL.synchronize()
         analyze_call()
         X = solve_call()
-        torch.cuda.synchronize()
+        fs_spsm_impl._ACCEL.synchronize()
     times = []
     for _ in range(iters):
         reset_call()
-        torch.cuda.synchronize()
+        fs_spsm_impl._ACCEL.synchronize()
         start = time.perf_counter()
         analyze_call()
         X = solve_call()
-        torch.cuda.synchronize()
+        fs_spsm_impl._ACCEL.synchronize()
         times.append((time.perf_counter() - start) * 1000.0)
     return X, _allinone_filtered_avg_ms(times)
 
@@ -1095,7 +1100,8 @@ def _run_one_spsm_case(
 
 
 def run_spsm_synthetic_all(n=512, n_rhs=1024):
-    if not torch.cuda.is_available():
+
+    if not fs_spsm_impl._ACCEL.is_available():
         print("GPU runtime is not available.")
         return
     vendor_name = _vendor_backend_name()
@@ -1160,10 +1166,11 @@ def run_spsm_synthetic_all(n=512, n_rhs=1024):
 
 
 def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
-    if not torch.cuda.is_available():
+
+    if not fs_spsm_impl._ACCEL.is_available():
         print("GPU runtime is not available.")
         return
-    device = torch.device("cuda")
+    device = torch.device(fs_spsm_impl._ACCEL_DEVICE_TYPE)
     records_out = []
     fmt = "coo" if use_coo else "csr"
     vendor_name = _vendor_backend_name()

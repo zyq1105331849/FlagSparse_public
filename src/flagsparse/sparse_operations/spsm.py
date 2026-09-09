@@ -187,15 +187,22 @@ def _hipsparse_csrsm2_skip_reason(value_dtype, index_dtype, indptr_dtype=None):
 
 
 def _spsm_csr_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None):
-    """Pick hipSPARSE on ROCm/DCU or native cuSPARSE on CUDA."""
-    if _is_rocm_runtime():
+    """Select the same-format vendor SpSM baseline for the active backend."""
+    vendor = _vendor_sparse_library()
+    if vendor == "hipsparse":
         reason = _hipsparse_csrsm2_skip_reason(
             value_dtype, index_dtype, indptr_dtype
         )
         if reason is None:
             return "hipsparse", None
         return None, reason
-    return "native_cusparse", None
+    if vendor == "cupy_cusparse" and _backend_name() == "cuda":
+        return "native_cusparse", None
+    if vendor == "cupy_cusparse":
+        return None, f"native cuSPARSE SpSM baseline is not implemented for {_backend_name()}"
+    if vendor is None:
+        return None, f"no vendor sparse SpSM baseline is configured for {_backend_name()}"
+    return None, f"{vendor} SpSM baseline is not implemented"
 
 
 def _destroy_spsm_csr_ref_hipsparse_prepared(state):
@@ -250,13 +257,13 @@ def _time_hipsparse_call_ms(call):
             _destroy_hip_event(stop_evt)
             _destroy_hip_event(start_evt)
 
-    torch.cuda.synchronize()
-    start_evt_torch = torch.cuda.Event(enable_timing=True)
-    stop_evt_torch = torch.cuda.Event(enable_timing=True)
+    _ACCEL.synchronize()
+    start_evt_torch = _ACCEL.Event(enable_timing=True)
+    stop_evt_torch = _ACCEL.Event(enable_timing=True)
     start_evt_torch.record()
     call()
     stop_evt_torch.record()
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     return float(start_evt_torch.elapsed_time(stop_evt_torch))
 
 
@@ -295,7 +302,7 @@ def _prepare_spsm_csr_ref_hipsparse(
         raise RuntimeError(reason)
     if not all(torch.is_tensor(t) for t in (data, indices, indptr, B)):
         raise TypeError("data, indices, indptr, B must all be torch.Tensor")
-    if not all(t.is_cuda for t in (data, indices, indptr, B)):
+    if not all(_is_accel_tensor(t) for t in (data, indices, indptr, B)):
         raise ValueError("hipSPARSE csrsm2 inputs must all be GPU tensors")
     if not all(t.device == data.device for t in (indices, indptr, B)):
         raise ValueError("hipSPARSE csrsm2 inputs must be on the same device")
@@ -546,11 +553,11 @@ def _benchmark_spsm_csr_sparse_ref(
             finally:
                 _destroy_spsm_csr_ref_hipsparse_prepared(state)
                 state = None
-            torch.cuda.synchronize()
-        torch.cuda.synchronize()
+            _ACCEL.synchronize()
+        _ACCEL.synchronize()
         times = []
         for _ in range(iters):
-            torch.cuda.synchronize()
+            _ACCEL.synchronize()
             start_time = time.perf_counter()
             state = _prepare_spsm_csr_ref_hipsparse(
                 data,
@@ -563,7 +570,7 @@ def _benchmark_spsm_csr_sparse_ref(
             )
             try:
                 values = _run_spsm_csr_ref_hipsparse_prepared(state)
-                torch.cuda.synchronize()
+                _ACCEL.synchronize()
                 times.append((time.perf_counter() - start_time) * 1000.0)
             finally:
                 _destroy_spsm_csr_ref_hipsparse_prepared(state)
@@ -608,8 +615,8 @@ def _validate_spsm_op_and_layout(opA, opB, major):
 def _prepare_spsm_csr_inputs(data, indices, indptr, B, shape, opA, opB, major):
     if not all(torch.is_tensor(t) for t in (data, indices, indptr, B)):
         raise TypeError("data, indices, indptr, B must all be torch.Tensor")
-    if not all(t.is_cuda for t in (data, indices, indptr, B)):
-        raise ValueError("data, indices, indptr, B must all be CUDA tensors")
+    if not all(_is_accel_tensor(t) for t in (data, indices, indptr, B)):
+        raise ValueError("data, indices, indptr, B must all be accelerator tensors")
     if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1:
         raise ValueError("data, indices, indptr must be 1D")
     if B.ndim != 2:
@@ -649,8 +656,8 @@ def _prepare_spsm_csr_inputs(data, indices, indptr, B, shape, opA, opB, major):
 def _prepare_spsm_coo_inputs(data, row, col, B, shape, opA, opB, major):
     if not all(torch.is_tensor(t) for t in (data, row, col, B)):
         raise TypeError("data, row, col, B must all be torch.Tensor")
-    if not all(t.is_cuda for t in (data, row, col, B)):
-        raise ValueError("data, row, col, B must all be CUDA tensors")
+    if not all(_is_accel_tensor(t) for t in (data, row, col, B)):
+        raise ValueError("data, row, col, B must all be accelerator tensors")
     if data.ndim != 1 or row.ndim != 1 or col.ndim != 1:
         raise ValueError("data, row, col must be 1D")
     if data.numel() != row.numel() or data.numel() != col.numel():
@@ -1370,7 +1377,7 @@ def flagsparse_spsm_csr(
     )
     alpha_value = 1.0 if _alpha_is_one(alpha) else _alpha_to_host_scalar(alpha)
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t0 = time.perf_counter()
     x = _run_spsm_csr_core(
         solve_plan["kernel_dep_data"],
@@ -1384,7 +1391,7 @@ def flagsparse_spsm_csr(
         unit_diagonal=solve_plan["unit_diagonal"],
     )
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
     if out is not None:
         if out.shape != x.shape or out.dtype != x.dtype:
@@ -1416,7 +1423,7 @@ def flagsparse_spsm_coo(
     )
     alpha_value = 1.0 if _alpha_is_one(alpha) else _alpha_to_host_scalar(alpha)
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t0 = time.perf_counter()
     x = _run_spsm_csr_core(
         solve_plan["kernel_dep_data"],
@@ -1430,7 +1437,7 @@ def flagsparse_spsm_coo(
         unit_diagonal=solve_plan["unit_diagonal"],
     )
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
     if out is not None:
         if out.shape != x.shape or out.dtype != x.dtype:
@@ -1460,13 +1467,13 @@ def _analyze_spsm_csr(
     if clear_cache:
         _clear_spsm_preprocess_cache()
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t0 = time.perf_counter()
     _resolve_spsm_csr_runtime(
         data, indices, indptr, B, shape, lower, unit_diagonal, opA, opB, major
     )
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         return elapsed_ms
     return None
@@ -1490,13 +1497,13 @@ def _analyze_spsm_coo(
     if clear_cache:
         _clear_spsm_preprocess_cache()
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t0 = time.perf_counter()
     _resolve_spsm_coo_runtime(
         data, row, col, B, shape, lower, unit_diagonal, opA, opB, major
     )
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         return elapsed_ms
     return None

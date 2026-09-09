@@ -617,23 +617,12 @@ def _status_str(ok, available):
 def _print_mtx_header(value_dtype, index_dtype, op="non"):
     op = _normalize_op(op)
     transpose = _op_transposes(op)
-    vendor_backend, vendor_reason = ast_common._spmv_csr_sparse_ref_backend(
-        value_dtype, index_dtype, op=op
-    )
-    print_backend_summary(
-        op_name="SpMV CSR",
-        native_format="CSR",
-        correctness_ref="PyTorch CSR or COO",
-        vendor_backend=vendor_backend,
-        vendor_reason=vendor_reason,
-    )
+    vendor_label = ast_common._expected_vendor_sparse_label()
+    vendor_short = ast_common._expected_vendor_sparse_short()
     print(
         f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}  |  op: {op}  |  transpose: {bool(transpose)}"
     )
-    print(
-        f"Formats: FlagSparse=CSR, {expected_vendor_short()}=CSR"
-        f"{'/CSC' if not ast_common._is_rocm_runtime() else ''}, PyTorch=CSR or COO."
-    )
+    print(f"Formats: FlagSparse=CSR, {vendor_label}=CSR/CSC when supported, PyTorch=CSR or COO.")
     print(
         "Timing stays in native dtype. For float32, correctness references use float64 compute then cast."
     )
@@ -641,13 +630,13 @@ def _print_mtx_header(value_dtype, index_dtype, op="non"):
         "Timing policy: non = compute only; trans/conj = raw op materialization + compute."
     )
     print(
-        "PT/CU show per-reference correctness. Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|))."
+        f"PT/{vendor_short} show per-reference correctness. Err(PT)/Err({vendor_short})=max(|diff| / (atol + rtol*|ref|))."
     )
     print("-" * 150)
     print(
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
-        f"{'FlagSparse(ms)':>10} {(expected_vendor_short() + '-CSR'):>10} {'CSC(ms)':>10} {'PyTorch(ms)':>11} "
-        f"{('FS/' + expected_vendor_short()):>7} {'FS/PT':>7} {'PT':>6} {expected_vendor_short():>6} {'Err(PT)':>10} {('Err(' + expected_vendor_short() + ')'):>10}"
+        f"{'FlagSparse(ms)':>10} {'CSR(ms)':>10} {'CSC(ms)':>10} {'PyTorch(ms)':>11} "
+        f"{'FS/CSR':>7} {'FS/PT':>7} {'PT':>6} {vendor_short:>6} {'Err(PT)':>10} {('Err(' + vendor_short + ')'):>10}"
     )
     print("-" * 150)
 
@@ -797,8 +786,10 @@ def run_comprehensive_synthetic(op="non"):
     op = _normalize_op(op)
     transpose = _op_transposes(op)
     if not torch.cuda.is_available():
-        print("CUDA is not available.")
+        print("A CUDA/ROCm PyTorch device is not available.")
         return
+    vendor_label = ast_common._expected_vendor_sparse_label()
+    vendor_short = ast_common._expected_vendor_sparse_short()
     print("=" * 110)
     print("FLAGSPARSE SpMV BENCHMARK (synthetic CSR)")
     print("=" * 110)
@@ -811,10 +802,10 @@ def run_comprehensive_synthetic(op="non"):
         f"GPU: {torch.cuda.get_device_name(0)}  |  Warmup: {WARMUP}  Iters: {ITERS}  |  op: {op}  |  transpose: {bool(transpose)}"
     )
     print(
-        f"Formats: FlagSparse=CSR, {expected_vendor_label()}=CSR when supported, Reference=PyTorch CSR or COO"
+        f"Formats: FlagSparse=CSR, {vendor_label}=CSR when supported, Reference=vendor CSR or PyTorch COO"
     )
     print(
-        "When CuPy does not support dtype (e.g. bfloat16/float16), reference = PyTorch (float32 then cast)."
+        "When the vendor sparse baseline does not support a dtype, reference = PyTorch (float32 then cast)."
     )
     print()
     total = 0
@@ -828,8 +819,8 @@ def run_comprehensive_synthetic(op="non"):
             print("-" * 110)
             print(
                 f"{'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
-                f"{'FlagSparse(ms)':>11} {'cuSPARSE(ms)':>12} {'FS/CS':>8} "
-                f"{'Status':>6} {'Err(FS)':>10} {'Err(CS)':>10}"
+                f"{'FlagSparse(ms)':>11} {(vendor_short + '(ms)'):>12} {('FS/' + vendor_short):>8} "
+                f"{'Status':>6} {'Err(FS)':>10} {('Err(' + vendor_short + ')'):>10}"
             )
             print("-" * 110)
             for n_rows, n_cols, nnz in TEST_CASES:
@@ -912,7 +903,15 @@ def main():
     parser.add_argument("--warmup", type=int, default=10, help="Warmup runs")
     parser.add_argument("--iters", type=int, default=50, help="Timing iterations")
     parser.add_argument(
-        "--no-cusparse", action="store_true", help="Skip cuSPARSE baseline"
+        "--no-cusparse",
+        action="store_true",
+        help="Skip vendor sparse baseline (cuSPARSE on CUDA, hipSPARSE on ROCm)",
+    )
+    parser.add_argument(
+        "--no-hipsparse",
+        dest="no_cusparse",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--csv-csr",

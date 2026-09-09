@@ -31,6 +31,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
+from flagsparse.sparse_operations import _common as fs_common
 import flagsparse.sparse_operations.spsv as fs_spsv_impl
 from mtx_fast import NonSquareMatrixError
 
@@ -90,6 +91,8 @@ ROCM_SPSV_ALG_NUM_TO_SOLVE_KIND = {
 def _active_spsv_alg_num_to_solve_kind():
     if fs_spsv_impl._is_rocm_runtime():
         return ROCM_SPSV_ALG_NUM_TO_SOLVE_KIND
+    if fs_spsv_impl._is_mthreads_runtime() or fs_spsv_impl._is_ascend_runtime():
+        return {1: "csr_cw"}
     return CUDA_SPSV_ALG_NUM_TO_SOLVE_KIND
 
 
@@ -158,7 +161,8 @@ def _print_rocm_alg3_launch_config(alg_num):
         return
     if _solve_kind_from_alg_num(alg_num) != "csr_nnz_balance":
         return
-    cu_count = int(torch.cuda.get_device_properties(0).multi_processor_count)
+
+    cu_count = int(fs_spsv_impl._ACCEL.get_device_properties(0).multi_processor_count)
     workgroups_per_cu = fs_spsv_impl.SPSV_ROCM_ALG3_WORKGROUPS_PER_CU
     worker_cap = cu_count * workgroups_per_cu
     print(
@@ -203,15 +207,24 @@ def _safe_ratio(other_ms, base_ms):
 
 
 def _vendor_backend_name():
-    return "hipSPARSE" if fs_spsv_impl._is_rocm_runtime() else "cuSPARSE"
+    return fs_common._expected_vendor_sparse_label()
 
 
 def _vendor_short_name():
-    return "HIP" if fs_spsv_impl._is_rocm_runtime() else "CU"
+    return fs_common._expected_vendor_sparse_short()
 
 
 def _backend_error_key():
-    return "err_hip" if fs_spsv_impl._is_rocm_runtime() else "err_cu"
+    backend = fs_common._expected_vendor_sparse_backend()
+    return {
+        "hipsparse": "err_hip",
+        "cupy_cusparse": "err_cu",
+        "native_cusparse": "err_cu",
+        "torch": "err_pt_vendor",
+        "musparse": "err_ms",
+        "ops_sparse": "err_ops",
+        None: "err_vendor",
+    }.get(backend, f"err_{str(backend).lower()}")
 
 
 def _vendor_all_speedup_key():
@@ -231,6 +244,7 @@ def _spsv_csv_fieldnames():
     """Return one CSV schema named for the active sparse-library backend."""
 
     backend_name = _vendor_backend_name()
+
     fields = [
         "matrix",
         "value_dtype",
@@ -239,6 +253,7 @@ def _spsv_csv_fieldnames():
         "n_rows",
         "n_cols",
         "nnz",
+
     ]
     if fs_spsv_impl._is_rocm_runtime():
         fields.extend(
@@ -274,15 +289,19 @@ def _spsv_csv_fieldnames():
         f"{backend_name}_reason",
         "pytorch_reason",
         "error",
+
     ])
     return fields
 
 
 def _vendor_reference_route():
     """Mirror the mutually exclusive SpMV/SpMM vendor dispatch."""
-    if fs_spsv_impl._is_rocm_runtime():
+    backend = fs_common._expected_vendor_sparse_backend()
+    if backend == "hipsparse":
         return "hipSPARSE direct API"
-    return "cuSPARSE via CuPy spsolve_triangular"
+    if backend == "cupy_cusparse":
+        return "cuSPARSE via CuPy spsolve_triangular"
+    return fs_common._sparse_backend_label(backend)
 
 
 def _spsv_benchmark_schedule(nnz, op_mode, value_dtype, fmt="CSR"):
@@ -419,20 +438,20 @@ def _benchmark_pytorch_reference(data, indices, indptr, shape, b, *, lower, op_m
         A_csr = _build_csr_tensor_for_op(
             data, indices, indptr, shape, op_mode, lower=lower
         )
-        if not A_csr.is_cuda:
+        if not fs_spsv_impl._is_accel_tensor(A_csr):
             raise RuntimeError("torch.sparse.spsolve CUDA path is unavailable")
-        torch.cuda.synchronize()
-        e0 = torch.cuda.Event(True)
-        e1 = torch.cuda.Event(True)
+        fs_spsv_impl._ACCEL.synchronize()
+        e0 = fs_spsv_impl._ACCEL.Event(True)
+        e1 = fs_spsv_impl._ACCEL.Event(True)
         e0.record()
         x_ref = sparse_spsolve(A_csr, b)
         e1.record()
-        torch.cuda.synchronize()
+        fs_spsv_impl._ACCEL.synchronize()
         ms = e0.elapsed_time(e1)
         return x_ref.to(b.dtype), ms, "gpu_sparse", None
     except Exception as sparse_err:
-        if "out of memory" in str(sparse_err).lower() and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if "out of memory" in str(sparse_err).lower() and fs_spsv_impl._ACCEL.is_available():
+            fs_spsv_impl._ACCEL.empty_cache()
         return (
             None,
             None,
@@ -650,6 +669,7 @@ def _benchmark_flagsparse_spsv_full_rounds(
     warmup,
     iters,
 ):
+
     """Preserve the CUDA full-round analysis-plus-solve benchmark."""
 
     warmup = max(0, int(warmup))
@@ -657,19 +677,21 @@ def _benchmark_flagsparse_spsv_full_rounds(
 
     def run_round(record):
         reset_call()
-        torch.cuda.synchronize()
+
+        fs_spsv_impl._ACCEL.synchronize()
         total_start = time.perf_counter()
         state = analyze_call()
-        torch.cuda.synchronize()
+        fs_spsv_impl._ACCEL.synchronize()
         analysis_end = time.perf_counter()
         x = solve_call(state)
-        torch.cuda.synchronize()
+        fs_spsv_impl._ACCEL.synchronize()
         solve_end = time.perf_counter()
         if record:
             analysis_times.append((analysis_end - total_start) * 1000.0)
             solve_times.append((solve_end - analysis_end) * 1000.0)
             total_times.append((solve_end - total_start) * 1000.0)
         return x, state
+
 
     x = None
     state = None
@@ -705,13 +727,13 @@ def _benchmark_flagsparse_spsv_stages(
     warmup = max(0, int(warmup))
     iters = max(1, int(iters))
 
-    torch.cuda.synchronize()
-    start_event = torch.cuda.Event(enable_timing=True)
-    stop_event = torch.cuda.Event(enable_timing=True)
+    fs_spsv_impl._ACCEL.synchronize()
+    start_event = fs_spsv_impl._ACCEL.Event(enable_timing=True)
+    stop_event = fs_spsv_impl._ACCEL.Event(enable_timing=True)
     start_event.record()
     buffer_size_call()
     stop_event.record()
-    torch.cuda.synchronize()
+    fs_spsv_impl._ACCEL.synchronize()
     buffer_size_ms = start_event.elapsed_time(stop_event)
 
     state = None
@@ -721,27 +743,32 @@ def _benchmark_flagsparse_spsv_stages(
     analysis_times = []
     for _ in range(iters):
         reset_call()
-        torch.cuda.synchronize()
-        start_event = torch.cuda.Event(enable_timing=True)
-        stop_event = torch.cuda.Event(enable_timing=True)
+        fs_spsv_impl._ACCEL.synchronize()
+        start_event = fs_spsv_impl._ACCEL.Event(enable_timing=True)
+        stop_event = fs_spsv_impl._ACCEL.Event(enable_timing=True)
         start_event.record()
         state = analyze_call()
         stop_event.record()
-        torch.cuda.synchronize()
+        fs_spsv_impl._ACCEL.synchronize()
         analysis_times.append(start_event.elapsed_time(stop_event))
 
     x = None
+    state = None
+    analysis_times = []
+    solve_times = []
+    total_times = []
     for _ in range(warmup):
+
         x = solve_call(state)
     solve_times = []
     for _ in range(iters):
-        torch.cuda.synchronize()
-        start_event = torch.cuda.Event(enable_timing=True)
-        stop_event = torch.cuda.Event(enable_timing=True)
+        fs_spsv_impl._ACCEL.synchronize()
+        start_event = fs_spsv_impl._ACCEL.Event(enable_timing=True)
+        stop_event = fs_spsv_impl._ACCEL.Event(enable_timing=True)
         start_event.record()
         x = solve_call(state)
         stop_event.record()
-        torch.cuda.synchronize()
+        fs_spsv_impl._ACCEL.synchronize()
         solve_times.append(start_event.elapsed_time(stop_event))
 
     analysis_ms = _allinone_filtered_avg_ms(analysis_times, fmt=fmt)
@@ -799,6 +826,7 @@ def _benchmark_flagsparse_spsv_csr_split(
             lower=lower,
             transpose=transpose,
             solve_kind=solve_kind,
+
         )
         if fs_spsv_impl._is_rocm_runtime():
             x, _state, buffer_ms, analysis_ms, solve_ms, total_ms = (
@@ -969,6 +997,7 @@ def _benchmark_flagsparse_spsv_coo_split(
             lower=lower,
             transpose=transpose,
             solve_kind=solve_kind,
+
         )
         if fs_spsv_impl._is_rocm_runtime():
             x, _state, buffer_ms, analysis_ms, solve_ms, total_ms = (
@@ -1100,11 +1129,13 @@ def _cupy_spsolve_lower_csr_or_coo(
         data.dtype, indices.dtype, indptr.dtype, op="non"
     )
     if vendor_backend is None:
+
         return None, None, vendor_reason, None, None, None, None
     if vendor_backend == "hipsparse":
         # The DCU vendor reference is hipSPARSE CSR SpSV.  COO cases use the
         # same mathematically equivalent CSR reference after input conversion.
         return _cupy_spsolve_csr_with_op(
+
             data, indices, indptr, shape, b, "NON", lower, timing_fmt=fmt
         )
     if cp is None or cpx_sparse is None or cpx_spsolve_triangular is None:
@@ -1148,6 +1179,7 @@ def _cupy_spsolve_lower_csr_or_coo(
         cupy_ms = _allinone_filtered_avg_ms(times, fmt=fmt)
         x_cu_t = torch.utils.dlpack.from_dlpack(x_cu.toDlpack())
         x_cu_t = x_cu_t.to(b.dtype)
+
         return cupy_ms, x_cu_t, None, "cuSPARSE via CuPy spsolve_triangular", None, None, None
     except Exception as exc:
         return None, None, str(exc), None, None, None, None
@@ -1165,6 +1197,7 @@ def _cupy_spsolve_csr_with_op(
         op=str(op_mode).lower(),
     )
     if vendor_backend is None:
+
         return None, None, selector_reason, None, None, None, None
     if vendor_backend == "hipsparse":
         warmup, iters = _spsv_benchmark_schedule(
@@ -1181,6 +1214,7 @@ def _cupy_spsolve_csr_with_op(
             op=str(op_mode).lower(),
             warmup=warmup,
             iters=iters,
+
             fmt=timing_fmt,
         )
         if sparse_ref.get("backend") != "hipsparse":
@@ -1190,6 +1224,7 @@ def _cupy_spsolve_csr_with_op(
                 None,
                 f"ROCm/DCU vendor dispatch did not select hipSPARSE: {reason}",
                 None,
+
                 None,
                 None,
                 None,
@@ -1199,6 +1234,7 @@ def _cupy_spsolve_csr_with_op(
             sparse_ref["values"],
             sparse_ref.get("reason"),
             "hipSPARSE direct API",
+
             sparse_ref["buffer_size_ms"],
             sparse_ref["analysis_ms"],
             sparse_ref["solve_ms"],
@@ -1250,21 +1286,23 @@ def _cupy_spsolve_csr_with_op(
             times.append((time.perf_counter() - t0) * 1000.0)
         ms = _allinone_filtered_avg_ms(times, fmt="CSR")
         x_t = torch.utils.dlpack.from_dlpack(x_cp.toDlpack()).to(b.dtype)
+
         return ms, x_t, None, "cuSPARSE via CuPy spsolve_triangular", None, None, None
     except Exception as exc:
         return None, None, str(exc), None, None, None, None
 
 
 def run_spsv_synthetic_all(lower=True, alg_num=None):
-    if not torch.cuda.is_available():
+    if not fs_spsv_impl._ACCEL.is_available():
         print("CUDA is not available. Please run on a GPU-enabled system.")
         return
-    device = torch.device("cuda")
+    device = torch.device(fs_spsv_impl._ACCEL_DEVICE_TYPE)
     sep = "=" * 124
     print(sep)
     print("FLAGSPARSE SpSV BENCHMARK (synthetic triangular systems, CSR + COO)")
     print(sep)
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    print(f"GPU: {fs_spsv_impl._ACCEL.get_device_name(0)}")
     print(f"Benchmark schedule: warmup={WARMUP}, iter={ITERS}")
     print(f"Triangle: {'LOWER' if lower else 'UPPER'}")
     print(f"Algorithm: {_alg_label(alg_num)}")
@@ -1272,6 +1310,7 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
     _print_rocm_alg3_launch_config(alg_num)
     vendor_name = _vendor_backend_name()
     vendor_short = _vendor_short_name()
+
     if fs_spsv_impl._is_rocm_runtime():
         print("DCU timing: total=bufferSize+average analysis+average solve.")
     else:
@@ -1289,6 +1328,7 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
     hdr = (
         f"{'Fmt':>5} {'opA':>5} {'N':>6} {'FS.ms':>10} "
         f"{(vendor_short + '.ms'):>10} {'PT.ms':>10} "
+
         f"{terminal_vendor_speedup_label:>10} {'PT.spdT':>10} "
         f"{'Status':>8} {'Err(PT)':>12} {('Err(' + vendor_short + ')'):>12}"
     )
@@ -1337,8 +1377,9 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                             ),
                         )
 
-                        torch.cuda.synchronize()
+                        fs_spsv_impl._ACCEL.synchronize()
                         if fmt == "CSR":
+
                             x, buffer_ms, analysis_ms, t_ms, flagsparse_ms, _route_name = (
                                 _benchmark_flagsparse_spsv_csr_split(
                                     data,
@@ -1355,6 +1396,7 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                             dc, rr, cc = _csr_to_coo(
                                 data, indices, indptr, shape, index_dtype=index_dtype
                             )
+
                             x, buffer_ms, analysis_ms, t_ms, flagsparse_ms, _route_name = (
                                 _benchmark_flagsparse_spsv_coo_split(
                                     dc,
@@ -1367,7 +1409,7 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                                     solve_kind=_solve_kind_from_alg_num(alg_num),
                                 )
                             )
-                        torch.cuda.synchronize()
+                        fs_spsv_impl._ACCEL.synchronize()
 
                         x_pt, pytorch_ms, _pt_backend, _pt_skip_reason = (
                             _benchmark_pytorch_reference(
@@ -1392,6 +1434,7 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                         vendor_reason = None
                         vendor_route = None
                         if fmt == "CSR":
+
                             (
                                 cupy_ms,
                                 x_cu_t,
@@ -1411,6 +1454,7 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                             torch.complex64,
                             torch.complex128,
                         ):
+
                             (
                                 cupy_ms,
                                 x_cu_t,
@@ -1461,6 +1505,7 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                         )
                         print(
                             f"{fmt:>5} {op_mode:>5} {n:>6} {_fmt_ms(flagsparse_ms):>10} {_fmt_ms(cupy_ms):>10} "
+
                             f"{_fmt_ms(pytorch_ms):>10} {_fmt_ratio(vendor_speedup_display):>10} {_fmt_ratio(pt_vs_total):>10} "
                             f"{status:>8} {_fmt_err(err_pt):>12} {_fmt_err(err_cu):>12}"
                         )
@@ -1507,6 +1552,7 @@ def _run_one_csv_row_coo(
     data_tri, _indices_tri, _indptr_tri = _extract_triangular_csr(
         data, indices, indptr, shape, lower=lower
     )
+
     x, buffer_ms, analysis_ms, t_ms, flagsparse_ms, _route_name = (
         _benchmark_flagsparse_spsv_coo_split(
             d_in,
@@ -1591,6 +1637,7 @@ def _finalize_csv_row(
     err_vendor = None
     ok_vendor = False
     x_vendor = None
+
     (
         vendor_ms,
         x_vendor,
@@ -1629,6 +1676,7 @@ def _finalize_csv_row(
         "n_cols": n_cols,
         "nnz": int(nnz_effective),
         "FlagSparse_ms": flagsparse_ms,
+
         "FlagSparse_bufferSize_ms": buffer_ms,
         "FlagSparse_analysis_ms": analysis_ms,
         "FlagSparse_solve_ms": t_ms,
@@ -1687,6 +1735,7 @@ def _run_one_csv_row_csr_full(
     data_tri, _indices_tri, _indptr_tri = _extract_triangular_csr(
         data, indices, indptr, shape, lower=lower
     )
+
     x, buffer_ms, analysis_ms, t_ms, flagsparse_ms, _route_name = (
         _benchmark_flagsparse_spsv_csr_split(
             data,
@@ -1771,6 +1820,7 @@ def _finalize_csv_row_csr_full(
     err_vendor = None
     ok_vendor = False
     x_vendor = None
+
     (
         vendor_ms,
         x_vendor,
@@ -1809,6 +1859,7 @@ def _finalize_csv_row_csr_full(
         "n_cols": n_cols,
         "nnz": int(nnz_effective),
         "FlagSparse_ms": flagsparse_ms,
+
         "FlagSparse_bufferSize_ms": buffer_ms,
         "FlagSparse_analysis_ms": analysis_ms,
         "FlagSparse_solve_ms": t_ms,
@@ -1850,14 +1901,16 @@ def run_all_supported_spsv_csr_csv(
     op_modes=None,
     alg_num=None,
 ):
-    if not torch.cuda.is_available():
+
+    if not fs_spsv_impl._ACCEL.is_available():
         print("GPU runtime is not available.")
         return
-    device = torch.device("cuda")
+    device = torch.device(fs_spsv_impl._ACCEL_DEVICE_TYPE)
     records_out = []
     vendor_name = _vendor_backend_name()
     vendor_short = _vendor_short_name()
     vendor_route_key = f"{vendor_name}_route"
+
     vendor_all_speedup_key = _vendor_all_speedup_key()
     vendor_solve_speedup_key = f"FlagSparse_vs_{vendor_name}_solve_speedup"
     pytorch_all_speedup_key = _pytorch_all_speedup_key()
@@ -1888,6 +1941,7 @@ def run_all_supported_spsv_csr_csv(
                     f"{_solve_kind_from_alg_num(alg_num) or 'AUTO'}"
                 )
                 _print_rocm_alg3_launch_config(alg_num)
+
                 print(
                     f"Formats: FlagSparse=CSR, {vendor_name}=CSR reference, "
                     "PT=official sparse solve reference"
@@ -1942,6 +1996,7 @@ def run_all_supported_spsv_csr_csv(
                         print(
                             f"{name:<28} {n_rows:>7} {n_cols:>7} {nnz:>10} "
                             f"{_fmt_ms(flagsparse_ms):>10} {_fmt_ms(vendor_ms):>10} {_fmt_ms(pytorch_ms):>10} "
+
                             f"{_fmt_ratio(record[vendor_solve_speedup_key] if fs_spsv_impl._is_rocm_runtime() else record[vendor_all_speedup_key]):>10} "
                             f"{_fmt_ratio(record[pytorch_all_speedup_key]):>10} "
                             f"{status:>8} {_fmt_err(err_pt):>10} "
@@ -1983,6 +2038,7 @@ def run_all_supported_spsv_csr_csv(
                                 vendor_route_key: None,
                                 f"{vendor_name}_ms": None,
                                 "PyTorch_ms": None,
+
                                 vendor_all_speedup_key: None,
                                 pytorch_all_speedup_key: None,
                                 "status": status,
@@ -2024,14 +2080,16 @@ def run_all_dtypes_spsv_coo_csv(
     op_modes=None,
     alg_num=None,
 ):
-    if not torch.cuda.is_available():
+
+    if not fs_spsv_impl._ACCEL.is_available():
         print("GPU runtime is not available.")
         return
-    device = torch.device("cuda")
+    device = torch.device(fs_spsv_impl._ACCEL_DEVICE_TYPE)
     records_out = []
     vendor_name = _vendor_backend_name()
     vendor_short = _vendor_short_name()
     vendor_route_key = f"{vendor_name}_route"
+
     vendor_all_speedup_key = _vendor_all_speedup_key()
     vendor_solve_speedup_key = f"FlagSparse_vs_{vendor_name}_solve_speedup"
     pytorch_all_speedup_key = _pytorch_all_speedup_key()
@@ -2062,6 +2120,7 @@ def run_all_dtypes_spsv_coo_csv(
                     f"{_solve_kind_from_alg_num(alg_num) or 'AUTO'}"
                 )
                 _print_rocm_alg3_launch_config(alg_num)
+
                 print(
                     f"Formats: FlagSparse=COO via CSR SpSV, {vendor_name}=CSR "
                     "reference, PT=official sparse solve reference."
@@ -2083,6 +2142,7 @@ def run_all_dtypes_spsv_coo_csv(
                     f"Ept=|FS-PT|, E{vendor_short}=|FS-{vendor_name}|."
                 )
                 print("-" * 126)
+
                 terminal_vendor_speedup_label = (
                     f"{vendor_short}.S.spd"
                     if fs_spsv_impl._is_rocm_runtime()
@@ -2121,6 +2181,7 @@ def run_all_dtypes_spsv_coo_csv(
                         print(
                             f"{name:<28} {n_rows:>7} {n_cols:>7} {nnz:>10} "
                             f"{_fmt_ms(flagsparse_ms):>10} {_fmt_ms(vendor_ms):>10} {_fmt_ms(pytorch_ms):>10} "
+
                             f"{_fmt_ratio(record[vendor_solve_speedup_key] if fs_spsv_impl._is_rocm_runtime() else record[vendor_all_speedup_key]):>10} "
                             f"{_fmt_ratio(record[pytorch_all_speedup_key]):>10} "
                             f"{status:>8} {_fmt_err(err_pt):>10} "
@@ -2162,6 +2223,7 @@ def run_all_dtypes_spsv_coo_csv(
                                 vendor_route_key: None,
                                 f"{vendor_name}_ms": None,
                                 "PyTorch_ms": None,
+
                                 vendor_all_speedup_key: None,
                                 pytorch_all_speedup_key: None,
                                 "status": status,
@@ -2327,10 +2389,10 @@ def run_csr_transpose_check(
     index_dtypes=None,
     op_modes=None,
 ):
-    if not torch.cuda.is_available():
+    if not fs_spsv_impl._ACCEL.is_available():
         print("CUDA is not available.")
         return
-    device = torch.device("cuda")
+    device = torch.device(fs_spsv_impl._ACCEL_DEVICE_TYPE)
     selected_value_dtypes = value_dtypes or CSR_FULL_VALUE_DTYPES
     selected_index_dtypes = index_dtypes or CSR_FULL_INDEX_DTYPES
     selected_op_modes = [
@@ -2447,6 +2509,7 @@ def main():
         help=(
             "Algorithm selection compatible with allinone style. "
             "DCU: 1=ALG1(csr_cw), 2=ALG2(csr_cw_levelschd), "
+
             "3=ALG3(csr_nnz_balance; default). "
             "CUDA: 1=csr_cw, "
             "2=csr_cw_levelschd, 3=csr_roc, 4=csr_smblk, "

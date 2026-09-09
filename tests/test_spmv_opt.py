@@ -254,6 +254,7 @@ def _err(v):
 
 
 def _header(timing=False):
+    vendor_short = fs_common._expected_vendor_sparse_short()
     split = f"{'OptPGPU':>9} {'OptComp':>9} " if timing else ""
     vendor_ms = f"{expected_vendor_short()}(ms)"
     opt_vendor = f"Opt/{expected_vendor_short()}"
@@ -261,8 +262,8 @@ def _header(timing=False):
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10}  "
         f"{'Base(ms)':>9} {'BaseGPU':>9} {'BaseCPU':>9} "
         f"{'Opt(ms)':>9} {'OptGPU':>9} {'OptCPU':>9} {split}"
-        f"{'PT(ms)':>9} {vendor_ms:>9}  "
-        f"{'Opt/Base':>8} {'Opt/PT':>8} {opt_vendor:>8}  "
+        f"{'PT(ms)':>9} {(vendor_short + '(ms)'):>9}  "
+        f"{'Opt/Base':>8} {'Opt/PT':>8} {('Opt/' + vendor_short):>8}  "
         f"{'Err(Base)':>10} {'Err(Opt)':>10} {'Status':>6}"
     )
 
