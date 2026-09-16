@@ -470,9 +470,10 @@ def _benchmark_triton(
         "transpose": op_mode,
         "alg_num": alg_num,
     }
-    if alg2_worker_count is not None:
-        analysis_kwargs["alg2_worker_count"] = alg2_worker_count
-    if op_mode != "NON":
+    if op_mode == "NON":
+        if alg2_worker_count is not None:
+            analysis_kwargs["alg2_worker_count"] = alg2_worker_count
+    else:
         spsv_impl._clear_spsv_sell_trans_analysis_cache()
     descr, analysis_ms = _time_cuda(
         lambda: fs.flagsparse_spsv_analysis_sell(
@@ -515,6 +516,24 @@ def _run_case(
     n_rows = int(row_ptr.numel() - 1)
     sell_values, sell_cols, offsets = _csr_to_sell(
         values, cols, row_ptr, n_rows, slice_size
+    )
+    analysis_kwargs = {
+        "slice_size": slice_size,
+        "unit_diagonal": unit_diagonal,
+        "transpose": op_mode,
+        "alg_num": alg_num,
+    }
+    if op_mode == "NON":
+        if alg2_worker_count is not None:
+            analysis_kwargs["alg2_worker_count"] = alg2_worker_count
+    public_descr = fs.flagsparse_spsv_analysis_sell(
+        sell_values, sell_cols, offsets, (n_rows, n_rows), **analysis_kwargs
+    )
+    public_workspace = fs.flagsparse_spsv_create_workspace(public_descr)
+    public_result = fs.flagsparse_spsv_solve_sell(
+        public_descr,
+        b,
+        workspace=public_workspace,
     )
     triton_result, triton_ms = _benchmark_triton(
         sell_values,

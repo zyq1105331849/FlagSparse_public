@@ -1010,7 +1010,6 @@ def _destroy_spsv_csr_ref_hipsparse_prepared(state):
             pass
 
 
-
 def _benchmark_spsv_hipsparse_stage(state, run_fn, warmup, iters, fmt):
     output = None
     for _ in range(max(0, int(warmup))):
@@ -1052,6 +1051,7 @@ def _benchmark_spsv_csr_sparse_ref(
     op="non",
     warmup=0,
     iters=1,
+    fresh_each_iter=False,
     fmt="CSR",
 ):
     backend, reason = _spsv_csr_sparse_ref_backend(
@@ -1077,41 +1077,91 @@ def _benchmark_spsv_csr_sparse_ref(
         )
         return result
     try:
+        if fresh_each_iter:
+            warmup = max(0, int(warmup))
+            iters = max(1, int(iters))
+            values = None
+            for _ in range(warmup):
+                state = _prepare_spsv_csr_ref_hipsparse(
+                    data,
+                    indices,
+                    indptr,
+                    rhs,
+                    shape,
+                    lower=lower,
+                    unit_diagonal=unit_diagonal,
+                    op=op,
+                )
+                try:
+                    values = _run_spsv_csr_ref_hipsparse_prepared(state)
+                finally:
+                    _destroy_spsv_csr_ref_hipsparse_prepared(state)
+                _ACCEL.synchronize()
 
-        state = _prepare_spsv_csr_ref_hipsparse(
-            data,
-            indices,
-            indptr,
-            rhs,
-            shape,
-            lower=lower,
-            unit_diagonal=unit_diagonal,
-            op=op,
-            run_analysis=False,
-            measure_buffer_size=True,
-        )
-        try:
-            _, analysis_ms = _benchmark_spsv_hipsparse_stage(
-                state,
-                _run_spsv_csr_ref_hipsparse_analysis_prepared,
-                warmup=warmup,
-                iters=iters,
-                fmt=fmt,
+            times = []
+            for _ in range(iters):
+                _ACCEL.synchronize()
+                t0 = time.perf_counter()
+                state = _prepare_spsv_csr_ref_hipsparse(
+                    data,
+                    indices,
+                    indptr,
+                    rhs,
+                    shape,
+                    lower=lower,
+                    unit_diagonal=unit_diagonal,
+                    op=op,
+                )
+                try:
+                    values = _run_spsv_csr_ref_hipsparse_prepared(state)
+                    _ACCEL.synchronize()
+                    times.append((time.perf_counter() - t0) * 1000.0)
+                finally:
+                    _destroy_spsv_csr_ref_hipsparse_prepared(state)
+            if times:
+                ordered = sorted(times)
+                median = ordered[len(ordered) // 2]
+                lo = median * 0.9
+                hi = median * 1.1
+                kept = [t for t in ordered if lo <= t <= hi]
+                ms = sum(kept) / len(kept) if kept else median
+            else:
+                ms = None
+        else:
+            state = _prepare_spsv_csr_ref_hipsparse(
+                data,
+                indices,
+                indptr,
+                rhs,
+                shape,
+                lower=lower,
+                unit_diagonal=unit_diagonal,
+                op=op,
+                run_analysis=False,
+                measure_buffer_size=True,
             )
-            values, solve_ms = _benchmark_spsv_hipsparse_stage(
-                state,
-                _run_spsv_csr_ref_hipsparse_prepared,
-                warmup=warmup,
-                iters=iters,
-                fmt=fmt,
-            )
-            buffer_size_ms = float(state["buffer_size_ms"] or 0.0)
-            ms = buffer_size_ms + analysis_ms + solve_ms
-        finally:
-            _destroy_spsv_csr_ref_hipsparse_prepared(state)
-        result["buffer_size_ms"] = buffer_size_ms
-        result["analysis_ms"] = analysis_ms
-        result["solve_ms"] = solve_ms
+            try:
+                _, analysis_ms = _benchmark_spsv_hipsparse_stage(
+                    state,
+                    _run_spsv_csr_ref_hipsparse_analysis_prepared,
+                    warmup=warmup,
+                    iters=iters,
+                    fmt=fmt,
+                )
+                values, solve_ms = _benchmark_spsv_hipsparse_stage(
+                    state,
+                    _run_spsv_csr_ref_hipsparse_prepared,
+                    warmup=warmup,
+                    iters=iters,
+                    fmt=fmt,
+                )
+                buffer_size_ms = float(state["buffer_size_ms"] or 0.0)
+                ms = buffer_size_ms + analysis_ms + solve_ms
+            finally:
+                _destroy_spsv_csr_ref_hipsparse_prepared(state)
+            result["buffer_size_ms"] = buffer_size_ms
+            result["analysis_ms"] = analysis_ms
+            result["solve_ms"] = solve_ms
         result["values"] = values
         result["ms"] = ms
         result["reason"] = None
@@ -1492,6 +1542,11 @@ def _build_spsv_workspace_layout(n_rows, solve_kind, value_dtype=None):
             _workspace_entry("ready_queue", n_rows, torch.int32),
             _workspace_entry("queue_state", 2, torch.int32),
 
+        )
+    if solve_kind == "sell_trans_csc":
+        return (
+            _workspace_entry("ready", n_rows, torch.int32),
+            _workspace_entry("row_counter", 1, torch.int32),
         )
     if solve_kind == "sell_trans_csc":
         return (
@@ -5909,7 +5964,6 @@ def _build_spsv_sell_trans_queue_metadata(
     }
 
 
-
 def _build_spsv_sell_trans_csc_metadata(
     values,
     col_indices,
@@ -6016,7 +6070,6 @@ def _launch_spsv_sell_trans_queue(
     if int(n_rows) == 0:
         return out
     is_complex = torch.is_complex(values)
-
     use_fp64_acc = residual_in.dtype in (torch.float64, torch.complex128)
     if is_complex:
         if values_ri_in is None:
@@ -6127,6 +6180,67 @@ def _launch_spsv_sell_trans_csc(
         worker_count = _spsv_cu_capped_worker_count(
             n_rows, b_vec.device, True
         )
+    if torch.is_complex(data):
+        if data_ri_in is None:
+            raise RuntimeError("SELL CSC analysis is missing interleaved values")
+        b_ri = torch.view_as_real(b_vec.contiguous()).reshape(-1).contiguous()
+        out_ri = torch.view_as_real(out.contiguous()).reshape(-1).contiguous()
+        _spsv_csr_cw_kernel_complex[(int(worker_count),)](
+            data_ri_in,
+            indices,
+            indptr,
+            b_ri,
+            out_ri,
+            ready,
+            row_counter,
+            int(n_rows),
+            LOWER=False,
+            REVERSE_ORDER=True,
+            UNIT_DIAG=bool(unit_diagonal),
+            USE_FP64_ACC=data.dtype == torch.complex128,
+            num_warps=1,
+        )
+    else:
+        _spsv_csr_cw_kernel[(int(worker_count),)](
+            data,
+            indices,
+            indptr,
+            b_vec,
+            out,
+            ready,
+            row_counter,
+            int(n_rows),
+            LOWER=False,
+            REVERSE_ORDER=True,
+            UNIT_DIAG=bool(unit_diagonal),
+            USE_FP64_ACC=data.dtype == torch.float64,
+            num_warps=1,
+        )
+    return out
+
+
+def _launch_spsv_sell_trans_csc(
+    data,
+    indices,
+    indptr,
+    b_vec,
+    n_rows,
+    *,
+    worker_count,
+    out,
+    ready,
+    row_counter,
+    unit_diagonal=False,
+    data_ri_in=None,
+):
+    """Solve the analyzed upper CSC view with one gather owner per row."""
+
+    ready.zero_()
+    row_counter.zero_()
+    if int(n_rows) == 0:
+        return out
+    if _is_rocm_runtime():
+        worker_count = _spsv_alg4_worker_count(n_rows, b_vec.device, True)
     if torch.is_complex(data):
         if data_ri_in is None:
             raise RuntimeError("SELL CSC analysis is missing interleaved values")
@@ -8513,7 +8627,6 @@ def flagsparse_spsv_analysis_sell(
         if alg2_worker_count is not None:
             raise ValueError("SELL TRANS/CONJ do not accept worker-count tuning")
         if trans_analysis is None:
-
             if trans_alg_num == SPSV_SELL_ALG1:
                 queue_meta = _build_spsv_sell_trans_queue_metadata(
                     cols,
@@ -8545,7 +8658,6 @@ def flagsparse_spsv_analysis_sell(
                     trans_analysis,
                     _SPSV_SELL_TRANS_ANALYSIS_CACHE_SIZE,
                 )
-
         solve_kind = (
             "sell_trans_queue"
             if trans_alg_num == SPSV_SELL_ALG1
@@ -8572,7 +8684,6 @@ def flagsparse_spsv_analysis_sell(
         solve_plan["trans_worker_count"] = int(trans_analysis["worker_count"])
         solve_plan["alg_num"] = int(trans_alg_num)
     else:
-
         solve_plan["trans_csc_data"] = trans_analysis["data"]
         solve_plan["trans_csc_indices"] = trans_analysis["indices"]
         solve_plan["trans_csc_indptr"] = trans_analysis["indptr"]
@@ -8652,7 +8763,6 @@ def flagsparse_spsv_solve_sell(
     )
     plan = descr.solve_plan
     if descr.transpose_mode in ("T", "C"):
-
         if descr.solve_kind == "sell_trans_csc":
             return _launch_spsv_sell_trans_csc(
                 plan["trans_csc_data"],

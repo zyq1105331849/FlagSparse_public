@@ -524,7 +524,7 @@ def test_spsv_output_uses_runtime_vendor_name_and_dcu_split_times():
         source = _benchmark_function_source(name)
         assert "_vendor_backend_name()" in source
         assert "_vendor_short_name()" in source
-        assert 'f"{vendor_short}.S.spd"' in source
+        assert ".S.spd" in source
         assert "'PT.spdT'" in source
         assert '"  split: "' not in source
     selector = _function_source("_spsv_csr_sparse_ref_backend")
@@ -537,23 +537,14 @@ def test_spsv_output_uses_runtime_vendor_name_and_dcu_split_times():
     assert "backend_name = _vendor_backend_name()" in csv_fields
     assert 'f"{backend_name}_ms"' in csv_fields
     assert 'f"{backend_name}_route"' in csv_fields
-    assert 'f"FlagSparse_vs_{backend_name}_speedup"' in csv_fields
-    for field in (
-        '"FlagSparse_analysis_ms"',
-        '"FlagSparse_solve_ms"',
-        '"FlagSparse_ms"',
-        '"hipSPARSE_analysis_ms"',
-        '"hipSPARSE_solve_ms"',
-        '"hipSPARSE_ms"',
-        '"PyTorch_ms"',
-        '"FlagSparse_vs_hipSPARSE_solve_speedup"',
-        '"FlagSparse_vs_hipSPARSE_all_speedup"',
-        '"FlagSparse_vs_PyTorch_all_speedup"',
-    ):
-        assert field in csv_fields
-    assert '"FlagSparse_bufferSize_ms"' not in csv_fields
-    assert '"hipSPARSE_bufferSize_ms"' not in csv_fields
-    assert '"FlagSparse_vs_hipSPARSE_analysis_speedup"' not in csv_fields
+    assert '"FlagSparse_bufferSize_ms"' in csv_fields
+    assert 'f"{backend_name}_bufferSize_ms"' in csv_fields
+    assert 'f"{backend_name}_analysis_ms"' in csv_fields
+    assert 'f"{backend_name}_solve_ms"' in csv_fields
+    assert 'f"FlagSparse_vs_{backend_name}_analysis_speedup"' in csv_fields
+    assert 'f"FlagSparse_vs_{backend_name}_solve_speedup"' in csv_fields
+    assert "_vendor_all_speedup_key()" in csv_fields
+    assert "_pytorch_all_speedup_key()" in csv_fields
     assert "_backend_error_key()" in csv_fields
     assert '"err_ref"' not in csv_fields
     assert '"err_res"' not in csv_fields
@@ -657,7 +648,7 @@ def test_rocm_flagsparse_uses_stable_split_stage_timing():
     assert "total_times.append" in cuda_rounds
 
     stages = _benchmark_function_source("_benchmark_flagsparse_spsv_stages")
-    assert stages.count("state = analyze_call()") == 2
+    assert stages.count("state = analyze_call()") == 3
     assert "analysis_times" in stages
     assert "analysis_times.append(start_event.elapsed_time(stop_event))" in stages
     assert "buffer_size_call()" in stages
@@ -683,8 +674,8 @@ def test_rocm_flagsparse_uses_stable_split_stage_timing():
 
     fields = _benchmark_function_source("_spsv_csv_fieldnames")
     assert '"FlagSparse_analysis_ms"' in fields
-    assert '"hipSPARSE_analysis_ms"' in fields
-    assert '"FlagSparse_vs_hipSPARSE_solve_speedup"' in fields
+    assert 'f"{backend_name}_analysis_ms"' in fields
+    assert 'f"FlagSparse_vs_{backend_name}_solve_speedup"' in fields
 
 
 def test_spsv_default_rounds_match_spsm():

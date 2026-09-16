@@ -313,6 +313,18 @@ wavefront 因无关依赖互相等待。CU 数量封顶保持不变，因此不�
 自旋等待的旧调度方式。
 
 可用 `FLAGSPARSE_SPSV_ROCM_ENABLE_ADVANCED_AUTO=0` 强制 AUTO 使用 ALG1。
+
+SpSV CSR/COO 普通 runner 在 ROCm 上会把 hipSPARSE vendor baseline 拆成
+`bufferSize + analysis + solve` 三段记录。CSV 中新增 `FlagSparse_bufferSize_ms`、
+`FlagSparse_analysis_ms`、`FlagSparse_solve_ms` 以及对应的 `hipSPARSE_*` 字段；
+终端里的 `HS.S.spd` 使用 solve 阶段对比，`*_all_speedup` 仍保留完整总耗时对比。
+CUDA/MACA 路径继续使用原来的总耗时字段，避免 ROCm 分阶段口径污染其它后端。
+
+SELL SpSV 的 TRANS/CONJ 路径现在允许显式选择 `--alg_num 1|2`：
+
+- `ALG1`：`sell_trans_queue`，沿用原始 SELL scatter queue；
+- `ALG2`：`sell_trans_csc`，analysis 阶段构造 CSC gather 视图，`float32/complex64`
+  在 ROCm 上保持输入精度，不再分别提升到 `float64/complex128`。
 ---
 
 ## 5. 正确性套件
