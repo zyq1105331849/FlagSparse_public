@@ -212,10 +212,7 @@ def test_spsv_sell_trans_matches_dense_and_supports_inplace(
     expected_route = "sell_trans_queue" if alg_num == 1 else "sell_trans_csc"
     assert descr.solve_kind == expected_route
     workspace = flagsparse_spsv_create_workspace(descr)
-    expected_compute_dtype = {
-        torch.float32: torch.float64,
-        torch.complex64: torch.complex128,
-    }.get(dtype, dtype)
+    expected_compute_dtype = dtype
     assert descr.compute_dtype == expected_compute_dtype
     if alg_num == 1:
         assert workspace.buffers["residual"].dtype == expected_compute_dtype

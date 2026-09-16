@@ -161,22 +161,24 @@ def test_shared_transpose_kernels_use_launch_time_serial_policy():
         assert "_is_rocm_runtime" not in source
 
 
-def test_rocm_nontrans_cw_uses_cu_capped_persistent_workers():
+def test_rocm_cw_uses_single_resident_worker():
     for name in (
         "_triton_spsv_csr_cw_vector",
         "_triton_spsv_csr_cw_vector_complex",
     ):
         source = _function_source(name)
-        assert "_spsv_cu_capped_worker_count(n_rows, b_vec.device, True)" in source
+        assert "if _is_rocm_runtime():" in source
+        assert "worker_count = 1" in source
         assert "SERIAL_EXECUTION" not in source
 
-    # TRANS/CONJ was not part of the CSR-NON performance change.
     for name in (
         "_triton_spsv_csr_transpose_cw_vector",
         "_triton_spsv_csr_transpose_cw_vector_complex",
     ):
         source = _function_source(name)
-        assert "serial_execution = _is_rocm_runtime()" in source
+        assert "_spsv_transpose_cw_worker_count(" in source
+        assert "_spsv_transpose_cw_num_warps(block_nnz_use)" in source
+        assert "SPSV_ROCM_TRANS_CW_SERIAL_FALLBACK" in source
         assert "if serial_execution:\n        worker_count = 1" in source
 
 
@@ -437,7 +439,8 @@ def test_cuda_keeps_requested_parallel_routes():
     assert "elif solve_kind == \"csr_smblk\"" in source
     assert "elif solve_kind == \"csr_cw_levelschd\"" in source
     assert "elif solve_kind == \"csr_nnz_balance\"" in source
-    assert "and _is_rocm_runtime()\n        and worker_count_use == 1" in source
+    assert "_spsv_transpose_cw_worker_count(" in source
+    assert "transpose_preprocessed = False" in source
 
     for name in (
         "_triton_spsv_csr_n_lo_roc_vector",
@@ -452,13 +455,21 @@ def test_rocm_auto_can_use_safe_advanced_route_by_default():
     assert '"FLAGSPARSE_SPSV_ROCM_ENABLE_ADVANCED_AUTO", "1"' in SPSV_SOURCE
 
 
-def test_rocm_benchmark_defaults_to_alg3_without_changing_cuda_auto():
+def test_transpose_auto_defaults_to_alg2_for_analysis_and_workspace():
+    prepare = _function_source("_prepare_spsv_csr_system")
+    assert 'default_solve_kind = "transpose_alg2"' in prepare
+    buffer_size = _function_source("flagsparse_spsv_buffer_size")
+    assert 'route = "transpose_alg2" if trans_mode in ("T", "C") else "csr_cw"' in buffer_size
+
+
+def test_benchmark_defaults_to_backend_auto_routing():
     default_alg = _benchmark_function_source("_default_spsv_alg_num")
-    assert "return 3 if fs_spsv_impl._is_rocm_runtime() else None" in default_alg
+    assert "return None" in default_alg
     main = _benchmark_function_source("main")
     assert "default=_default_spsv_alg_num()" in main
-    assert "3=ALG3(csr_nnz_balance; default)" in main
-    assert "CUDA keeps AUTO routing when omitted" in main
+    assert "transpose_alg2 for TRANS/CONJ" in main
+    assert "DCU: 3=ALG3(csr_nnz_balance)" in main
+    assert "CUDA and DCU keep AUTO routing when omitted" in main
 
 
 def test_rocm_vendor_reference_uses_stable_split_stage_timing():

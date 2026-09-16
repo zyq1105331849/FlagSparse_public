@@ -76,14 +76,14 @@ VALUE_DTYPE_NAME_MAP.update(
 INDEX_DTYPE_NAME_MAP = {_dtype_name(dtype): dtype for dtype in CSR_FULL_INDEX_DTYPES}
 CUDA_SPSV_ALG_NUM_TO_SOLVE_KIND = {
     1: "csr_cw",
-    2: "csr_cw_levelschd",
+    2: "alg2",
     3: "csr_roc",
     4: "csr_smblk",
     8: "csr_nnz_balance",
 }
 ROCM_SPSV_ALG_NUM_TO_SOLVE_KIND = {
     1: "csr_cw",
-    2: "csr_cw_levelschd",
+    2: "alg2",
     3: "csr_nnz_balance",
 }
 
@@ -97,7 +97,7 @@ def _active_spsv_alg_num_to_solve_kind():
 
 
 def _default_spsv_alg_num():
-    return 3 if fs_spsv_impl._is_rocm_runtime() else None
+    return None
 
 
 def _parse_csv_tokens(raw):
@@ -181,9 +181,11 @@ def _alg_num_supports_case(alg_num, fmt, op_mode, lower, value_dtype):
         return False
     if alg_num == 1:
         return True
+    if alg_num == 2:
+        return fmt in ("CSR", "COO") and op_mode in SPSV_OP_MODES
     if fs_spsv_impl._is_rocm_runtime() and alg_num == 3:
         return fmt in ("CSR", "COO") and op_mode == "NON" and bool(lower)
-    if alg_num in (2, 3, 4, 8):
+    if alg_num in (3, 4, 8):
         return fmt in ("CSR", "COO") and op_mode == "NON"
     return False
 
@@ -661,6 +663,63 @@ def _solution_residual_metrics(
     return err_res, ok_res
 
 
+def _print_scipy_failure_diagnostic(
+    data,
+    indices,
+    indptr,
+    shape,
+    b,
+    x_flagsparse,
+    x_vendor,
+    value_dtype,
+    op_mode,
+    *,
+    lower,
+    unit_diagonal=False,
+    vendor_name="vendor",
+):
+    """Print an untimed CPU SciPy cross-check for a failed GPU comparison."""
+    import numpy as np
+    import scipy.sparse as sp
+    from scipy.sparse.linalg import spsolve_triangular
+
+    data_eff, indices_eff, indptr_eff = _effective_csr_for_op(
+        data, indices, indptr, shape, lower=lower, op_mode=op_mode
+    )
+    matrix = sp.csr_matrix(
+        (
+            data_eff.detach().cpu().numpy(),
+            indices_eff.detach().cpu().numpy(),
+            indptr_eff.detach().cpu().numpy(),
+        ),
+        shape=shape,
+    )
+    x_scipy = spsolve_triangular(
+        matrix,
+        b.detach().cpu().numpy(),
+        lower=lower if op_mode == "NON" else not lower,
+        unit_diagonal=unit_diagonal,
+    )
+    x_scipy = torch.from_numpy(np.asarray(x_scipy)).to(
+        device=x_flagsparse.device, dtype=value_dtype
+    )
+    atol, rtol = _tol_for_dtype(value_dtype)
+    fs_err = float(torch.max(torch.abs(x_flagsparse - x_scipy)).item())
+    vendor_err = float(torch.max(torch.abs(x_vendor - x_scipy)).item())
+    fs_vendor_err = float(torch.max(torch.abs(x_flagsparse - x_vendor)).item())
+    fs_ok = torch.allclose(x_flagsparse, x_scipy, atol=atol, rtol=rtol)
+    vendor_ok = torch.allclose(x_vendor, x_scipy, atol=atol, rtol=rtol)
+    fs_vendor_ok = torch.allclose(x_flagsparse, x_vendor, atol=atol, rtol=rtol)
+    print(
+        "  SciPy numeric check (untimed): "
+        f"FS-SciPy={fs_err:.2e} ({'PASS' if fs_ok else 'FAIL'}), "
+        f"{vendor_name}-SciPy={vendor_err:.2e} "
+        f"({'PASS' if vendor_ok else 'FAIL'}), "
+        f"FS-{vendor_name}={fs_vendor_err:.2e} "
+        f"({'PASS' if fs_vendor_ok else 'FAIL'})"
+    )
+
+
 def _benchmark_flagsparse_spsv_full_rounds(
     reset_call,
     analyze_call,
@@ -753,12 +812,7 @@ def _benchmark_flagsparse_spsv_stages(
         analysis_times.append(start_event.elapsed_time(stop_event))
 
     x = None
-    state = None
-    analysis_times = []
-    solve_times = []
-    total_times = []
     for _ in range(warmup):
-
         x = solve_call(state)
     solve_times = []
     for _ in range(iters):
@@ -856,7 +910,11 @@ def _benchmark_flagsparse_spsv_csr_split(
                     iters=iters,
                 )
             )
-        return x, buffer_ms, analysis_ms, solve_ms, total_ms, "transpose_cw"
+        route_name = (
+            fs_spsv_impl._normalize_requested_spsv_route(solve_kind, op_mode)
+            or "transpose_alg2"
+        )
+        return x, buffer_ms, analysis_ms, solve_ms, total_ms, route_name
 
     rocm_runtime = fs_spsv_impl._is_rocm_runtime()
     if rocm_runtime:
@@ -1027,7 +1085,11 @@ def _benchmark_flagsparse_spsv_coo_split(
                     iters=iters,
                 )
             )
-        return x, buffer_ms, analysis_ms, solve_ms, total_ms, "transpose_cw"
+        route_name = (
+            fs_spsv_impl._normalize_requested_spsv_route(solve_kind, trans_mode)
+            or "transpose_alg2"
+        )
+        return x, buffer_ms, analysis_ms, solve_ms, total_ms, route_name
 
     rocm_runtime = fs_spsv_impl._is_rocm_runtime()
     if rocm_runtime:
@@ -1380,7 +1442,7 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                         fs_spsv_impl._ACCEL.synchronize()
                         if fmt == "CSR":
 
-                            x, buffer_ms, analysis_ms, t_ms, flagsparse_ms, _route_name = (
+                            x, _buffer_ms, _analysis_ms, t_ms, flagsparse_ms, _route_name = (
                                 _benchmark_flagsparse_spsv_csr_split(
                                     data,
                                     indices,
@@ -1397,7 +1459,7 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                                 data, indices, indptr, shape, index_dtype=index_dtype
                             )
 
-                            x, buffer_ms, analysis_ms, t_ms, flagsparse_ms, _route_name = (
+                            x, _buffer_ms, _analysis_ms, t_ms, flagsparse_ms, _route_name = (
                                 _benchmark_flagsparse_spsv_coo_split(
                                     dc,
                                     rr,
@@ -1664,6 +1726,20 @@ def _finalize_csv_row(
     status = "PASS" if (ok_pt or ok_vendor) else "FAIL"
     if (not ok_pt) and (not ok_vendor) and (err_pt is None and err_vendor is None):
         status = "REF_FAIL"
+    if x_vendor is not None and not ok_vendor:
+        _print_scipy_failure_diagnostic(
+            data,
+            indices,
+            indptr,
+            shape,
+            b,
+            x,
+            x_vendor,
+            value_dtype,
+            op_mode,
+            lower=lower,
+            vendor_name=_vendor_backend_name(),
+        )
     vendor_backend = _vendor_backend_name()
     backend_error_key = _backend_error_key()
 
@@ -1847,6 +1923,20 @@ def _finalize_csv_row_csr_full(
     status = "PASS" if (ok_pt or ok_vendor) else "FAIL"
     if (not ok_pt) and (not ok_vendor) and (err_pt is None and err_vendor is None):
         status = "REF_FAIL"
+    if x_vendor is not None and not ok_vendor:
+        _print_scipy_failure_diagnostic(
+            data,
+            indices,
+            indptr,
+            shape,
+            b,
+            x,
+            x_vendor,
+            value_dtype,
+            op_mode,
+            lower=lower,
+            vendor_name=_vendor_backend_name(),
+        )
     vendor_backend = _vendor_backend_name()
     backend_error_key = _backend_error_key()
 
@@ -2508,13 +2598,12 @@ def main():
         default=_default_spsv_alg_num(),
         help=(
             "Algorithm selection compatible with allinone style. "
-            "DCU: 1=ALG1(csr_cw), 2=ALG2(csr_cw_levelschd), "
-
-            "3=ALG3(csr_nnz_balance; default). "
-            "CUDA: 1=csr_cw, "
-            "2=csr_cw_levelschd, 3=csr_roc, 4=csr_smblk, "
+            "ALG1 selects CW; ALG2 selects csr_cw_levelschd for NON and "
+            "transpose_alg2 for TRANS/CONJ. "
+            "DCU: 3=ALG3(csr_nnz_balance). CUDA NON: "
+            "3=csr_roc, 4=csr_smblk, "
             "8=csr_nnz_balance. "
-            "CUDA keeps AUTO routing when omitted."
+            "CUDA and DCU keep AUTO routing when omitted."
         ),
     )
     parser.add_argument(
@@ -2551,7 +2640,7 @@ def main():
     WARMUP = max(0, int(args.warmup))
     ITERS = max(1, int(args.iters))
     lower = not args.upper
-    if args.alg_num in (2, 3, 4, 8):
+    if args.alg_num in (3, 4, 8):
         if args.check_transpose:
             raise ValueError(
                 f"ALG{args.alg_num} matches allinone's NON-only path; --check-transpose is not supported"

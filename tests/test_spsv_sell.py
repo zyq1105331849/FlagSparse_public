@@ -46,6 +46,7 @@ from tests.test_spsv import (
     _fmt_ms,
     _fmt_ratio,
     _load_mtx_to_csr_torch,
+    _print_scipy_failure_diagnostic,
     _random_rhs_for_spsv,
     _stable_case_seed,
 )
@@ -151,22 +152,6 @@ def _spsv_tolerance(dtype):
     if dtype in (torch.float64, torch.complex128):
         return 1e-12, 1e-10
     raise TypeError(f"unsupported SELL value dtype: {dtype}")
-
-
-def _spsv_relative_error(actual, reference):
-    if actual.shape != reference.shape:
-        return float("inf")
-    if not bool(torch.isfinite(actual).all().item()) or not bool(
-        torch.isfinite(reference).all().item()
-    ):
-        return float("inf")
-    if actual.numel() == 0:
-        return 0.0
-    error = float(torch.max(torch.abs(actual - reference)).item())
-    scale = float(torch.max(torch.abs(reference)).item())
-    if scale == 0.0:
-        return 0.0 if error == 0.0 else float("inf")
-    return error / scale
 
 
 def _spsv_matches(actual, reference, dtype):
@@ -531,15 +516,6 @@ def _run_case(
     sell_values, sell_cols, offsets = _csr_to_sell(
         values, cols, row_ptr, n_rows, slice_size
     )
-    analysis_kwargs = {
-        "slice_size": slice_size,
-        "unit_diagonal": unit_diagonal,
-        "transpose": op_mode,
-    }
-    if op_mode == "NON":
-        analysis_kwargs["alg_num"] = alg_num
-        if alg2_worker_count is not None:
-            analysis_kwargs["alg2_worker_count"] = alg2_worker_count
     triton_result, triton_ms = _benchmark_triton(
         sell_values,
         sell_cols,
@@ -601,6 +577,21 @@ def _run_case(
         "pytorch_reason": "not used for SELL",
         "error": None,
     }
+    if record["status"] == "FAIL":
+        _print_scipy_failure_diagnostic(
+            values,
+            cols,
+            row_ptr,
+            (n_rows, n_rows),
+            b,
+            triton_result,
+            cusparse_result,
+            values.dtype,
+            op_mode,
+            lower=True,
+            unit_diagonal=unit_diagonal,
+            vendor_name="cuSPARSE",
+        )
     return record, triton_result, cusparse_result
 
 
